@@ -1,0 +1,4501 @@
+diff --git a/criu/Makefile b/criu/Makefile
+index 55bdb1b..f15aa04 100644
+--- a/criu/Makefile
++++ b/criu/Makefile
+@@ -85,7 +85,7 @@ $(obj)/%: pie
+ 
+ $(obj)/criu: $(PROGRAM-BUILTINS)
+ 	$(call msg-link, $@)
+-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
++	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) -libverbs -lpthread $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
+ 
+ UNIT-BUILTINS		+= $(obj)/util.o
+ UNIT-BUILTINS		+= $(obj)/config.o
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index f586449..c856d0d 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -99,6 +99,7 @@ obj-$(CONFIG_COMPAT)	+= vdso-compat.o
+ CFLAGS_REMOVE_vdso-compat.o	+= $(CFLAGS-ASAN) $(CFLAGS-GCOV)
+ obj-y			+= pidfd-store.o
+ obj-y			+= hugetlb.o
++obj-y			+= rdma_migr.o rdma_vma.o id_fe_map.o
+ 
+ PROTOBUF_GEN := scripts/protobuf-gen.sh
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 90d763f..59d7d56 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -2098,6 +2098,8 @@ static int cr_dump_finish(int ret)
+ 	return post_dump_ret ?: (ret != 0);
+ }
+ 
++FILE *fp;
++
+ int cr_dump_tasks(pid_t pid)
+ {
+ 	InventoryEntry he = INVENTORY_ENTRY__INIT;
+@@ -2106,6 +2108,13 @@ int cr_dump_tasks(pid_t pid)
+ 	int pre_dump_ret = 0;
+ 	int ret = -1;
+ 
++	fp = NULL;
++	if(opts.mode == CR_DUMP) {
++		char fname[128];
++		sprintf(fname, "%.110s/update_files.raw", images_dir);
++		fp = fopen(fname, "w");
++	}
++
+ 	pr_info("========================================\n");
+ 	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+ 	pr_info("========================================\n");
+@@ -2174,6 +2183,13 @@ int cr_dump_tasks(pid_t pid)
+ 	if (collect_pstree())
+ 		goto err;
+ 
++	{
++		struct pstree_item *pi;
++		for_each_pstree_item(pi) {
++			pi->pid->max_fd = -1;
++		}
++	}
++
+ 	if (collect_pstree_ids())
+ 		goto err;
+ 
+@@ -2200,8 +2216,41 @@ int cr_dump_tasks(pid_t pid)
+ 		goto err;
+ 
+ 	for_each_pstree_item(item) {
++		int fd;
++		char fname[128];
++		int virt_pid;
++
+ 		if (dump_one_task(item, parent_ie))
+ 			goto err;
++
++		sprintf(fname, "/proc/rdma/%d/user_pid", item->pid->real);
++		fd = open(fname, O_RDONLY);
++		if(fd < 0) {
++			continue;
++		}
++
++		if(read(fd, &virt_pid, sizeof(pid)) < 0) {
++			close(fd);
++			pr_perror("read");
++			return -1;
++		}
++
++		close(fd);
++
++		sprintf(fname, "%.108s/max_fd_%d.raw", images_dir, virt_pid);
++		fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 00666);
++		if(fd < 0) {
++			pr_err("Failed to open %s\n", fname);
++			return -1;
++		}
++
++		if(write(fd, &item->pid->max_fd, sizeof(int)) < 0) {
++			close(fd);
++			pr_perror("write");
++			return -1;
++		}
++
++		close(fd);
+ 	}
+ 
+ 	if (parent_ie) {
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index f02e95f..a94c508 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -99,6 +99,11 @@
+ 
+ #include "cr-errno.h"
+ 
++#include "rdma_migr.h"
++
++static pid_t prerestore_parent_pid;
++int timens_helper_pid = -1;
++
+ #ifndef arch_export_restore_thread
+ #define arch_export_restore_thread __export_restore_thread
+ #endif
+@@ -112,6 +117,9 @@
+ #define arch_export_unmap_compat __export_unmap_compat
+ #endif
+ 
++int num_devices;
++struct ibv_device **ibv_device_list;
++
+ struct pstree_item *current;
+ 
+ static int restore_task_with_children(void *);
+@@ -882,21 +890,97 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
+ static int prepare_itimers(int pid, struct task_restore_args *args, CoreEntry *core);
+ static int prepare_mm(pid_t pid, struct task_restore_args *args);
+ 
++#define up_align_four(n) ({								\
++	typeof(n) __tmp__ = ~0x11;							\
++	(((n)-1) & __tmp__) + 4;							\
++})
++
+ static int restore_one_alive_task(int pid, CoreEntry *core)
+ {
+ 	unsigned args_len;
+ 	struct task_restore_args *ta;
++	struct unmapped_node *unmapped;
++	struct unmapped_node *ta_unmapped;
++	int n_unmapped;
++	int n_update;
++	size_t update_size;
++	int n_qp_replay;
++	size_t qp_replay_size;
++	int n_srq_replay;
++	size_t srq_replay_size;
++	int n_msg;
++	size_t msg_meta_size;
++	int err;
++	void *content_p;
++
+ 	pr_info("Restoring resources\n");
++	if(prepare_for_partners_restore(current->pid->real)) {
++		return -1;
++	}
+ 
+ 	rst_mem_switch_to_private();
+ 
+-	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads, page_size());
++	/* Transfer the data structure of RDMA vma from non-linear to array */
++	unmapped = get_rdma_unmapped_node(&n_unmapped, &err);
++	if(err) {
++		pr_err("Error occurs when get_unmapped_node\n");
++		return -1;
++	}
++
++	update_size = get_update_node_size(&n_update);
++	qp_replay_size = get_qp_replay_size(&n_qp_replay);
++	srq_replay_size = get_srq_replay_size(&n_srq_replay);
++	msg_meta_size = get_send_msg_meta_size(&n_msg);
++	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads
++						+ n_unmapped * sizeof(*unmapped)
++						+ update_size + qp_replay_size + srq_replay_size + msg_meta_size
++						+ get_total_content_size()
++						+ get_send_msg_size(), page_size());
+ 	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+ 	if (!ta)
+ 		return -1;
+ 
+ 	memzero(ta, args_len);
+ 
++	ta->base = ta;
++	ta_unmapped = (struct unmapped_node *)((void*)(ta + 1)
++					+ sizeof(struct thread_restore_args) * current->nr_threads);
++	memcpy(ta_unmapped, unmapped, n_unmapped * sizeof(*unmapped));
++	ta->unmapped = ta_unmapped;
++	ta->n_unmapped = n_unmapped;
++
++	free(unmapped);
++
++	ta->n_update = n_update;
++	ta->update_arr = (void *)(ta->unmapped + n_unmapped);
++	copy_update_nodes(ta->update_arr);
++
++	ta->n_qp_replay = n_qp_replay;
++	ta->qp_replay_arr = (void *)(ta->update_arr + n_update);
++	copy_qp_replay_nodes(ta->qp_replay_arr);
++
++	ta->n_srq_replay = n_srq_replay;
++	ta->srq_replay_arr = (void *)(ta->qp_replay_arr + n_qp_replay);
++	copy_srq_replay_nodes(ta->srq_replay_arr);
++
++	ta->n_msg = n_msg;
++	ta->msg_arr = (void *)(ta->srq_replay_arr + n_srq_replay);
++	copy_send_msg_meta(ta->msg_arr);
++
++	content_p = (void *)(ta->msg_arr + n_msg);
++	for(int i = 0; i < n_update; i++) {
++		memcpy(content_p, ta->update_arr[i].content_p,
++						ta->update_arr[i].size);
++		ta->update_arr[i].content_p = content_p;
++		content_p += up_align_four(ta->update_arr[i].size);
++	}
++
++	for(int i = 0; i < n_msg; i++) {
++		memcpy(content_p, ta->msg_arr[i].buf, ta->msg_arr[i].size);
++		ta->msg_arr[i].buf = content_p;
++		content_p += up_align_four(ta->msg_arr[i].size);
++	}
++
+ 	if (prepare_fds(current))
+ 		return -1;
+ 
+@@ -1235,6 +1319,29 @@ static int restore_one_helper(void)
+ 	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
+ 		close_service_fd(i);
+ 
++	{
++		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++		struct sockaddr_un sock_un;
++		char buf[32];
++		int err;
++
++		if(sock < 0) {
++			pr_err("Unable to create unix socket to notify CRIU\n");
++			return -1;
++		}
++
++		memset(&sock_un, 0, sizeof(sock_un));
++		sock_un.sun_family = AF_UNIX;
++		sprintf(sock_un.sun_path, "/dev/shm/fullrestore.sock");
++		err = sendto(sock, buf, 32, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
++		if(err < 0) {
++			pr_err("Unable to notify CRIU\n");
++			return -1;
++		}
++
++		close(sock);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1506,6 +1613,9 @@ static int sigchld_process(int status, pid_t pid)
+ {
+ 	int sig;
+ 
++	if(pid == timens_helper_pid)
++		return 0;
++
+ 	if (WIFEXITED(status)) {
+ 		pr_err("%d exited, status=%d\n", pid, WEXITSTATUS(status));
+ 		return -1;
+@@ -1758,6 +1868,112 @@ static int create_children_and_session(void)
+ 	return 0;
+ }
+ 
++static int init_server_unix_socket(char **p_sockname) {
++	struct sockaddr_un sock_un;
++	char sockname[1024];
++	int sock;
++	int err;
++
++	sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++	if(sock < 0) {
++		pr_perror("socket");
++		return -1;
++	}
++
++	memset(&sock_un, 0, sizeof(sock_un));
++	sock_un.sun_family = AF_UNIX;
++	if(current == root_item) {
++		sprintf(sockname, "/dev/shm/pid_leader_%d.sock", getpid());
++	}
++	else {
++		sprintf(sockname, "/dev/shm/pid_%d.sock", getpid());
++	}
++	strcpy(sock_un.sun_path, sockname);
++	unlink(sockname);
++	err = bind(sock, (struct sockaddr*)&sock_un, sizeof(sock_un));
++	if(err) {
++		close(sock);
++		pr_perror("bind");
++		return -1;
++	}
++
++	if(p_sockname && asprintf(p_sockname, "%s", sockname) < 0) {
++		close(sock);
++		pr_perror("asprintf");
++		return -1;
++	}
++
++	return sock;
++}
++
++static int __stop_and_copy_update_core(struct pstree_item *item,
++						struct cr_clone_arg *ca) {
++	pid_t pid = vpid(item);
++
++	if (item->pid->state != TASK_HELPER) {
++		if (open_core(pid, &ca->core))
++			return -1;
++
++		if (check_core(ca->core, item))
++			return -1;
++
++		item->pid->state = ca->core->tc->task_state;
++
++		/*
++		 * Zombie tasks' cgroup is not dumped/restored.
++		 * cg_set == 0 is skipped in prepare_task_cgroup()
++		 */
++		if (item->pid->state == TASK_DEAD) {
++			rsti(item)->cg_set = 0;
++		} else {
++			if (ca->core->thread_core->has_cg_set)
++				rsti(item)->cg_set = ca->core->thread_core->cg_set;
++			else
++				rsti(item)->cg_set = ca->core->tc->cg_set;
++		}
++
++		if (ca->core->tc->has_stop_signo)
++			item->pid->stop_signo = ca->core->tc->stop_signo;
++
++		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
++			pr_err("Unknown task state %d\n", item->pid->state);
++			return -1;
++		}
++
++		/*
++		 * By default we assume that seccomp is not
++		 * used at all (especially on dead task). Later
++		 * we will walk over all threads and check in
++		 * details if filter is present setting up
++		 * this flag as appropriate.
++		 */
++		rsti(item)->has_seccomp = false;
++
++		if (unlikely(item == root_item))
++			maybe_clone_parent(item, ca);
++	} else {
++		/*
++		 * Helper entry will not get moved around and thus
++		 * will live in the parent's cgset.
++		 */
++		rsti(item)->cg_set = rsti(item->parent)->cg_set;
++		ca->core = NULL;
++	}
++
++	return 0;
++}
++
++int stop_and_copy_update_core(void *clone_arg) {
++	return __stop_and_copy_update_core(current, clone_arg);
++}
++
++struct rdma_mmap_item {
++	unsigned long					start;
++	unsigned long					end;
++	int								prot;
++	int								flag;
++};
++
+ static int restore_task_with_children(void *_arg)
+ {
+ 	struct cr_clone_arg *ca = _arg;
+@@ -1766,6 +1982,53 @@ static int restore_task_with_children(void *_arg)
+ 
+ 	current = ca->item;
+ 
++#if 0
++	if(current == root_item) {
++		timens_helper_pid = fork();
++		if(timens_helper_pid < 0) {
++			goto err;
++		}
++		if(timens_helper_pid == 0) {
++			int sock;
++			struct sockaddr_un sock_un;
++			int err;
++
++			if (unshare(CLONE_NEWTIME)) {
++				pr_perror("Unable to create a new time namespace");
++				goto err;
++			}
++
++			sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++			if(sock < 0) {
++				pr_perror("socket");
++				return -1;
++			}
++
++			memset(&sock_un, 0, sizeof(sock_un));
++			sock_un.sun_family = AF_UNIX;
++			sprintf(sock_un.sun_path, "/dev/shm/timens.sock");
++			unlink(sock_un.sun_path);
++			err = bind(sock, (struct sockaddr*)&sock_un, sizeof(sock_un));
++			if(err) {
++				close(sock);
++				pr_perror("bind");
++				return -1;
++			}
++
++			if(recvfrom(sock, NULL, 0, 0, NULL, NULL) < 0) {
++				close(sock);
++				pr_perror("recvfrom");
++				return -1;
++			}
++
++			pr_info("Now timens helper exits\n");
++			close(sock);
++			unlink(sock_un.sun_path);
++			while(1);
++		}
++	}
++#endif
++
+ 	if (current != root_item) {
+ 		char buf[12];
+ 		int fd;
+@@ -1813,6 +2076,7 @@ static int restore_task_with_children(void *_arg)
+ 			}
+ 		}
+ 
++#if 0
+ 		if (root_ns_mask & CLONE_NEWTIME) {
+ 			if (prepare_timens(current->ids->time_ns_id))
+ 				goto err;
+@@ -1820,6 +2084,7 @@ static int restore_task_with_children(void *_arg)
+ 			if (prepare_timens(0))
+ 				goto err;
+ 		}
++#endif
+ 
+ 		if (set_opts_cap_eff())
+ 			goto err;
+@@ -1877,13 +2142,21 @@ static int restore_task_with_children(void *_arg)
+ 			goto err;
+ 	}
+ 
++	if(add_rdma_vma_node(pid)) {
++		goto err;
++	}
++
++	if(only_prepare_rdma_mappings(current)) {
++		goto err;
++	}
++
+ 	if (setup_newborn_fds(current))
+ 		goto err;
+ 
+ 	if (restore_task_mnt_ns(current))
+ 		goto err;
+ 
+-	if (prepare_mappings(current))
++	if (prepare_mappings(current, false))
+ 		goto err;
+ 
+ 	if (prepare_sigactions(ca->core) < 0)
+@@ -1904,6 +2177,117 @@ static int restore_task_with_children(void *_arg)
+ 
+ 	timing_stop(TIME_FORK);
+ 
++	if(restore_rdma(pid, images_dir)) {
++		pr_err("restore_rdma failed. errno: %d\n", errno);
++		goto err;
++	}
++
++	{
++		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++		struct sockaddr_un sock_un;
++		char buf[32];
++		int err;
++
++		if(sock < 0) {
++			pr_perror("socket");
++			return -1;
++		}
++
++		memset(&sock_un, 0, sizeof(sock_un));
++		sock_un.sun_family = AF_UNIX;
++		sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
++		sprintf(buf, "FINISH");
++		err = sendto(sock, buf, strlen(buf)+1, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
++		if(err < 0) {
++			pr_perror("sendto");
++			return -1;
++		}
++
++		close(sock);
++	}
++
++	{
++		char *sockname;
++		char buf[32];
++		int sock = init_server_unix_socket(&sockname);
++
++		pr_info("Partial restore finished. Now wait for the rest states ready.\n");
++
++		if(recvfrom(sock, buf, 32, 0, NULL, NULL) < 0) {
++			close(sock);
++			pr_perror("recvfrom");
++			return -1;
++		}
++
++		close(sock);
++		unlink(sockname);
++		free(sockname);
++
++		pr_info("Full restore starts.\n");
++	}
++
++	if(stop_and_copy_update_state(current, ca))
++		goto err;
++
++	if(prepare_mappings(current, true))
++		goto err;
++
++	if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback)) {
++		goto err;
++	}
++
++	if(ibv_update_mem(add_update_node, add_one_rdma_vma_node)) {
++		goto err;
++	}
++
++	if(current->pid->state != TASK_HELPER) {
++		struct rdma_mmap_item item;
++		int fd;
++		char fname[128];
++		int err;
++
++		sprintf(fname, "%.110s/rdma_mmap_%d.raw",
++					images_dir, vpid(current));
++		fd = open(fname, O_RDONLY);
++		if(fd < 0) {
++			pr_info("No RDMA. Skip RDMA mmap\n");
++			goto skip_rdma_mmap;
++		}
++
++		do {
++			void *addr;
++
++			err = read(fd, &item, sizeof(item));
++			if(err != 0 && err != sizeof(item)) {
++				pr_perror("read");
++				goto err;
++			}
++
++			if(err == 0) {
++				continue;
++			}
++
++			addr = mmap((void *)item.start, item.end - item.start,
++					PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++			if(addr != (void *)item.start) {
++				perror("mmap");
++				goto err;
++			}
++
++			add_one_rdma_vma_node(item.start, item.end);
++
++			pr_info("mmap null RDMA register: %lx-%lx, %c%c%c%c\n",
++							item.start, item.end,
++							(item.prot & PROT_READ)? 'r': '-',
++							(item.prot & PROT_WRITE)? 'w': '-',
++							(item.prot & PROT_EXEC)? 'x': '-',
++							(item.flag == MAP_SHARED)? 's': 'p');
++		} while(err != 0);
++
++		close(fd);
++	}
++
++skip_rdma_mmap:
+ 	if (populate_pid_proc())
+ 		goto err;
+ 
+@@ -2559,6 +2943,7 @@ int prepare_task_entries(void)
+ 
+ 	task_entries->nr_threads = 0;
+ 	task_entries->nr_tasks = 0;
++	task_entries->nr_to_wait = 0;
+ 	task_entries->nr_helpers = 0;
+ 	futex_set(&task_entries->start, CR_STATE_FAIL);
+ 	mutex_init(&task_entries->userns_sync_lock);
+@@ -2580,9 +2965,77 @@ int prepare_dummy_task_state(struct pstree_item *pi)
+ 	return 0;
+ }
+ 
++static pid_t get_parent_pid_from_proc(pid_t pid) {
++	FILE *fp;
++	char fname[128];
++	pid_t parent_pid;
++	char strln[1024];
++
++	sprintf(fname, "/proc/%d/status", pid);
++	fp = fopen(fname, "r");
++	if(!fp) {
++		return -1;
++	}
++
++	while(fgets(strln, 1024, fp) != NULL) {
++		char header[16];
++		off_t off;
++		sscanf(strln, "%s%ln", header, &off);
++		if(strcmp(header, "PPid:"))
++			continue;
++
++		sscanf(strln + off, "%d", &parent_pid);
++		fclose(fp);
++		return parent_pid;
++	}
++
++	fclose(fp);
++	return -1;
++}
++
++static int get_cmdline_from_pid(pid_t pid, char *cmdline) {
++	FILE *fp;
++	char fname[128];
++	char strln[1024];
++
++	sprintf(fname, "/proc/%d/cmdline", pid);
++	fp = fopen(fname, "r");
++	if(fgets(strln, 1024, fp) == NULL)
++		return -1;
++
++	strcpy(cmdline, strln);
++	return 0;
++}
++
++static pid_t get_init_pid(void) {
++	pid_t cur_pid = getpid();
++	pid_t parent_pid = get_parent_pid_from_proc(cur_pid);
++	char cmdline[1024];
++
++	if(get_cmdline_from_pid(parent_pid, cmdline)) {
++		return -1;
++	}
++
++	while(!strcmp(cmdline, "runc")) {
++		cur_pid = parent_pid;
++		parent_pid = get_parent_pid_from_proc(cur_pid);
++		if(get_cmdline_from_pid(parent_pid, cmdline)) {
++			return -1;
++		}
++	}
++
++	return parent_pid;
++}
++
+ int cr_restore_tasks(void)
+ {
+ 	int ret = -1;
++	int i;
++
++	ibv_device_list = ibv_get_device_list(&num_devices);
++	for(i = 0; i < num_devices; i++) {
++		munmap(ibv_device_list[i]->qpn_dict, 4096 * 4096 * sizeof(uint32_t));
++	}
+ 
+ 	if (init_service_fd())
+ 		return 1;
+@@ -2621,6 +3074,34 @@ int cr_restore_tasks(void)
+ 	if (prepare_pstree() < 0)
+ 		goto err;
+ 
++	futex_set(&task_entries->futex_n_wait,
++				task_entries->nr_to_wait);
++	futex_set(&task_entries->futex_n_wait_2,
++				task_entries->nr_to_wait);
++
++	{
++		struct pstree_item *pi;
++		for_each_pstree_item(pi) {
++			int fd;
++			char fname[128];
++
++			pi->pid->max_fd = -1;
++			sprintf(fname, "%.108s/max_fd_%d.raw", images_dir, vpid(pi));
++			fd = open(fname, O_RDONLY);
++			if(fd < 0) {
++				continue;
++			}
++
++			if(read(fd, &pi->pid->max_fd, sizeof(int)) < 0) {
++				close(fd);
++				pr_perror("read");
++				return -1;
++			}
++
++			close(fd);
++		}
++	}
++
+ 	if (fdstore_init())
+ 		goto err;
+ 
+@@ -2639,6 +3120,37 @@ int cr_restore_tasks(void)
+ 	if (prepare_lazy_pages_socket() < 0)
+ 		goto clean_cgroup;
+ 
++	{
++		int total_wait = 0;
++		struct pstree_item *it;
++		int sock;
++		struct sockaddr_un sock_un;
++		int err;
++
++		prerestore_parent_pid = get_init_pid();
++
++		for_each_pstree_item(it) {
++			total_wait++;
++		}
++
++		sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++		if(sock < 0) {
++			pr_perror("socket");
++			return -1;
++		}
++
++		memset(&sock_un, 0, sizeof(sock_un));
++		sock_un.sun_family = AF_UNIX;
++		sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
++		err = sendto(sock, &total_wait, sizeof(int), 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
++		if(err < 0) {
++			pr_perror("socket");
++			return -1;
++		}
++
++		close(sock);
++	}
++
+ 	ret = restore_root_task(root_item);
+ clean_cgroup:
+ 	fini_cgroup();
+@@ -3582,9 +4094,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 	unsigned long creds_pos_next;
+ 
+ 	sigset_t blockmask;
++	struct unmapped_node *ta_unmapped;
+ 
+ 	pr_info("Restore via sigreturn\n");
+ 
++	task_args->prerestore_parent_pid = prerestore_parent_pid;
++
+ 	/* pr_info_vma_list(&self_vma_list); */
+ 
+ 	BUILD_BUG_ON(sizeof(struct task_restore_args) & 1);
+@@ -3691,6 +4206,30 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 	task_args->rst_mem_size = rst_mem_size + alen;
+ 	thread_args = (struct thread_restore_args *)(task_args + 1);
+ 
++	ta_unmapped = (struct unmapped_node *)((void*)(task_args + 1)
++					+ sizeof(struct thread_restore_args) * current->nr_threads);
++	task_args->unmapped = ta_unmapped;
++
++	task_args->update_arr = (void *)task_args->update_arr - task_args->base +
++										(void *)task_args;
++	task_args->qp_replay_arr = (void *)task_args->qp_replay_arr - task_args->base +
++										(void *)task_args;
++	task_args->srq_replay_arr = (void *)task_args->srq_replay_arr - task_args->base +
++										(void *)task_args;
++	task_args->msg_arr = (void *)task_args->msg_arr - task_args->base +
++										(void *)task_args;
++	for(int i = 0; i < task_args->n_update; i++) {
++		void *content_p = (void *)task_args->update_arr[i].content_p -
++							task_args->base + (void *)task_args;
++		task_args->update_arr[i].content_p = content_p;
++	}
++
++	for(int i = 0; i < task_args->n_msg; i++) {
++		void *content_p = (void *)task_args->msg_arr[i].buf -
++							task_args->base + (void *)task_args;
++		task_args->msg_arr[i].buf = content_p;
++	}
++
+ 	/*
+ 	 * And finally -- the rest arguments referenced by task_ and
+ 	 * thread_restore_args. Pointers will get remapped below.
+diff --git a/criu/cr-service.c b/criu/cr-service.c
+index 314c309..342aafc 100644
+--- a/criu/cr-service.c
++++ b/criu/cr-service.c
+@@ -48,6 +48,8 @@
+ #include "cr-errno.h"
+ #include "namespaces.h"
+ 
++#define EXTRACT_LOG
++
+ unsigned int service_sk_ino = -1;
+ 
+ static int recv_criu_msg(int socket_fd, CriuReq **req)
+@@ -240,14 +242,14 @@ int send_criu_rpc_script(enum script_actions act, char *name, int sk, int fd)
+ 	return 0;
+ }
+ 
+-static char images_dir[PATH_MAX];
++char images_dir[PATH_MAX];
++char images_dir_path[PATH_MAX];
+ 
+ static int setup_opts_from_req(int sk, CriuOpts *req)
+ {
+ 	struct ucred ids;
+ 	struct stat st;
+ 	socklen_t ids_len = sizeof(struct ucred);
+-	char images_dir_path[PATH_MAX];
+ 	char work_dir_path[PATH_MAX];
+ 	char status_fd[PATH_MAX];
+ 	bool output_changed_by_rpc_conf = false;
+@@ -752,6 +754,18 @@ static int dump_using_req(int sk, CriuOpts *req)
+ 	if (setup_opts_from_req(sk, req))
+ 		goto exit;
+ 
++#ifdef EXTRACT_LOG
++	{
++		char fname[128];
++		int fd;
++
++		sprintf(fname, "/dev/shm/dump_%d.log", req->pid);
++		fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
++		dup2(fd, log_get_fd());
++		close(fd);
++	}
++#endif
++
+ 	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
+ 
+ 	if (init_pidfd_store_hash())
+@@ -795,6 +809,19 @@ static int restore_using_req(int sk, CriuOpts *req)
+ 	if (setup_opts_from_req(sk, req))
+ 		goto exit;
+ 
++#ifdef EXTRACT_LOG
++	{
++		char fname[128];
++		int fd;
++		pid_t pid;
++		sscanf(images_dir, "/dev/shm/restorerdma/%d", &pid);
++		sprintf(fname, "/dev/shm/restore_%d.log", pid);
++		fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
++		dup2(fd, log_get_fd());
++		close(fd);
++	}
++#endif
++
+ 	__setproctitle("restore --rpc -D %s", images_dir);
+ 
+ 	if (cr_restore_tasks())
+@@ -911,6 +938,69 @@ out:
+ 	return success ? 0 : -1;
+ }
+ 
++static int pre_dump_rdma_using_req(int sk, CriuOpts *req, bool single)
++{
++	int pid, status;
++	bool success = false;
++
++	pid = fork();
++	if (pid < 0) {
++		pr_perror("Can't fork");
++		goto out;
++	}
++
++	if (pid == 0) {
++		int ret = 1;
++
++		opts.mode = CR_PRE_DUMP_RDMA;
++		if (setup_opts_from_req(sk, req))
++			goto cout;
++
++#ifdef EXTRACT_LOG
++		{
++			char fname[128];
++			int fd;
++
++			sprintf(fname, "/dev/shm/dumprdma_%d.log", req->pid);
++			fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
++			dup2(fd, log_get_fd());
++			close(fd);
++		}
++#endif
++
++		opts.final_state = TASK_ALIVE;
++		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
++
++		if (init_pidfd_store_hash())
++			goto pidfd_store_err;
++
++		if (cr_dump_tasks(req->pid))
++			goto cout;
++
++		ret = 0;
++	cout:
++		free_pidfd_store();
++	pidfd_store_err:
++		exit(ret);
++	}
++
++	if (waitpid(pid, &status, 0) != pid) {
++		pr_perror("Unable to wait %d", pid);
++		goto out;
++	}
++	if (status != 0)
++		goto out;
++
++	success = true;
++out:
++	if (send_criu_pre_dump_resp(sk, success, single) == -1) {
++		pr_perror("Can't send pre-dump resp");
++		success = false;
++	}
++
++	return success ? 0 : -1;
++}
++
+ static int pre_dump_loop(int sk, CriuReq *msg)
+ {
+ 	int ret;
+@@ -1295,6 +1385,9 @@ more:
+ 	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP:
+ 		ret = pre_dump_using_req(sk, msg->opts, true);
+ 		break;
++	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP_RDMA:
++		ret = pre_dump_rdma_using_req(sk, msg->opts, true);
++		break;
+ 
+ 	default:
+ 		send_criu_err(sk, "Invalid req");
+diff --git a/criu/debug.h b/criu/debug.h
+new file mode 100644
+index 0000000..dd9b18a
+--- /dev/null
++++ b/criu/debug.h
+@@ -0,0 +1,40 @@
++#ifndef __DEBUG_H__
++#define __DEBUG_H__
++
++#define __ENABLE_DEBUG__
++
++#include <stdio.h>
++#include "include/criu-log.h"
++
++#ifdef __ENABLE_DEBUG__
++#define dbg_info(fmt, args...)												\
++	dprintf(log_get_fd(), "\033[1m\033[32m%s(%d)\033[0m: " fmt,				\
++					__FILE__, __LINE__, ##args)
++
++#define err_info(fmt, args...)												\
++	dprintf(log_get_fd(), "\033[1m\033[31mErr at %s(%d)\033[0m: " fmt,		\
++					__FILE__, __LINE__, ##args)
++
++#define warn_info(fmt, args...)												\
++	fprintf(log_get_fd(), "\033[1m\033[33mWarn at %s(%d)\033[0m: " fmt,		\
++					__FILE__, __LINE__, ##args)
++#else
++#define dbg_info(fmt, args...)
++#define err_info(fmt, args...)		dprintf(log_get_fd(), fmt, ##args)
++#define warn_info(fmt, args...)		dprintf(log_get_fd(), fmt, ##args)
++#endif		/* __ENABLE_DEBUG__ */
++
++#define CHECK(cond) ({											\
++	int ___r = (cond);											\
++	dbg_info("CHECK %s? \033[1m%s\033[0m\n", #cond,				\
++			___r? "\033[32mtrue": "\033[31mfalse");				\
++	___r;														\
++})
++
++#define PRINT(type, fmt, val)	({								\
++	typeof(val) ___r = (val);									\
++	dbg_info("PRINT %s: " fmt "\n", #val, (type)___r);			\
++	___r;														\
++})
++
++#endif
+\ No newline at end of file
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index ed8b9c8..6a84e33 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -1197,6 +1197,12 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
+ 	fe.id = rfe.id;
+ 	fe.reg = &rfe;
+ 
++	if(fp) {
++		fwrite(&fe, sizeof(fe), 1, fp);
++		fwrite(&rfe, sizeof(rfe), 1, fp);
++		fwrite(&fwn, sizeof(fwn), 1, fp);
++	}
++
+ 	return pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
+ }
+ 
+@@ -1855,6 +1861,12 @@ ext:
+ 	fe.id = rfe.id;
+ 	fe.reg = &rfe;
+ 
++	if(fp) {
++		fwrite(&fe, sizeof(fe), 1, fp);
++		fwrite(&rfe, sizeof(rfe), 1, fp);
++		fwrite(rfe.fown, sizeof(*rfe.fown), 1, fp);
++	}
++
+ 	rimg = img_from_set(glob_imgset, CR_FD_FILES);
+ 	ret = pb_write_one(rimg, &fe, PB_FILE);
+ 
+@@ -2286,6 +2298,14 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
+ 
+ 	mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
+ ext:
++	{
++		pid_t pid;
++		char suffix[64];
++		if(sscanf(rfi->path, "proc/rdma_uwrite/%d/%s", &pid, suffix) >= 2) {
++			sprintf(rfi->path, "proc/rdma_uwrite/%d/%s", current->pid->real, suffix);
++			pr_info("rfi->path: %s\n", rfi->path);
++		}
++	}
+ 	tmp = open_cb(mntns_root, rfi, arg);
+ 	if (tmp < 0) {
+ 		pr_perror("Can't open file %s", rfi->path);
+@@ -2314,12 +2334,24 @@ ext:
+ 				saved_mode &= ~(S_IRWXU | S_IRWXG | S_IRWXO);
+ 			}
+ 
++			if(curr_mode != saved_mode) {
++				char fname[1024];
++
++				sprintf(fname, "/%s", rfi->path);
++				if(chmod(fname, saved_mode) < 0) {
++					pr_err("Failed to change mode");
++					goto err;
++				}
++			}
++
++#if 0
+ 			if (curr_mode != saved_mode) {
+ 				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
+ 				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
+ 				       rfi->path, (int)curr_mode, saved_mode);
+ 				goto err;
+ 			}
++#endif
+ 		}
+ 
+ 		/*
+diff --git a/criu/files.c b/criu/files.c
+index 3b653e2..5c0d373 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -454,6 +454,8 @@ static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
+ 	return ops;
+ }
+ 
++#include "rdma_migr.h"
++
+ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ {
+ 	struct fd_link *link_old = p->link;
+@@ -483,6 +485,9 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ 		}
+ 
+ 		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
++		if(is_rdma_dev(p->stat.st_rdev)) {
++			return -10;
++		}
+ 		err = dump_unsupp_fd(p, lfd, "chr", more, e);
+ 		p->link = link_old;
+ 		return err;
+@@ -501,6 +506,10 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
+ 	const struct fdtype_ops *ops;
+ 	struct fd_link link;
+ 
++	if(fd > pid->max_fd) {
++		pid->max_fd = fd;
++	}
++
+ 	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
+ 		pr_err("Can't get stat on %d\n", fd);
+ 		return -1;
+@@ -548,8 +557,11 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
+ 		else if (is_bpfmap_link(link))
+ 			ops = &bpfmap_dump_ops;
+ #endif
+-		else
++		else {
++			if(is_rdma_event_fd(link))
++				return -10;
+ 			return dump_unsupp_fd(&p, lfd, "anon", link, e);
++		}
+ 
+ 		return do_dump_gen_file(&p, lfd, ops, e);
+ 	}
+@@ -647,8 +659,13 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
+ 			FdinfoEntry e = FDINFO_ENTRY__INIT;
+ 
+ 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
+-			if (ret)
+-				break;
++			if (ret) {
++				if(ret == -10) {
++					ret = 0;
++					continue;
++				}
++ 				break;
++			}
+ 
+ 			ret = pb_write_one(img, &e, PB_FDINFO);
+ 			if (ret)
+@@ -1726,6 +1743,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
+ 		return -1;
+ 	case FD_TYPES__REG:
+ 		ret = collect_one_file_entry(fe, fe->reg->id, &fe->reg->base, &reg_file_cinfo);
++		if(!ret) {
++			ret = insert_id_fe_map_entry(fe->id, fe);
++		}
+ 		break;
+ 	case FD_TYPES__INETSK:
+ 		ret = collect_one_file_entry(fe, fe->isk->id, &fe->isk->base, &inet_sk_cinfo);
+diff --git a/criu/id_fe_map.c b/criu/id_fe_map.c
+new file mode 100644
+index 0000000..080a633
+--- /dev/null
++++ b/criu/id_fe_map.c
+@@ -0,0 +1,77 @@
++#include "rdma_migr.h"
++#include "include/rbtree.h"
++
++static declare_and_init_rbtree(id_fe_map);
++
++struct id_fe_map_entry {
++	struct rb_node				entry;
++	uint32_t					id;
++	void						*ptr;
++};
++
++static inline struct id_fe_map_entry *to_id_fe_map_entry(struct rb_node *node) {
++	return node? container_of(node, struct id_fe_map_entry, entry): NULL;
++}
++
++static int id_fe_map_entry_compare(const struct rb_node *node1, const struct rb_node *node2) {
++	struct id_fe_map_entry *ent1 = node1? container_of(node1, struct id_fe_map_entry, entry): NULL;
++	struct id_fe_map_entry *ent2 = node2? container_of(node2, struct id_fe_map_entry, entry): NULL;
++	if(ent1->id < ent2->id) {
++		return -1;
++	}
++	else if(ent1->id > ent2->id) {
++		return 1;
++	}
++
++	return 0;
++}
++
++static struct id_fe_map_entry *search_id_fe_map_entry(uint32_t id,
++				struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct id_fe_map_entry target = {.id = id};
++	struct rb_node *match = ___search(&target.entry, &id_fe_map, p_parent, p_insert,
++					SEARCH_EXACTLY, id_fe_map_entry_compare);
++	return to_id_fe_map_entry(match);
++}
++
++int insert_id_fe_map_entry(uint32_t id, void *ptr) {
++	struct id_fe_map_entry *ent;
++	struct rb_node *parent, **insert;
++
++	pthread_rwlock_wrlock(&id_fe_map.rwlock);
++	ent = search_id_fe_map_entry(id, &parent, &insert);
++	if(ent) {
++		pthread_rwlock_unlock(&id_fe_map.rwlock);
++		return -EEXIST;
++	}
++
++	ent = malloc(sizeof(*ent));
++	if(!ent) {
++		pthread_rwlock_unlock(&id_fe_map.rwlock);
++		return -ENOMEM;
++	}
++
++	ent->id = id;
++	ent->ptr = ptr;
++	rbtree_add_node(&ent->entry, parent, insert, &id_fe_map);
++	pthread_rwlock_unlock(&id_fe_map.rwlock);
++
++	return 0;
++}
++
++void *get_fe_ptr_from_id(uint32_t id) {
++	struct id_fe_map_entry *ent;
++	void *ptr;
++
++	pthread_rwlock_rdlock(&id_fe_map.rwlock);
++	ent = search_id_fe_map_entry(id, NULL, NULL);
++	if(!ent) {
++		pthread_rwlock_unlock(&id_fe_map.rwlock);
++		return NULL;
++	}
++
++	ptr = ent->ptr;
++	pthread_rwlock_unlock(&id_fe_map.rwlock);
++
++	return ptr;
++}
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index c7e98c7..23e8c72 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -37,6 +37,8 @@
+ #define CPU_CAP_ALL	(CPU_CAP_FPU | CPU_CAP_CPU | CPU_CAP_INS)
+ #define CPU_CAP_DEFAULT (CPU_CAP_FPU | CPU_CAP_INS)
+ 
++extern int timens_helper_pid;
++
+ struct cg_root_opt {
+ 	struct list_head node;
+ 	char *controller;
+@@ -109,6 +111,7 @@ enum criu_mode {
+ 	CR_UNSET = 0,
+ 	CR_DUMP,
+ 	CR_PRE_DUMP,
++	CR_PRE_DUMP_RDMA,
+ 	CR_RESTORE,
+ 	CR_LAZY_PAGES,
+ 	CR_CHECK,
+@@ -238,8 +241,13 @@ struct cr_options {
+ 	int unprivileged;
+ };
+ 
++#include <linux/limits.h>
++
+ extern struct cr_options opts;
++extern char images_dir[PATH_MAX];
++extern char images_dir_path[PATH_MAX];
+ extern char *rpc_cfg_file;
++extern FILE *fp;
+ 
+ extern int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, int state);
+ extern int check_options(void);
+diff --git a/criu/include/mem.h b/criu/include/mem.h
+index 03574ea..9aa99eb 100644
+--- a/criu/include/mem.h
++++ b/criu/include/mem.h
+@@ -7,6 +7,7 @@
+ #include "pid.h"
+ #include "proc_parse.h"
+ #include "inventory.pb-c.h"
++#include "mm.pb-c.h"
+ 
+ struct parasite_ctl;
+ struct vm_area_list;
+@@ -25,6 +26,8 @@ extern bool vma_has_guard_gap_hidden(struct vma_area *vma);
+ extern bool page_is_zero(u64 pme);
+ extern bool page_in_parent(bool dirty);
+ extern int prepare_mm_pid(struct pstree_item *i);
++extern int get_vm_area_list(struct pstree_item *i,
++			struct vm_area_list *vmas, MmEntry **p_mm);
+ extern void prepare_cow_vmas(void);
+ extern int do_task_reset_dirty_track(int pid);
+ extern unsigned long dump_pages_args_size(struct vm_area_list *vmas);
+@@ -46,6 +49,7 @@ struct task_restore_args;
+ int open_vmas(struct pstree_item *t);
+ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta);
+ int unmap_guard_pages(struct pstree_item *t);
+-int prepare_mappings(struct pstree_item *t);
++int prepare_mappings(struct pstree_item *t, bool enqueue_page);
++int only_prepare_rdma_mappings(struct pstree_item *t);
+ bool should_dump_page(VmaEntry *vmae, u64 pme);
+ #endif /* __CR_MEM_H__ */
+diff --git a/criu/include/pid.h b/criu/include/pid.h
+index b2b7a36..daa9821 100644
+--- a/criu/include/pid.h
++++ b/criu/include/pid.h
+@@ -35,6 +35,7 @@ struct pid {
+ 	 * that caused task to stop.
+ 	 */
+ 	int stop_signo;
++	int max_fd;
+ 
+ 	/*
+ 	 * The @virt pid is one which used in the image itself and keeps
+diff --git a/criu/include/rbtree.h b/criu/include/rbtree.h
+index ba0a810..195f7a5 100644
+--- a/criu/include/rbtree.h
++++ b/criu/include/rbtree.h
+@@ -91,4 +91,72 @@ static inline void rb_link_and_balance(struct rb_root *root, struct rb_node *nod
+ 	rb_insert_color(node, root);
+ }
+ 
++/* rbtree_wrap */
++#include <pthread.h>
++
++struct rbtree_struct {
++	struct rb_root				tree;
++	pthread_rwlock_t			rwlock;
++};
++
++enum search_ops {
++	/* Search the element exactly the same as what is specified */
++	SEARCH_EXACTLY									= 0,
++	/* Search the last precursor of the specified item */
++	SEARCH_LAST_PRECURSOR							= 2,
++	/* Search the last precursor of the specified item.
++	 * If there is the item exactly the same as what is specified,
++	 * then return it */
++	SEARCH_LAST_PRECURSOR_INC_ITSELF				= 3,
++	/* Search the first successor of the specified item */
++	SEARCH_FIRST_SUCCESSOR							= 4,
++	/* Search the first successor of the specified item.
++	 * If there is the item exactly the same as what is specified,
++	 * then return it */
++	SEARCH_FIRST_SUCCESSOR_INC_ITSELF				= 5,
++};
++
++enum TRACE_DIRECTION {
++	LEFT,
++	RIGHT,
++};
++
++#define declare_and_init_rbtree(var)								\
++	struct rbtree_struct var = {									\
++		.tree				= RB_ROOT,								\
++		.rwlock				= PTHREAD_RWLOCK_INITIALIZER,			\
++	}
++
++extern struct rb_node *___search(const struct rb_node *target, struct rbtree_struct *rbtree,
++						struct rb_node **p_parent, struct rb_node ***p_insert, enum search_ops ops,
++						int (*compare)(const struct rb_node*, const struct rb_node*));
++
++static inline void rbtree_add_node(struct rb_node *new_node, struct rb_node *parent,
++					struct rb_node **insert, struct rbtree_struct *rbtree) {
++	rb_link_node(new_node, parent, insert);
++	rb_insert_color(new_node, &rbtree->tree);
++}
++
++static inline void rbtree_rm_node(struct rb_node *target, struct rbtree_struct *rbtree) {
++	rb_erase(target, &rbtree->tree);
++}
++
++static inline void clean_rbtree(struct rbtree_struct *rbtree,
++				void (*free_fn)(struct rb_node *node)) {
++	struct rb_node *root_node;
++	while((root_node = rbtree->tree.rb_node)) {
++		rb_erase(root_node, &rbtree->tree);
++		free_fn(root_node);
++	}
++}
++
++#define for_each_rbtree_entry(entry, rbtree, to_entry_fn, member)					\
++	for(entry = to_entry_fn(rb_first(&(rbtree)->tree));								\
++			entry; entry = to_entry_fn(rb_next(&entry->member)))
++
++#define for_each_rbtree_entry_safe(entry, tmp, rbtree, to_entry_fn, member)			\
++	for(entry = to_entry_fn(rb_first(&(rbtree)->tree)),								\
++			tmp = entry? to_entry_fn(rb_next(&entry->member)): NULL;				\
++			entry; entry = tmp, tmp = entry? to_entry_fn(rb_next(&entry->member)): NULL)
++
+ #endif /* __CR_RBTREE_H__ */
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index bc0beb5..ef9a14b 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -133,10 +133,57 @@ struct restore_vma_io {
+ 	struct iovec iovs[0];
+ };
+ 
++struct unmapped_node {
++	unsigned long long				start;
++	unsigned long long				end;
++};
++
++struct update_mem_node {
++	void					*ptr;
++	size_t					size;
++	void					*content_p;
++	char					msg[0];
++};
++
++struct qp_replay_call_entry {
++	void				*cb;
++	void				*qp;
++	char				msg[0];
++};
++
++struct srq_replay_call_entry {
++	void				*cb;
++	void				*srq;
++	int					head;
++	int					tail;
++	char				msg[0];
++};
++
++#include <arpa/inet.h>
++
++struct send_msg_entry {
++	struct sockaddr_in		remote_addr;
++	size_t					size;
++	void					*buf;
++};
++
+ #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
+ 
+ struct task_restore_args {
+ 	struct thread_restore_args *t; /* thread group leader */
++	void						*base;
++	struct unmapped_node *unmapped;
++	int n_unmapped;
++	struct update_mem_node			*update_arr;
++	int								n_update;
++	struct qp_replay_call_entry		*qp_replay_arr;
++	int								n_qp_replay;
++	struct srq_replay_call_entry	*srq_replay_arr;
++	int								n_srq_replay;
++	struct send_msg_entry			*msg_arr;
++	int								n_msg;
++
++	pid_t prerestore_parent_pid;
+ 
+ 	int fd_exe_link; /* opened self->exe file */
+ 	int logfd;
+diff --git a/criu/include/rst_info.h b/criu/include/rst_info.h
+index d0a3db6..2660c8d 100644
+--- a/criu/include/rst_info.h
++++ b/criu/include/rst_info.h
+@@ -10,6 +10,9 @@
+ 
+ struct task_entries {
+ 	int nr_threads, nr_tasks, nr_helpers;
++	int nr_to_wait;
++	futex_t futex_n_wait;
++	futex_t futex_n_wait_2;
+ 	futex_t nr_in_progress;
+ 	futex_t start;
+ 	atomic_t cr_err;
+diff --git a/criu/include/timens.h b/criu/include/timens.h
+index 0567c58..ddc826b 100644
+--- a/criu/include/timens.h
++++ b/criu/include/timens.h
+@@ -2,7 +2,9 @@
+ #define __CR_TIME_NS_H__
+ 
+ extern int dump_time_ns(int ns_id);
+-extern int prepare_timens(int pid);
++extern int prepare_timens(int id);
++extern int prepare_timens_v2(int id, pid_t pid);
++extern int join_new_timens(pid_t pid);
+ 
+ extern struct ns_desc time_ns_desc;
+ extern struct ns_desc time_for_children_ns_desc;
+diff --git a/criu/mem.c b/criu/mem.c
+index ab86a1f..a36dbb6 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -651,6 +651,88 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
+ 	return ret;
+ }
+ 
++int get_vm_area_list(struct pstree_item *i,
++			struct vm_area_list *vmas, MmEntry **p_mm) {
++	pid_t pid = vpid(i);
++	struct cr_img *img;
++	MmEntry *mm;
++	int ret = -1, vn = 0;
++
++	vm_area_list_init(vmas);
++
++	img = open_image(CR_FD_MM, O_RSTR, pid);
++	if(!img) {
++		return -1;
++	}
++
++	ret = pb_read_one_eof(img, &mm, PB_MM);
++	close_image(img);
++	if(ret <= 0) {
++		return ret;
++	}
++
++	if(p_mm)
++		*p_mm = mm;
++
++	if(collect_special_file(mm->exe_file_id) == NULL) {
++		return -1;
++	}
++
++	pr_debug("Found %zd VMAs in image\n", mm->n_vmas);
++	img = NULL;
++	if(mm->n_vmas == 0) {
++		img = open_image(CR_FD_VMAS, O_RSTR, pid);
++		if(!img) {
++			return -1;
++		}
++	}
++
++	while(vn < mm->n_vmas || img != NULL) {
++		struct vma_area *vma;
++
++		ret = -1;
++		vma = alloc_vma_area();
++		if(!vma)
++			break;
++
++		vmas->nr++;
++		if(!img)
++			vma->e = mm->vmas[vn++];
++		else {
++			ret = pb_read_one_eof(img, &vma->e, PB_VMA);
++			if(ret <= 0) {
++				xfree(vma);
++				close_image(img);
++				img = NULL;
++				break;
++			}
++		}
++
++		list_add_tail(&vma->list, &vmas->h);
++
++		if(vma_area_is_private(vma, kdat.task_size)) {
++			vmas->rst_priv_size += vma_area_len(vma);
++			if(vma_has_guard_gap_hidden(vma))
++				vmas->rst_priv_size += PAGE_SIZE;
++		}
++
++		if(vma_area_is(vma, VMA_ANON_SHARED))
++			ret = collect_shmem(pid, vma);
++		else if(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED))
++			ret = collect_filemap(vma);
++		else if (vma_area_is(vma, VMA_AREA_SOCKET))
++			ret = collect_socket_map(vma);
++		else
++			ret = 0;
++		if (ret)
++			break;
++	}
++
++	if(img)
++		close_image(img);
++	return ret;
++}
++
+ int prepare_mm_pid(struct pstree_item *i)
+ {
+ 	pid_t pid = vpid(i);
+@@ -1012,10 +1094,15 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
+ 			continue;
+ 		}
+ 
+-		ret = premap_private_vma(t, vma, at);
++		if(!vma_area_is(vma, VMA_PREMMAPED)) {
++			ret = premap_private_vma(t, vma, at);
+ 
+-		if (ret < 0)
+-			break;
++			if (ret < 0)
++				break;
++		}
++		else {
++			*at += vma_entry_len(vma->e);
++		}
+ 	}
+ 
+ 	filemap_ctx_fini();
+@@ -1023,9 +1110,12 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
+ 	return ret;
+ }
+ 
+-static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
++#include "rdma_migr.h"
++
++static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr, bool enqueue_page)
+ {
+ 	struct vma_area *vma;
++	struct vma_area *last_vma = NULL;
+ 	int ret = 0;
+ 	struct list_head *vmas = &rsti(t)->vmas.h;
+ 	struct list_head *vma_io = &rsti(t)->vma_io;
+@@ -1064,7 +1154,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+ 			continue;
+ 		}
+ 
+-		for (i = 0; i < nr_pages; i++) {
++		for (i = 0; i < nr_pages; i++, last_vma = vma) {
+ 			unsigned char buf[PAGE_SIZE];
+ 			void *p;
+ 
+@@ -1100,8 +1190,11 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+ 					BUG();
+ 				}
+ 
++				if(enqueue_page) {
+ 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
+ 					return -1;
++					pr_debug("Enqueue page-read\n");
++				}
+ 
+ 				pr->skip_pages(pr, len);
+ 
+@@ -1109,7 +1202,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+ 				len >>= PAGE_SHIFT;
+ 				nr_restored += len;
+ 				i += len - 1;
+-				pr_debug("Enqueue page-read\n");
++
+ 				continue;
+ 			}
+ 
+@@ -1122,6 +1215,23 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+ 
+ 			set_bit(off, vma->page_bitmap);
+ 			if (vma_inherited(vma)) {
++				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
++					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
++
++					if (vma->e->status & VMA_NO_PROT_WRITE) {
++						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
++							vma->e->end, va, nr_pages);
++						BUG();
++					}
++
++					if(enqueue_page) {
++					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
++						return -1;
++					
++					pr_debug("Enqueue page-read\n");
++				}
++				}
++
+ 				clear_bit(off, vma->pvma->page_bitmap);
+ 
+ 				ret = pr->read_pages(pr, va, 1, buf, 0);
+@@ -1141,6 +1251,23 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+ 			} else {
+ 				int nr;
+ 
++				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
++					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
++
++					if (vma->e->status & VMA_NO_PROT_WRITE) {
++						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
++							vma->e->end, va, nr_pages);
++						BUG();
++					}
++
++					if(enqueue_page) {
++					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
++						return -1;
++					
++					pr_debug("Enqueue page-read\n");
++				}
++				}
++
+ 				/*
+ 				 * Try to read as many pages as possible at once.
+ 				 *
+@@ -1247,7 +1374,153 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
+ 	return 0;
+ }
+ 
+-int prepare_mappings(struct pstree_item *t)
++static int only_premap_rdma_private_vma(struct pstree_item *t, struct vma_area *vma)
++{
++	int ret;
++	void *addr;
++	unsigned long nr_pages, size;
++
++	nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
++	vma->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
++	if (vma->page_bitmap == NULL)
++		return -1;
++
++	/*
++	 * A grow-down VMA has a guard page, which protect a VMA below it.
++	 * So one more page is mapped here to restore content of the first page
++	 */
++	if (vma_has_guard_gap_hidden(vma))
++		vma->e->start -= PAGE_SIZE;
++
++	size = vma_entry_len(vma->e);
++	if (!vma_inherited(vma)) {
++		int flag = 0;
++		/*
++		 * The respective memory area was NOT found in the parent.
++		 * Map a new one.
++		 */
++
++		/*
++		 * Restore AIO ring buffer content to temporary anonymous area.
++		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
++		 */
++		if (vma_entry_is(vma->e, VMA_AREA_AIORING))
++			flag |= MAP_ANONYMOUS;
++		else if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
++			ret = vma->vm_open(vpid(t), vma);
++			if (ret < 0) {
++				pr_err("Can't fixup VMA's fd\n");
++				return -1;
++			}
++		}
++
++		/*
++		 * All mappings here get PROT_WRITE regardless of whether we
++		 * put any data into it or not, because this area will get
++		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
++		 * bits there. Ideally we'd check for the whole COW-chain
++		 * having any data in.
++		 */
++		pr_info("Detect RDMA mem mapping %lx-%lx. Now map in.\n", vma->e->start, vma->e->end);
++		addr = mmap((void *)vma->e->start, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
++			    vma->e->pgoff);
++
++		if (addr == MAP_FAILED) {
++			pr_perror("Unable to map ANON_VMA");
++			return -1;
++		}
++	} else {
++		void *paddr;
++
++		/*
++		 * The area in question can be COWed with the parent. Remap the
++		 * parent area. Note, that it has already being passed through
++		 * the restore_priv_vma_content() call and thus may have some
++		 * pages in it.
++		 */
++
++		paddr = decode_pointer(vma->pvma->premmaped_addr);
++		if (vma_has_guard_gap_hidden(vma))
++			paddr -= PAGE_SIZE;
++
++		addr = mremap(paddr, size, size, MREMAP_FIXED | MREMAP_MAYMOVE, (void *)vma->e->start);
++		if (addr != (void *)vma->e->start) {
++			pr_perror("Unable to remap a private vma");
++			return -1;
++		}
++	}
++
++	vma->e->status |= VMA_PREMMAPED;
++	vma->premmaped_addr = (unsigned long)addr;
++	pr_debug("\tpremap %#016" PRIx64 "-%#016" PRIx64 " -> %016lx\n", vma->e->start, vma->e->end,
++		 (unsigned long)addr);
++
++	if (vma_has_guard_gap_hidden(vma)) { /* Skip guard page */
++		vma->e->start += PAGE_SIZE;
++		vma->premmaped_addr += PAGE_SIZE;
++	}
++
++	if (vma_area_is(vma, VMA_FILE_PRIVATE))
++		vma->vm_open = NULL; /* prevent from 2nd open in prepare_vmas */
++
++	return 0;
++}
++
++static int only_premap_rdma_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas)
++{
++	struct vma_area *vma;
++	int ret = 0;
++	LIST_HEAD(empty);
++
++	filemap_ctx_init(true);
++
++	list_for_each_entry(vma, &vmas->h, list) {
++		if (task_size_check(vpid(t), vma->e)) {
++			ret = -1;
++			break;
++		}
++		
++		if(!check_rdma_vma(vma->e->start, vma->e->end))
++			continue;
++
++		if (!vma_area_is_private(vma, kdat.task_size))
++			continue;
++
++		if (vma->e->flags & MAP_HUGETLB)
++			continue;
++
++		/* VMA offset may change due to plugin so we cannot premap */
++		if (vma->e->status & VMA_EXT_PLUGIN)
++			continue;
++
++		ret = only_premap_rdma_private_vma(t, vma);
++
++		if (ret < 0)
++			break;
++	}
++
++	filemap_ctx_fini();
++
++	return ret;
++}
++
++int only_prepare_rdma_mappings(struct pstree_item *t) {
++	int ret = 0;
++	struct vm_area_list *vmas;
++
++	vmas = &rsti(t)->vmas;
++	if (vmas->nr == 0) /* Zombie */
++		goto out;
++
++	ret = only_premap_rdma_priv_vmas(t, vmas);
++	if (ret < 0)
++		goto out;
++
++out:
++	return ret;
++}
++
++int prepare_mappings(struct pstree_item *t, bool enqueue_page)
+ {
+ 	int ret = 0;
+ 	void *addr;
+@@ -1269,8 +1542,10 @@ int prepare_mappings(struct pstree_item *t)
+ 		goto out;
+ 	}
+ 
+-	old_premmapped_addr = rsti(t)->premmapped_addr;
+-	old_premmapped_len = rsti(t)->premmapped_len;
++//	old_premmapped_addr = rsti(t)->premmapped_addr;
++//	old_premmapped_len = rsti(t)->premmapped_len;
++	old_premmapped_addr = NULL;
++	old_premmapped_len = 0;
+ 	rsti(t)->premmapped_addr = addr;
+ 	rsti(t)->premmapped_len = vmas->rst_priv_size;
+ 
+@@ -1289,7 +1564,7 @@ int prepare_mappings(struct pstree_item *t)
+ 
+ 	pr.reset(&pr);
+ 
+-	ret = restore_priv_vma_content(t, &pr);
++	ret = restore_priv_vma_content(t, &pr, enqueue_page);
+ 	if (ret < 0)
+ 		goto out;
+ 
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 5e78e74..16f2d3f 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -785,7 +785,9 @@ unsigned long arch_shmat(int shmid, void *shmaddr, int shmflg, unsigned long siz
+ }
+ #endif
+ 
+-static unsigned long restore_mapping(VmaEntry *vma_entry)
++static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry);
++
++static unsigned long restore_mapping(struct task_restore_args *args, VmaEntry *vma_entry)
+ {
+ 	int prot = vma_entry->prot;
+ 	int flags = vma_entry->flags | MAP_FIXED;
+@@ -844,8 +846,12 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
+ 	 * writable since we're going to restore page
+ 	 * contents.
+ 	 */
++	if(!check_is_rdma_mmap(args, vma_entry))
+ 	addr = sys_mmap(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), prot, flags, vma_entry->fd,
+ 			vma_entry->pgoff);
++	else {
++		addr = vma_entry->start;
++	}
+ 
+ 	if ((vma_entry->fd != -1) && (vma_entry->status & VMA_CLOSE))
+ 		sys_close(vma_entry->fd);
+@@ -1242,6 +1248,39 @@ static void unregister_libc_rseq(struct rst_rseq_param *rseq)
+ 	sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 1, rseq->signature);
+ }
+ 
++static int my_munmap_without_unmapping_rdma(struct unmapped_node *unmapped, int n_unmapped,
++						void *addr, size_t length, int *index) {
++	void *unmap_start = addr;
++	int i;
++	int ret;
++
++	for(i = *index; i < n_unmapped && unmapped[i].end <= (unsigned long long)addr + length; i++) {
++		if((unsigned long long)unmap_start == unmapped[i].start) {
++			unmap_start = (void*)unmapped[i].end;
++			continue;
++		}
++
++		ret = sys_munmap(unmap_start, unmapped[i].start - (unsigned long long)unmap_start);
++		if(ret) {
++			pr_err("Failed to unmap %llx-%llx\n", (unsigned long long)unmap_start, unmapped[i].start);
++			return ret;
++		}
++
++		unmap_start = (void*)unmapped[i].end;
++	}
++
++	if(unmap_start == addr + length)
++		return 0;
++
++	ret = sys_munmap(unmap_start, addr + length - unmap_start);
++	if(ret) {
++		pr_err("Failed to unmap %llx-%llx\n", (unsigned long long)unmap_start, (unsigned long long)addr + length);
++	}
++
++	*index = i;
++	return ret;
++}
++
+ /*
+  * This function unmaps all VMAs, which don't belong to
+  * the restored process or the restorer.
+@@ -1259,11 +1298,12 @@ static void unregister_libc_rseq(struct rst_rseq_param *rseq)
+  * [ 2nd start -- task_size ]
+  */
+ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, void *bootstrap_start,
+-			  unsigned long bootstrap_len, unsigned long task_size)
++			  unsigned long bootstrap_len, unsigned long task_size, struct unmapped_node *unmapped, int n_unmapped)
+ {
+ 	unsigned long s1, s2;
+ 	void *p1, *p2;
+ 	int ret;
++	int i = 0;
+ 
+ 	if (premmapped_addr < bootstrap_start) {
+ 		p1 = premmapped_addr;
+@@ -1277,19 +1317,19 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, v
+ 		s1 = bootstrap_len;
+ 	}
+ 
+-	ret = sys_munmap(NULL, p1 - NULL);
++	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, NULL, p1 - NULL, &i);
+ 	if (ret) {
+ 		pr_err("Unable to unmap (%p-%p): %d\n", NULL, p1, ret);
+ 		return -1;
+ 	}
+ 
+-	ret = sys_munmap(p1 + s1, p2 - (p1 + s1));
++	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, p1 + s1, p2 - (p1 + s1), &i);
+ 	if (ret) {
+ 		pr_err("Unable to unmap (%p-%p): %d\n", p1 + s1, p2, ret);
+ 		return -1;
+ 	}
+ 
+-	ret = sys_munmap(p2 + s2, task_size - (unsigned long)(p2 + s2));
++	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, p2 + s2, task_size - (unsigned long)(p2 + s2), &i);
+ 	if (ret) {
+ 		pr_err("Unable to unmap (%p-%p): %d\n", p2 + s2, (void *)task_size, ret);
+ 		return -1;
+@@ -1495,6 +1535,27 @@ int cleanup_current_inotify_events(struct task_restore_args *task_args)
+ 	return 0;
+ }
+ 
++static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry) {
++	int start = 0, end = args->n_unmapped - 1;
++
++	while(start <= end) {
++		int mid = (start + end) / 2;
++		if(vma_entry->start == args->unmapped[mid].start) {
++			return 1;
++		}
++		else if(vma_entry->start < args->unmapped[mid].start) {
++			end = mid - 1;
++		}
++		else {
++			start = mid + 1;
++		}
++	}
++
++	return 0;
++}
++
++#include <linux/un.h>
++
+ /*
+  * The main routine to restore task via sigreturn.
+  * This one is very special, we never return there
+@@ -1516,6 +1577,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 	pid_t my_pid = sys_getpid();
+ 	rt_sigaction_t act;
+ 	bool has_vdso_proxy;
++	int sk;
+ 
+ 	bootstrap_start = args->bootstrap_start;
+ 	bootstrap_len = args->bootstrap_len;
+@@ -1591,7 +1653,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 	unregister_libc_rseq(&args->libc_rseq);
+ 
+ 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len, bootstrap_start, bootstrap_len,
+-			   args->task_size))
++			   args->task_size, args->unmapped, args->n_unmapped))
+ 		goto core_restore_end;
+ 
+ 	/* Map vdso that wasn't parked */
+@@ -1663,10 +1725,19 @@ long __export_restore_task(struct task_restore_args *args)
+ 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
+ 			continue;
+ 
+-		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
++		/* If the vma is for rdma, it has been pre-mapped to the exact location,
++		 * so we just skip it (only valid for non mem pre-copy mode).
++		 * We need to re-think it when supporting mem pre-copy.
++		 */
++		if (!check_is_rdma_mmap(args, vma_entry) &&
++					vma_entry_is(vma_entry, VMA_PREMMAPED))
+ 			continue;
+ 
+-		va = restore_mapping(vma_entry);
++		if(check_is_rdma_mmap(args, vma_entry)) {
++			continue;
++		}
++
++		va = restore_mapping(args, vma_entry);
+ 
+ 		if (va != vma_entry->start) {
+ 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
+@@ -1775,6 +1846,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 			if (vma_entry->madv & (1ul << m)) {
+ 				ret = sys_madvise(vma_entry->start, vma_entry_len(vma_entry), m);
+ 				if (ret) {
++					pr_err("vma madvise failed at %d. %lx-%lx\n", i, vma_entry->start, vma_entry->end);
+ 					pr_err("madvise(%" PRIx64 ", %" PRIu64 ", %ld) "
+ 					       "failed with %ld\n",
+ 					       vma_entry->start, vma_entry_len(vma_entry), m, ret);
+@@ -2061,7 +2133,6 @@ long __export_restore_task(struct task_restore_args *args)
+ 	futex_wait_while_gt(&thread_inprogress, 1);
+ 
+ 	sys_close(args->proc_fd);
+-	std_log_set_fd(-1);
+ 
+ 	/*
+ 	 * The code that prepared the itimers makes sure that the
+@@ -2079,6 +2150,57 @@ long __export_restore_task(struct task_restore_args *args)
+ 
+ 	restore_posix_timers(args);
+ 
++	pr_info("Update RDMA metadata\n");
++	for(int i = 0; i < args->n_update; i++) {
++		memcpy(args->update_arr[i].ptr, args->update_arr[i].content_p,
++										args->update_arr[i].size);
++	}
++
++	pr_info("Replay recv wr on QP\n");
++	for(int i = 0; i < args->n_qp_replay; i++) {
++		int (*qp_replay_cb)(void *qp);
++		qp_replay_cb = args->qp_replay_arr[i].cb;
++		if(qp_replay_cb(args->qp_replay_arr[i].qp)) {
++			return -1;
++		}
++	}
++
++	pr_info("Replay recv wr on SRQ\n");
++	for(int i = 0; i < args->n_srq_replay; i++) {
++		int (*srq_replay_cb)(void *srq, int head, int tail);
++		srq_replay_cb = args->srq_replay_arr[i].cb;
++		if(srq_replay_cb(args->srq_replay_arr[i].srq,
++					args->srq_replay_arr[i].head,
++					args->srq_replay_arr[i].tail)) {
++			return -1;
++		}
++	}
++
++	pr_info("Notify partners to restore\n");
++	sk = sys_socket(AF_INET, SOCK_DGRAM, 0);
++	for(int i = 0; i < args->n_msg; i++) {
++		int sent_size = 0;
++		int this_size;
++		size_t size = args->msg_arr[i].size;
++		void *buf = args->msg_arr[i].buf;
++		struct sockaddr_in remote_addr;
++
++		memcpy(&remote_addr, &args->msg_arr[i].remote_addr, sizeof(remote_addr));
++		while(sent_size < size) {
++			this_size = sys_sendto(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
++									0, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
++			if(this_size < 0) {
++		return -1;
++	}
++
++			sent_size += this_size;
++		}
++		sys_sendto(sk, NULL, 0, 0, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
++	}
++	sys_close(sk);
++
++	pr_info("Restore RDMA communication finish\n");
++
+ 	sys_munmap(args->rst_mem, args->rst_mem_size);
+ 
+ 	/*
+@@ -2086,6 +2208,31 @@ long __export_restore_task(struct task_restore_args *args)
+ 	 */
+ 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
+ 
++	{
++		int sock = sys_socket(AF_UNIX, SOCK_DGRAM, 0);
++		struct sockaddr_un sock_un;
++		char buf[32];
++		int err;
++
++		if(sock < 0) {
++			pr_err("Unable to create unix socket to notify CRIU\n");
++			return -1;
++		}
++
++		memset(&sock_un, 0, sizeof(sock_un));
++		sock_un.sun_family = AF_UNIX;
++		std_sprintf(sock_un.sun_path, "/dev/shm/fullrestore.sock");
++		err = sys_sendto(sock, buf, 32, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
++		if(err < 0) {
++			pr_err("Unable to notify CRIU\n");
++			return -1;
++		}
++
++		sys_close(sock);
++	}
++
++	std_log_set_fd(-1);
++
+ 	/*
+ 	 * Prepare the stack and call for sigreturn,
+ 	 * pure assembly since we don't need any additional
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index 5e96b5c..db066f2 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -186,8 +186,8 @@ static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
+ 	 * only exception is VVAR area that mapped by the kernel as
+ 	 * VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP
+ 	 */
+-	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED))
+-		vma_area->e->status |= VMA_UNSUPP;
++//	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED))
++//		vma_area->e->status |= VMA_UNSUPP;
+ 
+ 	if (vma_area->e->madv)
+ 		vma_area->e->has_madv = true;
+@@ -807,10 +807,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
+ 		if (eof)
+ 			break;
+ 
+-		vma_area = alloc_vma_area();
+-		if (!vma_area)
+-			goto err;
+-
++parse_vma_file:
+ 		num = sscanf(str, "%lx-%lx %c%c%c%c %lx %x:%x %lu %n", &start, &end, &r, &w, &x, &s, &pgoff,
+ 			     &vfi.dev_maj, &vfi.dev_min, &vfi.ino, &path_off);
+ 		if (num < 10) {
+@@ -818,6 +815,33 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
+ 			goto err;
+ 		}
+ 
++		if(!strncmp(str + path_off, "/dev/infiniband/", 16)) {
++			pr_info("Skip mapping of file %s\n", str + path_off);
++read_line:
++			str = breadline(&f);
++			if (IS_ERR(str))
++				goto err;
++			eof = (str == NULL);
++
++			if (!eof && !__is_vma_range_fmt(str)) {
++				if (!strncmp(str, "VmFlags: ", 9)) {
++					BUG_ON(!vma_area);
++					parse_vma_vmflags(&str[9], vma_area);
++					goto read_line;
++				} else
++					goto read_line;
++			}
++
++			if (eof)
++				break;
++
++			goto parse_vma_file;
++		}
++
++		vma_area = alloc_vma_area();
++		if (!vma_area)
++			goto err;
++
+ 		vma_area->e->start = start;
+ 		vma_area->e->end = end;
+ 		vma_area->e->pgoff = pgoff;
+diff --git a/criu/pstree.c b/criu/pstree.c
+index 8c44e71..4cc77a8 100644
+--- a/criu/pstree.c
++++ b/criu/pstree.c
+@@ -626,6 +626,7 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
+ 
+ 	task_entries->nr_threads += e->n_threads;
+ 	task_entries->nr_tasks++;
++	task_entries->nr_to_wait++;
+ 
+ 	/* note: we don't fail if we have empty ids */
+ 	if (read_pstree_ids(pi) < 0)
+diff --git a/criu/rbtree.c b/criu/rbtree.c
+index ad619f3..b3298c2 100644
+--- a/criu/rbtree.c
++++ b/criu/rbtree.c
+@@ -352,3 +352,86 @@ void rb_replace_node(struct rb_node *victim, struct rb_node *new, struct rb_root
+ 	/* Copy the pointers/colour from the victim to the replacement */
+ 	*new = *victim;
+ }
++
++/* rbtree_wrap */
++enum TRAV_DIRECTION {
++	GO_LEFT,
++	GO_RIGHT,
++	NO_DIRECTION,
++};
++
++struct rb_node *___search(const struct rb_node *target, struct rbtree_struct *rbtree,
++						struct rb_node **p_parent, struct rb_node ***p_insert, enum search_ops ops,
++						int (*compare)(const struct rb_node*, const struct rb_node*)) {
++	struct rb_node *parent = NULL;
++	struct rb_node **insert = &rbtree->tree.rb_node;
++	struct rb_node *node = rbtree->tree.rb_node;
++	enum TRAV_DIRECTION direction = NO_DIRECTION;
++
++	while(node) {
++		parent = node;
++
++		if(compare(target, node) < 0) {
++			node = node->rb_left;
++			insert = &(*insert)->rb_left;
++			direction = GO_LEFT;
++		}
++		else if(compare(target, node) > 0) {
++			node = node->rb_right;
++			insert = &(*insert)->rb_right;
++			direction = GO_RIGHT;
++		}
++		else {
++			switch(ops) {
++			case SEARCH_EXACTLY:
++			case SEARCH_LAST_PRECURSOR_INC_ITSELF:
++			case SEARCH_FIRST_SUCCESSOR_INC_ITSELF:
++				parent = NULL;
++				insert = NULL;
++				goto out;
++			case SEARCH_LAST_PRECURSOR:
++				node = node->rb_left;
++				insert = &(*insert)->rb_left;
++				direction = GO_LEFT;
++				break;
++			case SEARCH_FIRST_SUCCESSOR:
++				node = node->rb_right;
++				insert = &(*insert)->rb_right;
++				direction = GO_RIGHT;
++				break;
++			}
++		}
++	}
++
++	if((!parent) || (ops == SEARCH_EXACTLY))
++		goto out;
++
++	if(p_parent)
++		*p_parent = parent;
++
++	while(parent && (((ops & SEARCH_LAST_PRECURSOR) && direction == GO_LEFT) ||
++				((ops & SEARCH_FIRST_SUCCESSOR) && direction == GO_RIGHT))) {
++		struct rb_node *grandpa = rb_parent(parent);
++		if(!grandpa)
++			direction = NO_DIRECTION;
++		else if(grandpa->rb_left == parent)
++			direction = GO_LEFT;
++		else
++			direction = GO_RIGHT;
++		parent = grandpa;
++	}
++
++	node = parent;
++
++	if(p_insert)
++		*p_insert = insert;
++	
++	return node;
++
++out:
++	if(p_parent)
++		*p_parent = parent;
++	if(p_insert)
++		*p_insert = insert;
++	return node;
++}
+diff --git a/criu/rdma_migr.c b/criu/rdma_migr.c
+new file mode 100644
+index 0000000..8f2f314
+--- /dev/null
++++ b/criu/rdma_migr.c
+@@ -0,0 +1,1768 @@
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <linux/un.h>
++#include "rdma_migr.h"
++#include "debug.h"
++#include "include/rbtree.h"
++#include "include/mem.h"
++#include "include/pstree.h"
++#include "include/namespaces.h"
++#include "include/timens.h"
++#include "include/cr_options.h"
++
++static declare_and_init_rbtree(cq_dict);
++
++struct cq_dict_node {
++	struct rb_node				node;
++	int							cq_handle;
++	void						*cq_ptr;
++};
++
++static int cq_dict_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct cq_dict_node *ent1 = n1? container_of(n1, struct cq_dict_node, node): NULL;
++	struct cq_dict_node *ent2 = n2? container_of(n2, struct cq_dict_node, node): NULL;
++
++	return ent1->cq_handle - ent2->cq_handle;
++}
++
++static struct cq_dict_node *search_cq_dict_node(int cq_handle,
++						struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct cq_dict_node my_node = {.cq_handle = cq_handle};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &cq_dict, p_parent, p_insert,
++								SEARCH_EXACTLY, cq_dict_node_compare);
++	return node? container_of(node, struct cq_dict_node, node): NULL;
++}
++
++static int add_one_cq_dict_node(int cq_handle, struct ibv_cq *cq_ptr) {
++	struct rb_node *parent, **insert;
++	struct cq_dict_node *this_node;
++
++	pthread_rwlock_wrlock(&cq_dict.rwlock);
++	this_node = search_cq_dict_node(cq_handle, &parent, &insert);
++	if(this_node) {
++		pthread_rwlock_unlock(&cq_dict.rwlock);
++		return 0;
++	}
++
++	this_node = malloc(sizeof(*this_node));
++	if(!this_node) {
++		pthread_rwlock_unlock(&cq_dict.rwlock);
++		return -1;
++	}
++
++	this_node->cq_handle = cq_handle;
++	this_node->cq_ptr = cq_ptr;
++	rbtree_add_node(&this_node->node, parent, insert, &cq_dict);
++
++	pthread_rwlock_unlock(&cq_dict.rwlock);
++	return 0;
++}
++
++static struct ibv_cq *get_cq_ptr_from_handle(int cq_handle) {
++	struct cq_dict_node *this_node;
++
++	pthread_rwlock_rdlock(&cq_dict.rwlock);
++	this_node = search_cq_dict_node(cq_handle, NULL, NULL);
++	if(!this_node) {
++		pthread_rwlock_unlock(&cq_dict.rwlock);
++		return NULL;
++	}
++
++	pthread_rwlock_unlock(&cq_dict.rwlock);
++	return this_node->cq_ptr;
++}
++
++static declare_and_init_rbtree(srq_dict);
++
++struct srq_dict_node {
++	struct rb_node				node;
++	int							srq_handle;
++	void						*srq_ptr;
++};
++
++static int srq_dict_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct srq_dict_node *ent1 = n1? container_of(n1, struct srq_dict_node, node): NULL;
++	struct srq_dict_node *ent2 = n2? container_of(n2, struct srq_dict_node, node): NULL;
++
++	return ent1->srq_handle - ent2->srq_handle;
++}
++
++static struct srq_dict_node *search_srq_dict_node(int srq_handle,
++					struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct srq_dict_node my_node = {.srq_handle = srq_handle};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &srq_dict, p_parent, p_insert,
++							SEARCH_EXACTLY, srq_dict_node_compare);
++	return node? container_of(node, struct srq_dict_node, node): NULL;
++}
++
++static int add_one_srq_dict_node(int srq_handle, struct ibv_srq *srq_ptr) {
++	struct rb_node *parent, **insert;
++	struct srq_dict_node *this_node;
++
++	pthread_rwlock_wrlock(&srq_dict.rwlock);
++	this_node = search_srq_dict_node(srq_handle, &parent, &insert);
++	if(this_node) {
++		pthread_rwlock_unlock(&srq_dict.rwlock);
++		return 0;
++	}
++
++	this_node = malloc(sizeof(*this_node));
++	if(!this_node) {
++		pthread_rwlock_unlock(&srq_dict.rwlock);
++		return -1;
++	}
++
++	this_node->srq_handle = srq_handle;
++	this_node->srq_ptr = srq_ptr;
++	rbtree_add_node(&this_node->node, parent, insert, &srq_dict);
++
++	pthread_rwlock_unlock(&srq_dict.rwlock);
++	return 0;
++}
++
++static struct ibv_srq *get_srq_ptr_from_handle(int srq_handle) {
++	struct srq_dict_node *this_node;
++
++	pthread_rwlock_rdlock(&srq_dict.rwlock);
++	this_node = search_srq_dict_node(srq_handle, NULL, NULL);
++	if(!this_node) {
++		pthread_rwlock_unlock(&srq_dict.rwlock);
++		return NULL;
++	}
++
++	pthread_rwlock_unlock(&srq_dict.rwlock);
++	return this_node->srq_ptr;
++}
++
++static pid_t __rdma_pid__;
++
++#define mv_fd(pid_fd, new_pid)									\
++	if(dup2(pid_fd, new_pid) < 0) {								\
++		if(pid_fd >= 0)											\
++			close(pid_fd);										\
++		pid_fd = -1;											\
++	}															\
++	else {														\
++		close(pid_fd);											\
++		pid_fd = new_pid;										\
++	}
++
++static int __wait_for_proc_complete(pid_t pid) {
++	char fname[128];
++	int channel_fd;
++	int sig;
++
++	sprintf(fname, "/proc/rdma/%d/to_proc", pid);
++	channel_fd = open(fname, O_RDONLY);
++	if(channel_fd < 0) {
++		return -1;
++	}
++
++	dbg_info("Ready to get the signal from channel FD\n");
++	if(read(channel_fd, &sig, sizeof(int)) < 0) {
++		dbg_info("Error occurs. errno: %d\n", -errno);
++		close(channel_fd);
++		return -1;
++	}
++	dbg_info("Finish get the signal from channel FD\n");
++
++	close(channel_fd);
++	return 0;
++}
++
++int wait_for_proc_complete(pid_t pid) {
++	char fname[512];
++	int task_fd;
++	DIR *task_DIR;
++	struct dirent *task_dirent;
++	struct stat statbuf;
++
++	sprintf(fname, "/proc/rdma/%d", pid);
++	if(!stat(fname, &statbuf) && __wait_for_proc_complete(pid)) {
++		return -1;
++	}
++
++	sprintf(fname, "/proc/%d/task", pid);
++	task_fd = open(fname, O_DIRECTORY);
++	if(task_fd < 0) {
++		return -1;
++	}
++
++	task_DIR = fdopendir(task_fd);
++	while((task_dirent = readdir(task_DIR)) != NULL) {
++		int child_fd;
++		FILE *child_fp;
++		pid_t child_pid;
++
++		if(!strncmp(task_dirent->d_name, ".", strlen(".")))
++			continue;
++		
++		sprintf(fname, "%s/children", task_dirent->d_name);
++		child_fd = openat(task_fd, fname, O_RDONLY);
++		if(child_fd < 0) {
++			close(task_fd);
++			return -1;
++		}
++
++		child_fp = fdopen(child_fd, "r");
++		while(fscanf(child_fp, "%d", &child_pid) != EOF) {
++			sprintf(fname, "/proc/rdma/%d", child_pid);
++			if(stat(fname, &statbuf))
++				continue;
++			
++			if(__wait_for_proc_complete(child_pid)) {
++				close(child_fd);
++				close(task_fd);
++				return -1;
++			}
++		}
++		close(child_fd);
++	}
++
++	close(task_fd);
++	return 0;
++}
++
++int is_rdma_dev(unsigned long st_rdev) {
++	int cdev_dir_fd;
++	DIR *cdev_dir;
++	struct dirent *cdev_ent;
++	char fname[128];
++
++	sprintf(fname, "/dev/infiniband/");
++	cdev_dir_fd = open(fname, O_DIRECTORY);
++	if(cdev_dir_fd < 0) {
++		return -1;
++	}
++
++	cdev_dir = fdopendir(cdev_dir_fd);
++	if(!cdev_dir) {
++		close(cdev_dir_fd);
++		return -1;
++	}
++
++	while((cdev_ent = readdir(cdev_dir)) != NULL) {
++		struct stat st;
++		int err;
++		int fd;
++
++		if(strncmp(cdev_ent->d_name, "uverbs", strlen("uverbs")))
++			continue;
++		
++		fd = openat(cdev_dir_fd, cdev_ent->d_name, O_WRONLY);
++		if(fd < 0) {
++			close(cdev_dir_fd);
++			return -1;
++		}
++
++		err = fstat(fd, &st);
++		if(err < 0) {
++			close(fd);
++			close(cdev_dir_fd);
++			return -1;
++		}
++
++		close(fd);
++
++		if(major(st_rdev) == major(st.st_rdev)) {
++			close(cdev_dir_fd);
++			return 1;
++		}
++	}
++
++	close(cdev_dir_fd);
++	return 0;
++}
++
++#define def_restore(res, restore_info_fn, restore_sub_fn, free_fn)						\
++static int restore_rdma_##res(void *parent, int img_fd,									\
++						char *path, char *parent_path) {								\
++	void *(*__restore_info_fn)(void *, int, char *, char *, int *);						\
++	int (*__restore_sub_fn)(void *, int, char *);										\
++	void (*__free_fn)(void *);															\
++	int sub_img_fd;																		\
++	void *p_res;																		\
++	int err;																			\
++																						\
++	__restore_info_fn = restore_info_fn;												\
++	__restore_sub_fn = restore_sub_fn;													\
++	__free_fn = free_fn;																\
++																						\
++	if(!__restore_info_fn)																\
++		return -1;																		\
++																						\
++	sub_img_fd = openat(img_fd, path, O_DIRECTORY);										\
++	if(sub_img_fd < 0) {																\
++		return -1;																		\
++	}																					\
++																						\
++	p_res = __restore_info_fn(parent, sub_img_fd, path, parent_path, &err);				\
++	if(err) {																			\
++		close(sub_img_fd);																\
++		return -1;																		\
++	}																					\
++																						\
++	if(__restore_sub_fn && __restore_sub_fn(p_res, sub_img_fd, path)) {					\
++		if(__free_fn)																	\
++			__free_fn(p_res);															\
++		close(sub_img_fd);																\
++		return -1;																		\
++	}																					\
++																						\
++	if(__free_fn)																		\
++		__free_fn(p_res);																\
++	close(sub_img_fd);																	\
++	return 0;																			\
++}
++
++#define dump_info(dir_fd, info_fd, param, info_name)									\
++	info_fd = openat(dir_fd, #info_name, O_RDONLY);										\
++	if(info_fd < 0) {																	\
++		*p_err = -1;																	\
++		return NULL;																	\
++	}																					\
++																						\
++	if(read(info_fd, &(param)->info_name, sizeof((param)->info_name)) < 0) {			\
++		close(info_fd);																	\
++		*p_err = -1;																	\
++		return NULL;																	\
++	}																					\
++																						\
++	close(info_fd)
++
++#define dump_mmap(dir_fd, info_fd, param, map_field)									\
++	dump_info(dir_fd, info_fd, param, map_field##_mmap_fd);								\
++	dump_info(dir_fd, info_fd, param, map_field##_map)
++
++static void *restore_mr(void *parent, int mr_fd,
++						char *mr_path, char *parent_path, int *p_err) {
++//	struct ibv_context *tmp_context = parent;
++	struct ibv_pd *tmp_pd = parent;
++	struct ibv_resume_mr_param mr_param;
++	int info_fd;
++	int pd_handle;
++	int mr_handle;
++
++	sscanf(parent_path, "pd_%d", &pd_handle);
++	sscanf(mr_path, "mr_%d", &mr_handle);
++	mr_param.pd_vhandle = pd_handle;
++	mr_param.mr_vhandle = mr_handle;
++	dump_info(mr_fd, info_fd, &mr_param, access_flags);
++	dump_info(mr_fd, info_fd, &mr_param, iova);
++	dump_info(mr_fd, info_fd, &mr_param, length);
++	dump_info(mr_fd, info_fd, &mr_param, vlkey);
++	dump_info(mr_fd, info_fd, &mr_param, vrkey);
++
++	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param);
++	return (*p_err)? NULL: parent;
++}
++
++def_restore(mr, restore_mr, NULL, NULL);
++
++#define get_cq_handle(qp_dir_fd, cq) ({													\
++	char linkbuf[128];																	\
++	char tmp_buf[128];																	\
++	ssize_t linkbuf_sz;																	\
++	int cq_handle = -1;																	\
++																						\
++	linkbuf_sz = readlinkat(qp_dir_fd, #cq, linkbuf, sizeof(linkbuf));					\
++	if(linkbuf_sz >= 0) {																\
++		sprintf(tmp_buf, "%.*s", (int)linkbuf_sz, linkbuf);								\
++		sscanf(tmp_buf, "../../cq_%d", &cq_handle);										\
++	}																					\
++	cq_handle;																			\
++})
++
++#define dump_info_var(dir_fd, info_fd, var, info_name)									\
++	info_fd = openat(dir_fd, info_name, O_RDONLY);										\
++	mv_fd(info_fd, info_fd + 1350);														\
++	if(info_fd < 0) {																	\
++		*p_err = -1;																	\
++		return NULL;																	\
++	}																					\
++																						\
++	if(read(info_fd, var, sizeof(*var)) < 0) {											\
++		close(info_fd);																	\
++		*p_err = -1;																	\
++		return NULL;																	\
++	}																					\
++																						\
++	close(info_fd)
++
++static void *restore_qp(void *parent, int qp_fd,
++						char *qp_path, char *parent_path, int *p_err) {
++	struct ibv_pd *tmp_pd = parent;
++	struct ibv_cq *send_cq, *recv_cq;
++	struct ibv_qp *tmp_qp;
++	struct ibv_qp *qp_ptr;
++	struct ibv_srq *srq;
++	struct ibv_resume_qp_param qp_param;
++	int info_fd;
++	int pd_handle;
++	int qp_handle;
++	unsigned long long bf_reg;
++	int i;
++
++	memset(&qp_param, 0, sizeof(qp_param));
++	info_fd = openat(qp_fd, "qp_ctx", O_RDONLY);
++	if(info_fd < 0) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	if(read(info_fd, &qp_param, sizeof(qp_param)) < 0) {
++		close(info_fd);
++		*p_err = -1;
++		return NULL;
++	}
++
++	close(info_fd);
++
++	sscanf(parent_path, "pd_%d", &pd_handle);
++	sscanf(qp_path, "qp_%d", &qp_handle);
++	qp_param.pd_vhandle = pd_handle;
++	qp_param.qp_vhandle = qp_handle;
++
++	info_fd = openat(qp_fd, "send_cq_handle", O_RDONLY);
++	if(info_fd < 0) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	if(read(info_fd, &qp_param.send_cq_handle, sizeof(qp_param.send_cq_handle)) < 0) {
++		close(info_fd);
++		*p_err = -1;
++		return NULL;
++	}
++
++	close(info_fd);
++
++	info_fd = openat(qp_fd, "recv_cq_handle", O_RDONLY);
++	if(info_fd < 0) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	if(read(info_fd, &qp_param.recv_cq_handle, sizeof(qp_param.recv_cq_handle)) < 0) {
++		close(info_fd);
++		*p_err = -1;
++		return NULL;
++	}
++
++	close(info_fd);
++
++	qp_ptr = qp_param.meta_uaddr;
++	send_cq = get_cq_ptr_from_handle(qp_param.send_cq_handle);
++	recv_cq = get_cq_ptr_from_handle(qp_param.recv_cq_handle);
++	if(qp_ptr->srq) {
++		srq = get_srq_ptr_from_handle(qp_ptr->srq->handle);
++		srq->handle = qp_ptr->srq->handle;
++	}
++	else {
++		srq = NULL;
++	}
++	tmp_qp = ibv_resume_create_qp(tmp_pd->context, tmp_pd,
++						send_cq, recv_cq, srq, &qp_param, &bf_reg);
++	if(!tmp_qp) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	add_one_rdma_vma_node(bf_reg & PAGE_MASK, (bf_reg & PAGE_MASK) + 4096);
++
++	for(i = 0; i < qp_param.qp_state; i++) {
++		if(ibv_modify_qp(tmp_qp, &qp_param.modify_qp_attr[i],
++							qp_param.modify_qp_mask[i])) {
++			*p_err = -1;
++			return NULL;
++		}
++	}
++
++	qp_ptr->dest_qpn = tmp_qp->dest_qpn;
++	{
++		typeof(tmp_qp->dest_qpn) *content_p;
++		content_p = malloc(sizeof(*content_p));
++		*content_p = tmp_qp->dest_qpn;
++		if(add_update_node(&qp_ptr->dest_qpn,
++					sizeof(*content_p), content_p)) {
++			*p_err = -1;
++			return NULL;
++		}
++	}
++	qp_ptr->dest_pid = tmp_qp->dest_pid;
++	{
++		typeof(tmp_qp->dest_pid) *content_p;
++		content_p = malloc(sizeof(*content_p));
++		*content_p = tmp_qp->dest_pid;
++		if(add_update_node(&qp_ptr->dest_pid,
++					sizeof(*content_p), content_p)) {
++			*p_err = -1;
++			return NULL;
++		}
++	}
++	memcpy(&qp_ptr->rc_dest_gid, &tmp_qp->rc_dest_gid, sizeof(union ibv_gid));
++	{
++		typeof(tmp_qp->rc_dest_gid) *content_p;
++		content_p = malloc(sizeof(*content_p));
++		memcpy(content_p, &tmp_qp->rc_dest_gid, sizeof(union ibv_gid));
++		if(add_update_node(&qp_ptr->rc_dest_gid,
++					sizeof(*content_p), content_p)) {
++			*p_err = -1;
++			return NULL;
++		}
++	}
++
++//	ibv_resume_free_qp(tmp_qp);
++	*p_err = 0;
++	return parent;
++}
++
++def_restore(qp, restore_qp, NULL, NULL);
++
++static void *restore_srq(void *parent, int srq_fd,
++			char *srq_path, char *parent_path, int *p_err) {
++	struct ibv_resume_srq_param srq_param;
++	struct ibv_pd *tmp_pd = parent;
++	struct ibv_srq *srq;
++	int info_fd;
++
++	memset(&srq_param, 0, sizeof(srq_param));
++	info_fd = openat(srq_fd, "srq_ctx", O_RDONLY);
++	if(info_fd < 0) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	if(read(info_fd, &srq_param, sizeof(srq_param)) < 0) {
++		close(info_fd);
++		*p_err = -1;
++		return NULL;
++	}
++
++	close(info_fd);
++
++	sscanf(parent_path, "pd_%d", &srq_param.pd_vhandle);
++	sscanf(srq_path, "srq_%d", &srq_param.vhandle);
++
++	srq = ibv_resume_srq(tmp_pd, &srq_param);
++	if(!srq) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	*p_err = add_one_srq_dict_node(srq_param.vhandle, srq);
++	if(*p_err) {
++		return NULL;
++	}
++
++	*p_err = 0;
++	return parent;
++}
++
++def_restore(srq, restore_srq, NULL, NULL);
++
++static void *restore_cq(void *parent, int cq_fd,
++						char *cq_path, char *parent_path, int *p_err) {
++	struct ibv_context *tmp_context = parent;
++	struct ibv_cq *tmp_cq;
++	struct ibv_resume_cq_param cq_param;
++	int info_fd;
++	int cq_handle;
++
++	sscanf(cq_path, "cq_%d", &cq_handle);
++
++	cq_param.cq_vhandle = cq_handle;
++
++	dump_info(cq_fd, info_fd, &cq_param, cq_size);
++	dump_info(cq_fd, info_fd, &cq_param, meta_uaddr);
++	dump_info(cq_fd, info_fd, &cq_param, buf_addr);
++	dump_info(cq_fd, info_fd, &cq_param, db_addr);
++	dump_info(cq_fd, info_fd, &cq_param, comp_fd);
++
++	tmp_cq = ibv_resume_cq(tmp_context, &cq_param);
++	if(!tmp_cq) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	*p_err = add_one_cq_dict_node(cq_param.cq_vhandle, tmp_cq);
++	if(*p_err) {
++		return NULL;
++	}
++
++	*p_err = 0;
++	return tmp_cq;
++}
++
++static inline void free_cq(void *g_tmp_cq) {
++	return;
++}
++
++def_restore(cq, restore_cq, NULL, free_cq);
++
++static void *restore_comp_channel(void *parent, int comp_channel_fd,
++						char *comp_path, char *parent_path, int *p_err) {
++	struct ibv_context *tmp_context = parent;
++	int comp_fd;
++
++	sscanf(comp_path, "uverbs_completion_event_file_%d", &comp_fd);
++	*p_err = ibv_resume_comp_channel(tmp_context, comp_fd);
++	if(*p_err) {
++		return NULL;
++	}
++
++	return NULL;
++}
++
++def_restore(uverbs_completion_event_file, restore_comp_channel, NULL, NULL);
++
++static void *restore_pd(void *parent, int pd_fd,
++				char *pd_path, char *parent_path, int *p_err) {
++	struct ibv_context *tmp_context = parent;
++	struct ibv_pd *tmp_pd;
++	int pd_handle;
++
++	sscanf(pd_path, "pd_%d", &pd_handle);
++	tmp_pd = ibv_resume_pd(tmp_context, pd_handle);
++	if(!tmp_pd) {
++		*p_err = -1;
++		return NULL;
++	}
++	
++	*p_err = 0;
++	return tmp_pd;
++}
++
++static int restore_pd_sub(void *parent, int pd_fd, char *path) {
++	struct ibv_context *tmp_context = parent;
++	DIR *pd_dir;
++	struct dirent *pd_dirent;
++
++	pd_dir = fdopendir(pd_fd);
++	if(!pd_dir)
++		return -1;
++
++	while((pd_dirent = readdir(pd_dir)) != NULL) {
++		if(!strncmp(pd_dirent->d_name, "srq", strlen("srq"))) {
++			if(restore_rdma_srq(tmp_context, pd_fd, pd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++	}
++
++	lseek(pd_fd, 0, SEEK_SET);
++
++	while((pd_dirent = readdir(pd_dir)) != NULL) {
++		if(!strncmp(pd_dirent->d_name, "mr", strlen("mr"))) {
++			if(restore_rdma_mr(tmp_context, pd_fd, pd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++
++		if(!strncmp(pd_dirent->d_name, "qp", strlen("qp"))) {
++			if(restore_rdma_qp(tmp_context, pd_fd, pd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++static inline void free_pd(void *g_tmp_pd) {
++	return;
++}
++
++def_restore(pd, restore_pd, restore_pd_sub, free_pd);
++
++static void *restore_context(void *parent, int cmd_fd,
++					char *cmd_fd_path, char *parent_path, int *p_err) {
++	struct ibv_resume_context_param context_param;
++	int info_fd;
++	struct ibv_context *context;
++
++	if(parent) {
++		*p_err = -1;
++		return NULL;
++	}
++
++	memset(&context_param, 0, sizeof(context_param));
++	context_param.cmd_fd = atoi(cmd_fd_path);
++
++	dump_info(cmd_fd, info_fd, &context_param, cdev);
++	dump_info(cmd_fd, info_fd, &context_param, async_fd);
++	dump_info(cmd_fd, info_fd, &context_param, ctx_uaddr);
++
++	dump_mmap(cmd_fd, info_fd, &context_param, lkey);
++	dump_mmap(cmd_fd, info_fd, &context_param, rkey);
++
++	context = ibv_resume_context(ibv_device_list, &context_param);
++	if(!context)
++		*p_err = -1;
++	else
++		*p_err = 0;
++
++	__rdma_pid__ = rdma_getpid(context);
++
++	return context;
++}
++
++static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
++	struct ibv_context *tmp_context = g_tmp_context;
++	DIR *cmd_dir;
++	struct dirent *cmd_dirent;
++
++	cmd_dir = fdopendir(cmd_fd);
++	if(!cmd_dir)
++		return -1;
++
++	while((cmd_dirent = readdir(cmd_dir)) != NULL) {
++		if(!strncmp(cmd_dirent->d_name, "uverbs_completion_event_file",
++						strlen("uverbs_completion_event_file"))) {
++			if(restore_rdma_uverbs_completion_event_file(tmp_context, cmd_fd,
++								cmd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++	}
++
++	if(lseek(cmd_fd, 0, SEEK_SET) < 0) {
++		return -1;
++	}
++	
++	while((cmd_dirent = readdir(cmd_dir)) != NULL) {
++		if(!strncmp(cmd_dirent->d_name, "cq", strlen("cq"))) {
++			if(restore_rdma_cq(tmp_context, cmd_fd, cmd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++	}
++
++	if(lseek(cmd_fd, 0, SEEK_SET) < 0) {
++		return -1;
++	}
++
++	while((cmd_dirent = readdir(cmd_dir)) != NULL) {
++		if(!strncmp(cmd_dirent->d_name, "pd", strlen("pd"))) {
++			if(restore_rdma_pd(tmp_context, cmd_fd, cmd_dirent->d_name, path)) {
++				return -1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++static inline void free_context(void *g_tmp_context) {
++	return;
++}
++
++def_restore(context, restore_context, restore_context_sub, free_context);
++
++int restore_rdma(pid_t pid, char *img_dir_path) {
++	char fname[128];
++	int img_fd;
++	int img_pid_fd;
++	DIR *img_pid_DIR;
++	struct dirent *img_pid_dirent;
++
++	img_fd = open(img_dir_path, O_DIRECTORY);
++	if(img_fd < 0) {
++		return 0;
++	}
++
++	sprintf(fname, "rdma_pid_%d", pid);
++	img_pid_fd = openat(img_fd, fname, O_DIRECTORY);
++	if(img_pid_fd < 0) {
++		close(img_fd);
++		return 0;
++	}
++
++	pr_info("Pre-restoring RDMA information...\n");
++
++	img_pid_DIR = fdopendir(img_pid_fd);
++	if(!img_pid_DIR) {
++		close(img_pid_fd);
++		close(img_fd);
++		return -1;
++	}
++
++	while((img_pid_dirent = readdir(img_pid_DIR)) != NULL) {
++		struct stat st;
++
++		if(!strncmp(img_pid_dirent->d_name, ".", strlen(".")))
++			continue;
++		
++		if(fstatat(img_pid_fd, img_pid_dirent->d_name, &st, 0)) {
++			close(img_pid_fd);
++			close(img_fd);
++			return -1;
++		}
++
++		if(!S_ISDIR(st.st_mode))
++			continue;
++		
++		if(restore_rdma_context(NULL, img_pid_fd,
++						img_pid_dirent->d_name, fname)) {
++			close(img_pid_fd);
++			close(img_fd);
++			return -1;
++		}
++	}
++
++	close(img_fd);
++	close(img_pid_fd);
++
++	return 0;
++}
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <arpa/inet.h>
++
++enum rdma_notify_ops {
++	RDMA_NOTIFY_PRE_ESTABLISH,
++	RDMA_NOTIFY_PRE_PAUSE,
++	RDMA_NOTIFY_RESTORE,
++};
++
++struct notify_message_fmt {
++	enum rdma_notify_ops				ops;
++	char								msg[0];
++};
++
++struct msg_fmt {
++	union ibv_gid						migr_dest_gid;
++	int									cnt;
++	char								msg[0];
++};
++
++static inline int up_to_pow_two(int n) {
++	int tmp = n;
++	while(tmp & (tmp - 1))
++		tmp = (tmp & (tmp - 1));
++	
++	if(n > tmp)
++		return 2*tmp;
++	else
++		return tmp;
++}
++
++static void *expand_buf(void *buf, size_t orig_size, size_t new_size) {
++	void *buf_tmp = NULL;
++
++	if(up_to_pow_two(new_size) <= up_to_pow_two(orig_size))
++		return buf;
++	
++	buf_tmp = malloc(up_to_pow_two(new_size));
++	if(!buf_tmp) {
++		if(buf)
++			free(buf);
++		return NULL;
++	}
++
++	memset(buf_tmp, 0, up_to_pow_two(new_size));
++	memcpy(buf_tmp, buf, up_to_pow_two(orig_size));
++	if(buf)
++		free(buf);
++	buf = buf_tmp;
++	return buf;
++}
++
++struct notify_item {
++	union ibv_gid			dest_gid;
++	uint32_t				dest_qpn;
++	pid_t					pid;
++	uint64_t				n_posted;
++};
++
++struct notify_msg_item {
++	uint32_t				dest_qpn;
++	pid_t					pid;
++	uint64_t				n_posted;
++};
++
++static int notify_item_compare(const void *i1, const void *i2) {
++	const struct notify_item *item1 = i1;
++	const struct notify_item *item2 = i2;
++
++	return memcmp(&item1->dest_gid, &item2->dest_gid, sizeof(union ibv_gid));
++}
++
++#define up_align_four(n) ({								\
++	typeof(n) __tmp__ = ~0x11;							\
++	(((n)-1) & __tmp__) + 4;							\
++})
++
++static struct send_msg_entry send_msgs[1024 * 1024];
++static int n_msgs = 0;
++
++inline size_t get_send_msg_meta_size(int *pn_msgs) {
++	if(pn_msgs) {
++		*pn_msgs = n_msgs;
++}
++
++	return sizeof(struct send_msg_entry) * n_msgs;
++}
++
++size_t get_send_msg_size(void) {
++	size_t ret = 0;
++	for(int i = 0; i < n_msgs; i++) {
++		ret += up_align_four(send_msgs[i].size);
++	}
++
++	return ret;
++}
++
++inline void copy_send_msg_meta(void *to) {
++	memcpy(to, send_msgs, sizeof(struct send_msg_entry) * n_msgs);
++		}
++
++static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait) {
++	struct sockaddr_in remote_addr;
++
++	remote_addr.sin_family = AF_INET;
++	remote_addr.sin_port = htons(50505);
++	memcpy(&remote_addr.sin_addr.s_addr, &dest_gid->raw[12], sizeof(uint32_t));
++
++	memcpy(&send_msgs[n_msgs].remote_addr, &remote_addr, sizeof(remote_addr));
++	send_msgs[n_msgs].size = size;
++	send_msgs[n_msgs].buf = buf;
++	n_msgs++;
++
++	return 0;
++}
++
++static int notify_merge(struct notify_item *item_list, int n_item,
++				struct sockaddr_in *migr_dest_addr, enum rdma_notify_ops ops,
++				int need_wait) {
++	int i;
++	int start = 0;
++	for(i = 0; i < n_item + 1; i++) {
++		int j;
++		void *buf = NULL;
++		struct notify_message_fmt *header;
++		struct msg_fmt *per_ops_header;
++		struct notify_msg_item *arr;
++		int cur_size = 0;
++
++		if(i == start)
++			continue;
++
++		if(i < n_item && !memcmp(&item_list[i].dest_gid, &item_list[start].dest_gid, sizeof(union ibv_gid)))
++			continue;
++
++		buf = expand_buf(buf, cur_size, cur_size + sizeof(struct notify_message_fmt)
++								+ sizeof(struct msg_fmt) + (i - start) * sizeof(struct notify_msg_item));
++		if(!buf) {
++			return -1;
++		}
++
++		cur_size = cur_size + sizeof(struct notify_message_fmt)
++						+ sizeof(struct msg_fmt) + (i - start) * sizeof(struct notify_msg_item);
++
++		header = buf;
++		header->ops = ops;
++		per_ops_header = (struct msg_fmt*)(header + 1);
++		memset(&per_ops_header->migr_dest_gid, 0, sizeof(union ibv_gid));
++		per_ops_header->migr_dest_gid.raw[10] = 0xff;
++		per_ops_header->migr_dest_gid.raw[11] = 0xff;
++		memcpy(&per_ops_header->migr_dest_gid.raw[12], &migr_dest_addr->sin_addr.s_addr, sizeof(uint32_t));
++		per_ops_header->cnt = i - start;
++		arr = (struct notify_msg_item *)&per_ops_header->msg;
++
++		for(j = start; j < i; j++) {
++			arr->dest_qpn = item_list[j].dest_qpn;
++			arr->pid = item_list[j].pid;
++			arr->n_posted = item_list[j].n_posted;
++			arr++;
++		}
++
++		send_msg(&item_list[start].dest_gid, buf, cur_size, need_wait);
++		buf = NULL;
++		cur_size = 0;
++		start = i;
++	}
++
++	return 0;
++}
++
++static uint64_t get_n_posted_from_qpn(uint32_t this_qpn);
++
++static int notify_partners(pid_t pid, struct sockaddr_in *migr_dest_addr,
++						enum rdma_notify_ops ops, int need_wait) {
++	char fname[128];
++	int rdma_proc_fd;
++	DIR *rdma_proc_DIR;
++	struct dirent *rdma_proc_dirent;
++	int n_item = 0;
++	struct notify_item *item_list;
++	int curp = 0;
++
++	sprintf(fname, "/proc/rdma/%d", pid);
++	rdma_proc_fd = open(fname, O_DIRECTORY);
++	if(rdma_proc_fd < 0) {
++		return 0;
++	}
++
++	pr_info("PID %d: Now prepare to notify partners\n", pid);
++
++	rdma_proc_DIR = fdopendir(rdma_proc_fd);
++	while((rdma_proc_dirent = readdir(rdma_proc_DIR)) != NULL) {
++		int ctx_fd;
++		DIR *ctx_DIR;
++		struct dirent *ctx_dirent;
++		struct stat st;
++
++		if(!strncmp(rdma_proc_dirent->d_name, ".", 1))
++			continue;
++
++		if(fstatat(rdma_proc_fd, rdma_proc_dirent->d_name, &st, 0)) {
++			close(rdma_proc_fd);
++			return -1;
++		}
++
++		if(!S_ISDIR(st.st_mode))
++			continue;
++
++		ctx_fd = openat(rdma_proc_fd, rdma_proc_dirent->d_name, O_DIRECTORY);
++		if(ctx_fd < 0) {
++			close(rdma_proc_fd);
++			return -1;
++		}
++
++		ctx_DIR = fdopendir(ctx_fd);
++		while((ctx_dirent = readdir(ctx_DIR)) != NULL) {
++			int pd_fd;
++			DIR *pd_DIR;
++			struct dirent *pd_dirent;
++
++			if(strncmp(ctx_dirent->d_name, "pd", 2))
++				continue;
++
++			pd_fd = openat(ctx_fd, ctx_dirent->d_name, O_DIRECTORY);
++			if(pd_fd < 0) {
++				close(ctx_fd);
++				close(rdma_proc_fd);
++				return -1;
++			}
++
++			pd_DIR = fdopendir(pd_fd);
++			while((pd_dirent = readdir(pd_DIR)) != NULL) {
++				struct ibv_resume_qp_param param;
++				char fname[128];
++				int info_fd;
++
++				if(strncmp(pd_dirent->d_name, "qp", 2))
++					continue;
++
++				sprintf(fname, "%.100s/qp_ctx", pd_dirent->d_name);
++				info_fd = openat(pd_fd, fname, O_RDONLY);
++				if(info_fd < 0) {
++					continue;
++				}
++
++				if(read(info_fd, &param, sizeof(param)) < 0) {
++					close(info_fd);
++					continue;
++				}
++
++				close(info_fd);
++
++				if(param.init_attr.qp_type == IBV_QPT_UD)
++					continue;
++
++				if(param.qp_state < 2)
++					continue;
++
++				n_item++;
++			}
++			
++			close(pd_fd);
++		}
++
++		close(ctx_fd);
++	}
++
++	item_list = calloc(n_item, sizeof(*item_list));
++	if(!item_list) {
++		close(rdma_proc_fd);
++		return -1;
++	}
++
++	lseek(rdma_proc_fd, 0, SEEK_SET);
++	while((rdma_proc_dirent = readdir(rdma_proc_DIR)) != NULL) {
++		int ctx_fd;
++		DIR *ctx_DIR;
++		struct dirent *ctx_dirent;
++		struct stat st;
++
++		if(!strncmp(rdma_proc_dirent->d_name, ".", 1))
++			continue;
++
++		if(fstatat(rdma_proc_fd, rdma_proc_dirent->d_name, &st, 0)) {
++			close(rdma_proc_fd);
++			return -1;
++		}
++
++		if(!S_ISDIR(st.st_mode))
++			continue;
++
++		ctx_fd = openat(rdma_proc_fd, rdma_proc_dirent->d_name, O_DIRECTORY);
++		if(ctx_fd < 0) {
++			close(rdma_proc_fd);
++			return -1;
++		}
++
++		ctx_DIR = fdopendir(ctx_fd);
++		while((ctx_dirent = readdir(ctx_DIR)) != NULL) {
++			int pd_fd;
++			DIR *pd_DIR;
++			struct dirent *pd_dirent;
++
++			if(strncmp(ctx_dirent->d_name, "pd", 2))
++				continue;
++
++			pd_fd = openat(ctx_fd, ctx_dirent->d_name, O_DIRECTORY);
++			if(pd_fd < 0) {
++				close(ctx_fd);
++				close(rdma_proc_fd);
++				return -1;
++			}
++
++			pd_DIR = fdopendir(pd_fd);
++			while((pd_dirent = readdir(pd_DIR)) != NULL) {
++				int qp_fd;
++				union ibv_gid dest_gid;
++				uint32_t dest_qpn;
++				int info_fd;
++				struct ibv_resume_qp_param param;
++				char fname[128];
++				struct ibv_qp *qp;
++
++				if(strncmp(pd_dirent->d_name, "qp", 2))
++					continue;
++
++				sprintf(fname, "%.100s/qp_ctx", pd_dirent->d_name);
++				info_fd = openat(pd_fd, fname, O_RDONLY);
++				if(info_fd < 0) {
++					continue;
++				}
++
++				if(read(info_fd, &param, sizeof(param)) < 0) {
++					close(info_fd);
++					continue;
++				}
++
++				close(info_fd);
++
++				if(param.init_attr.qp_type == IBV_QPT_UD)
++					continue;
++
++				if(param.qp_state < 2)
++					continue;
++
++				qp_fd = openat(pd_fd, pd_dirent->d_name, O_DIRECTORY);
++				if(qp_fd < 0) {
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				info_fd = openat(qp_fd, "rc_dest_pgid", O_RDONLY);
++				if(info_fd < 0) {
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++				return -1;
++				}
++
++				if(read(info_fd, &dest_gid, sizeof(dest_gid)) < 0) {
++					close(info_fd);
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				close(info_fd);
++
++				info_fd = openat(qp_fd, "dest_pqpn", O_RDONLY);
++				if(info_fd < 0) {
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				if(read(info_fd, &dest_qpn, sizeof(dest_qpn)) < 0) {
++					close(info_fd);
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				close(info_fd);
++
++				info_fd = openat(qp_fd, "meta_uaddr", O_RDONLY);
++				if(info_fd < 0) {
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				if(read(info_fd, &qp, sizeof(qp)) < 0) {
++					close(info_fd);
++					close(qp_fd);
++					close(pd_fd);
++					close(ctx_fd);
++					close(rdma_proc_fd);
++					return -1;
++				}
++
++				close(info_fd);
++
++				memcpy(&item_list[curp].dest_gid, &dest_gid, sizeof(dest_gid));
++				item_list[curp].dest_qpn = dest_qpn;
++				item_list[curp].pid = pid;
++				item_list[curp].n_posted = get_n_posted_from_qpn(qp->qp_num);
++				curp++;
++
++				close(qp_fd);
++			}
++			
++			close(pd_fd);
++		}
++
++		close(ctx_fd);
++	}
++
++	close(rdma_proc_fd);
++
++	qsort(item_list, n_item, sizeof(*item_list), notify_item_compare);
++
++	notify_merge(item_list, n_item, migr_dest_addr, ops, need_wait);
++
++	return 0;
++}
++
++struct reply_hdr_fmt {
++	int								cnt;
++	char							msg[0];
++};
++
++struct reply_item_fmt {
++	uint32_t						qpn;
++	uint64_t						n_posted;
++};
++
++static declare_and_init_rbtree(qpn_n_posted_tree);
++
++struct qpn_n_posted_entry {
++	uint32_t						this_qpn;
++	uint64_t						n_posted;
++	struct rb_node					node;
++};
++
++static inline struct qpn_n_posted_entry *to_qpn_n_posted_entry(struct rb_node *node) {
++	return node? container_of(node, struct qpn_n_posted_entry, node): NULL;
++}
++
++static int qpn_n_posted_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct qpn_n_posted_entry *ent1 = to_qpn_n_posted_entry((struct rb_node *)n1);
++	struct qpn_n_posted_entry *ent2 = to_qpn_n_posted_entry((struct rb_node *)n2);
++
++	if(ent1->this_qpn < ent2->this_qpn) {
++		return -1;
++	}
++	else if(ent1->this_qpn > ent2->this_qpn) {
++		return 1;
++	}
++	else {
++		return 0;
++	}
++}
++
++static struct qpn_n_posted_entry *search_qpn_n_posted_entry(uint32_t this_qpn,
++				struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct qpn_n_posted_entry my_node = {.this_qpn = this_qpn};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &qpn_n_posted_tree, p_parent, p_insert,
++							SEARCH_EXACTLY, qpn_n_posted_compare);
++	return to_qpn_n_posted_entry(node);
++}
++
++static int add_one_qpn_n_posted(uint32_t this_qpn, uint64_t n_posted) {
++	struct rb_node *parent, **insert;
++	struct qpn_n_posted_entry *ent;
++
++	ent = search_qpn_n_posted_entry(this_qpn, &parent, &insert);
++	if(ent) {
++		return -1;
++	}
++
++	ent = malloc(sizeof(*ent));
++	if(!ent) {
++		return -1;
++	}
++
++	ent->this_qpn = this_qpn;
++	ent->n_posted = n_posted;
++	rbtree_add_node(&ent->node, parent, insert, &qpn_n_posted_tree);
++
++	return 0;
++}
++
++static uint64_t get_n_posted_from_qpn(uint32_t this_qpn) {
++	struct qpn_n_posted_entry *ent;
++
++	ent = search_qpn_n_posted_entry(this_qpn, NULL, NULL);
++	if(!ent) {
++		return -1;
++	}
++
++	return ent->n_posted;
++}
++
++int prepare_for_partners_restore(pid_t pid) {
++	struct sockaddr_in migr_dest_addr;
++	char fname[256];
++	int info_fd;
++	char recvbuf[1024];
++	void *buf = NULL;
++	int cur_size = 0;
++	int recv_size;
++	struct reply_hdr_fmt *reply_hdr;
++	struct reply_item_fmt *arr;
++
++	sprintf(fname, "%.110s/qp_n_posted_%d.raw", images_dir, vpid(current));
++	info_fd = open(fname, O_RDONLY);
++	if(info_fd < 0) {
++		return 0;
++	}
++
++	while(1) {
++		recv_size = read(info_fd, recvbuf, sizeof(recvbuf));
++		if(recv_size < 0) {
++			pr_perror("read");
++			close(info_fd);
++			return -1;
++		}
++
++		if(recv_size > 0) {
++			buf = expand_buf(buf, cur_size, cur_size + recv_size);
++			memcpy(buf + cur_size, recvbuf, recv_size);
++			cur_size += recv_size;
++			continue;
++		}
++
++		break;
++	}
++
++	reply_hdr = buf;
++	arr = (typeof(arr))&reply_hdr->msg;
++
++	for(int i = 0; i < reply_hdr->cnt; i++) {
++		if(add_one_qpn_n_posted(arr[i].qpn, arr[i].n_posted)) {
++			return -1;
++		}
++	}
++
++	close(info_fd);
++	if(buf)
++		free(buf);
++
++	inet_pton(AF_INET, "0.0.0.0", &migr_dest_addr.sin_addr);
++	return notify_partners(pid, &migr_dest_addr, RDMA_NOTIFY_RESTORE, 0);
++}
++
++int stop_and_copy_update_state(struct pstree_item *current,
++					void *clone_arg) {
++	struct vm_area_list vmas;
++	struct vma_area *vma1, *vma2;
++	MmEntry *new_mm;
++	unsigned long nr_pages;
++	unsigned long end;
++	void *addr;
++	struct rst_info *ri = rsti(current);
++
++	if(current == root_item) {
++		struct pstree_item *pi;
++
++#if 1
++#if 0
++		/* Update PB_TIMENS. Only once */
++		if (root_ns_mask & CLONE_NEWTIME) {
++			if (prepare_timens(current->ids->time_ns_id))
++				return -1;
++		} else if (kdat.has_timens) {
++			if (prepare_timens(0))
++				return -1;
++		}
++#endif
++#else
++		/* Update PB_TIMENS. Only once */
++		if (root_ns_mask & CLONE_NEWTIME) {
++			if (prepare_timens_v2(current->ids->time_ns_id,
++							timens_helper_pid))
++				return -1;
++		} else if (kdat.has_timens) {
++			if (prepare_timens_v2(0, timens_helper_pid))
++				return -1;
++		}
++#endif
++
++		for_each_pstree_item(pi) {
++			int sock, err;
++			struct sockaddr_un sock_un;
++
++			if(pi == root_item) {
++				continue;
++			}
++
++			sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++			if(sock < 0) {
++				pr_perror("socket");
++				return -1;
++			}
++
++			memset(&sock_un, 0, sizeof(sock_un));
++			sock_un.sun_family = AF_UNIX;
++			sprintf(sock_un.sun_path, "/dev/shm/pid_%d.sock", vpid(pi));
++
++			err = sendto(sock, "hi", 3, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
++			if(err < 0) {
++				pr_perror("sendto");
++				return -1;
++			}
++
++			close(sock);
++		}
++	}
++
++	{
++		char fname[128];
++		FILE *fp;
++		FileEntry fe;
++		FileEntry *fe_ptr;
++
++		/* Update PB_FILES */
++		sprintf(fname, "%.110s/update_files.raw", images_dir);
++		fp = fopen(fname, "r");
++		if(!fp) {
++			pr_perror("fopen");
++			return -1;
++		}
++
++		while(fread(&fe, sizeof(fe), 1, fp) > 0) {
++			RegFileEntry reg;
++			FownEntry fwn;
++
++			if(!fe.id)
++				break;
++
++			if(fread(&reg, sizeof(reg), 1, fp) <= 0) {
++				pr_perror("fread");
++				return -1;
++			}
++
++			if(fread(&fwn, sizeof(fwn), 1, fp) <= 0) {
++				pr_perror("fread");
++				return -1;
++			}
++
++			fe_ptr = get_fe_ptr_from_id(fe.id);
++			if(!fe_ptr) {
++				continue;
++				pr_err("No fe_ptr found\n");
++				return -1;
++			}
++
++			fe_ptr->reg->pos = reg.pos;
++			fe_ptr->reg->size = reg.size;
++		}
++
++		fclose(fp);
++	}
++
++	/* Update PB_CORE */
++	if(current->pid->state != TASK_HELPER
++				&& stop_and_copy_update_core(clone_arg)) {
++		return -1;
++	}
++
++	/* Update PB_MM */
++	if(current->pid->state != TASK_HELPER
++				&& get_vm_area_list(current, &vmas, &new_mm)) {
++		return -1;
++	}
++
++	if(current->pid->state == TASK_HELPER) {
++		goto exit;
++	}
++
++	vma1 = list_entry(&rsti(current)->vmas.h, struct vma_area, list);
++	vma2 = list_entry(&vmas.h, struct vma_area, list);
++
++	vma1 = list_entry(vma1->list.next, struct vma_area, list);
++	vma2 = list_entry(vma2->list.next, struct vma_area, list);
++	while(&vma1->list != &rsti(current)->vmas.h &&
++					&vma2->list != &vmas.h) {
++		if(vma1->e->start == vma2->e->start &&
++						vma1->e->end == vma2->e->end) {
++			vma2->e->status = vma1->e->status;
++			nr_pages = vma_entry_len(vma2->e) / PAGE_SIZE;
++			if(vma1->page_bitmap) {
++				vma2->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
++				if(vma2->page_bitmap == NULL) {
++					return -1;
++				}
++				memcpy(vma2->page_bitmap, vma1->page_bitmap, BITS_TO_LONGS(nr_pages) * sizeof(long));
++			}
++			vma2->premmaped_addr = vma1->premmaped_addr;
++
++#if 0
++//			vma2->e->status = vma1->e->status;
++			memcpy(vma2->e, vma1->e, sizeof(*vma1->e));
++			vma1->e = vma2->e;
++#endif
++
++			vma1 = list_entry(vma1->list.next, struct vma_area, list);
++			vma2 = list_entry(vma2->list.next, struct vma_area, list);
++			continue;
++		}
++
++		/* If two regions do not intersect */
++		if(!((vma2->e->start >= vma1->e->start && vma2->e->start < vma1->e->end) ||
++					(vma2->e->end > vma1->e->start && vma2->e->end <= vma1->e->end))) {
++			if(vma1->e->start < vma2->e->start) {
++				/* vma1 is new */
++				pr_err("Detect new vma1: %lx-%lx\n", vma1->e->start, vma1->e->end);
++				if(vma1->premmaped_addr) {
++					munmap((void *)vma1->premmaped_addr, vma1->e->end - vma1->e->start);
++					vma1->premmaped_addr = 0;
++				}
++
++				vma1 = list_entry(vma1->list.next, struct vma_area, list);
++			}
++			else {
++				struct vma_area *vma2_tmp;
++				pr_err("Detect new vma2: %lx-%lx\n", vma2->e->start, vma2->e->end);
++				vma2_tmp = list_entry(vma2->list.next, struct vma_area, list);
++				list_del(&vma2->list);
++				list_add_tail(&vma2->list, &vma1->list);
++				pr_err("(%lx-%lx) before (%lx-%lx)\n", vma2->e->start, vma2->e->end, vma1->e->start, vma1->e->end);
++				vma2 = vma2_tmp;
++			}
++
++			continue;
++		}
++
++		/* Two regions intersect */
++		pr_err("Detect two intersected reagions\n");
++		pr_err("vma1: %lx-%lx, vma2: %lx-%lx\n",
++						vma1->e->start, vma1->e->end,
++						vma2->e->start, vma2->e->end);
++		vma2->e->status = vma1->e->status;
++		nr_pages = vma_entry_len(vma2->e) / PAGE_SIZE;
++		if(vma1->page_bitmap) {
++			vma2->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
++			if(vma2->page_bitmap == NULL) {
++				return -1;
++			}
++			memcpy(vma2->page_bitmap, vma1->page_bitmap, BITS_TO_LONGS(nr_pages) * sizeof(long));
++		}
++		vma2->premmaped_addr = vma1->premmaped_addr;
++
++		if(!vma_area_is(vma1, VMA_PREMMAPED)) {
++			vma1 = list_entry(vma1->list.next, struct vma_area, list);
++			vma2 = list_entry(vma2->list.next, struct vma_area, list);
++			continue;
++		}
++
++		/* The vma1 has been premapped, so we need to remap it */
++		pr_err("Re-map %lx-%lx to %lx-%lx\n",
++						vma1->e->start, vma1->e->end,
++						vma2->e->start, vma2->e->end);
++
++		/* Align the end of the vma1 and vma2
++		 * Case 1:
++		 * vma1:          |xxxxxxxxxxxxxxxxxxx|                  ==>      |xxxxxxxxxxxxxxxxxxxxxxxxxxxx|
++		 * vma2:  (start point not critical) ..xxxxxxxxxxxxx|    ==>                    ..xxxxxxxxxxxxx|
++		 *
++		 * Case 2 (do nothing):
++		 * vma1:        |xxxxxxxxxxxxxxxxxxxxxx|    ==> |xxxxxxxxxxxxx|
++		 * vma2:           ..xxxxxxxxx|             ==>    ..xxxxxxxxx|
++		 */
++		end = (vma1->e->end < vma2->e->end)?
++						vma2->e->end: vma1->e->end;
++		if(end != vma1->e->end) {
++			/* Case 1 */
++			addr = mremap((void *)vma1->e->start, vma1->e->end - vma1->e->start,
++									end - vma1->e->start, 0);
++			if(addr == MAP_FAILED || addr != (void *)vma1->e->start) {
++				pr_err("Failed to expand vma1\n");
++				return -1;
++			}
++
++			vma2->premmaped_addr = (unsigned long)addr;
++			vma1->premmaped_addr = (unsigned long)addr;
++		}
++		else {
++			/* Case 2 */
++			if(vma1->e->end != vma2->e->end) {
++				munmap((void *)vma2->e->end, vma1->e->end - vma2->e->end);
++			}
++		}
++
++		/* Align the start of vma1 and vma2
++		 * Case 1:
++		 * vma1: |xxxxxxxxxxxxxx| ==>        |xxxxxxx|
++		 * vma2:        |xxxxxxx| ==>        |xxxxxxx|
++		 * Case 2:
++		 * vma1:       |xxxxxxxx| ==> |xxxxxxxxxxxxxx|
++		 * vma2: |xxxxxxxxxxxxxx| ==> |xxxxxxxxxxxxxx|
++		 */
++		if(vma1->e->start < vma2->e->start) {
++			/* Case 1 */
++			munmap((void *)vma1->e->start, vma2->e->start - vma1->e->start);
++		}
++		else {
++			/* Case 2 */
++			if(vma1->e->start != vma2->e->start) {
++				int flag = 0;
++				if(vma_entry_is(vma1->e, VMA_AREA_AIORING))
++					flag |= MAP_ANONYMOUS;
++				addr = mmap((void *)vma2->e->start, vma1->e->start - vma2->e->start,
++							vma1->e->prot | PROT_WRITE, vma1->e->flags | MAP_FIXED | flag,
++							vma1->e->fd, 0);
++				if(addr == MAP_FAILED || addr != (void *)vma2->e->start) {
++					pr_err("Failed to mmap part of vma2\n");
++					return -1;
++				}
++
++				vma2->premmaped_addr = (unsigned long)addr;
++				vma1->premmaped_addr = (unsigned long)addr;
++			}
++		}
++
++		vma1 = list_entry(vma1->list.next, struct vma_area, list);
++		vma2 = list_entry(vma2->list.next, struct vma_area, list);
++	}
++
++#if 0
++	for(int idx = 0; idx < ri->mm->n_vmas; idx++) {
++//		memcpy(ri->mm->vmas[idx], new_mm->vmas[idx], sizeof(VmaEntry));
++		ri->mm->vmas[idx]->start = new_mm->vmas[idx]->start;
++		ri->mm->vmas[idx]->end = new_mm->vmas[idx]->end;
++	}
++#endif
++
++	ri->mm = new_mm;
++	rsti(current)->vmas.nr = ri->mm->n_vmas;
++
++	{
++		struct vma_area *vma;
++		struct list_head *vmas = &rsti(current)->vmas.h;
++
++		list_for_each_entry(vma, vmas, list) {
++			pr_err("vma->e->start: %lx, vma->e->end: %lx\n", vma->e->start, vma->e->end);
++		}
++	}
++
++	INIT_LIST_HEAD(&rsti(current)->vma_io);
++
++exit:
++	return 0;
++}
++
++static struct update_mem_node update_arr[1024 * 1024];
++static int n_update = 0;
++
++int add_update_node(void *ptr, size_t size, void *content_p) {
++	update_arr[n_update].ptr				= ptr;
++	update_arr[n_update].size				= size;
++	update_arr[n_update].content_p			= content_p;
++	n_update++;
++	return 0;
++}
++
++inline size_t get_update_node_size(int *n_node) {
++	if(n_node)
++		*n_node = n_update;
++
++	return n_update * sizeof(struct update_mem_node);
++}
++
++size_t get_total_content_size(void) {
++	size_t ret = 0;
++
++	for(int i = 0; i < n_update; i++) {
++		ret += up_align_four(update_arr[i].size);
++	}
++
++	return ret;
++}
++
++inline void copy_update_nodes(void *to) {
++	memcpy(to, update_arr, sizeof(struct update_mem_node) * n_update);
++	}
++
++static struct qp_replay_call_entry qp_replay_arr[1024 * 1024];
++static int n_qp_replay = 0;
++
++int load_qp_callback(struct ibv_qp *orig_qp, void *replay_fn) {
++	qp_replay_arr[n_qp_replay].qp = orig_qp;
++	qp_replay_arr[n_qp_replay].cb = replay_fn;
++	n_qp_replay++;
++	return 0;
++}
++
++inline size_t get_qp_replay_size(int *n_node) {
++	if(n_node)
++		*n_node = n_qp_replay;
++
++	return n_qp_replay * sizeof(struct qp_replay_call_entry);
++}
++
++inline void copy_qp_replay_nodes(void *to) {
++	memcpy(to, qp_replay_arr, sizeof(struct qp_replay_call_entry) * n_qp_replay);
++}
++
++static struct srq_replay_call_entry srq_replay_arr[1024 * 1024];
++static int n_srq_replay = 0;
++
++int load_srq_callback(struct ibv_srq *srq, void *replay_fn, int head, int tail) {
++	srq_replay_arr[n_srq_replay].srq = srq;
++	srq_replay_arr[n_srq_replay].cb = replay_fn;
++	srq_replay_arr[n_srq_replay].head = head;
++	srq_replay_arr[n_srq_replay].tail = tail;
++	n_srq_replay++;
++	return 0;
++}
++
++inline size_t get_srq_replay_size(int *n) {
++	if(n)
++		*n = n_srq_replay;
++
++	return sizeof(struct srq_replay_call_entry) * n_srq_replay;
++}
++
++inline void copy_srq_replay_nodes(void *to) {
++	memcpy(to, srq_replay_arr, sizeof(struct srq_replay_call_entry) * n_srq_replay);
++}
+diff --git a/criu/rdma_migr.h b/criu/rdma_migr.h
+new file mode 100644
+index 0000000..5d65774
+--- /dev/null
++++ b/criu/rdma_migr.h
+@@ -0,0 +1,45 @@
++#ifndef __RDMA_NOTIFY_H__
++#define __RDMA_NOTIFY_H__
++
++#include <stdio.h>
++#include <infiniband/verbs.h>
++#include "include/restorer.h"
++#include "include/util.h"
++
++extern int num_devices;
++extern struct ibv_device **ibv_device_list;
++
++extern int is_rdma_dev(unsigned long st_rdev);
++extern int dump_rdma(pid_t pid, char *img_dir_path);
++extern int restore_rdma(pid_t pid, char *img_dir_path);
++extern int prepare_for_partners_restore(pid_t pid);
++
++#define is_rdma_event_fd(link)								\
++	is_anon_link_type(link, "[infinibandevent]")
++
++extern int add_rdma_vma_node(pid_t pid);
++extern int add_one_rdma_vma_node(unsigned long long start, unsigned long long end);
++extern int check_rdma_vma(unsigned long long start, unsigned long long end);
++extern struct unmapped_node *get_rdma_unmapped_node(int *pn_unmapped, int *err);
++extern int add_update_node(void *ptr, size_t size, void *content_p);
++extern size_t get_update_node_size(int *n_node);
++extern void copy_update_nodes(void *to);
++extern size_t get_total_content_size(void);
++extern int load_qp_callback(struct ibv_qp *orig_qp, void *replay_fn);
++extern int load_srq_callback(struct ibv_srq *srq, void *replay_fn, int head, int tail);
++extern size_t get_qp_replay_size(int *n_node);
++extern void copy_qp_replay_nodes(void *to);
++extern size_t get_send_msg_meta_size(int *pn_msgs);
++extern size_t get_send_msg_size(void);
++extern void copy_send_msg_meta(void *to);
++extern size_t get_srq_replay_size(int *n);
++extern void copy_srq_replay_nodes(void *to);
++
++extern int stop_and_copy_update_core(void *clone_arg);
++extern int stop_and_copy_update_state(struct pstree_item *current,
++				void *clone_arg);
++
++extern int insert_id_fe_map_entry(uint32_t id, void *ptr);
++extern void *get_fe_ptr_from_id(uint32_t id);
++
++#endif
+diff --git a/criu/rdma_vma.c b/criu/rdma_vma.c
+new file mode 100644
+index 0000000..b344378
+--- /dev/null
++++ b/criu/rdma_vma.c
+@@ -0,0 +1,223 @@
++#include <sys/types.h>
++#include <unistd.h>
++#include "rdma_migr.h"
++#include "rbtree.h"
++
++static declare_and_init_rbtree(rdma_vma);
++
++struct rdma_vma_node {
++	struct rb_node				node;
++	unsigned long long			start;
++	unsigned long long			end;
++};
++
++static int rdma_vma_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct rdma_vma_node *ent1 = n1? container_of(n1, struct rdma_vma_node, node): NULL;
++	struct rdma_vma_node *ent2 = n1? container_of(n2, struct rdma_vma_node, node): NULL;
++	if(ent1->start < ent2->start)
++		return -1;
++	else if(ent1->start > ent2->start)
++		return 1;
++	else
++		return 0;
++}
++
++static struct rdma_vma_node *to_rdma_vma_node(struct rb_node *n) {
++	return n? container_of(n, struct rdma_vma_node, node): NULL;
++}
++
++static struct rdma_vma_node *search_rdma_vma_node(unsigned long long start,
++							struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct rdma_vma_node my_node = {.start = start};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &rdma_vma, p_parent, p_insert,
++							SEARCH_EXACTLY, rdma_vma_node_compare);
++	
++	return node? container_of(node, struct rdma_vma_node, node): NULL;
++}
++
++int check_rdma_vma(unsigned long long start, unsigned long long end) {
++	struct rdma_vma_node *vma_node;
++
++	pthread_rwlock_rdlock(&rdma_vma.rwlock);
++	vma_node = search_rdma_vma_node(start, NULL, NULL);
++	if(!vma_node) {
++		pthread_rwlock_unlock(&rdma_vma.rwlock);
++		return 0;
++	}
++
++	if(vma_node->end != end) {
++		pthread_rwlock_unlock(&rdma_vma.rwlock);
++		return 0;
++	}
++
++	pthread_rwlock_unlock(&rdma_vma.rwlock);
++	return 1;
++}
++
++int add_one_rdma_vma_node(unsigned long long start, unsigned long long end) {
++	struct rb_node *parent, **insert;
++	struct rdma_vma_node *vma_node;
++
++	pthread_rwlock_wrlock(&rdma_vma.rwlock);
++	vma_node = search_rdma_vma_node(start, &parent, &insert);
++	if(vma_node) {
++		pthread_rwlock_unlock(&rdma_vma.rwlock);
++		return -EEXIST;
++	}
++
++	vma_node = malloc(sizeof(*vma_node));
++	if(!vma_node) {
++		pthread_rwlock_unlock(&rdma_vma.rwlock);
++		return -ENOMEM;
++	}
++
++	vma_node->start = start;
++	vma_node->end = end;
++	rbtree_add_node(&vma_node->node, parent, insert, &rdma_vma);
++
++	pthread_rwlock_unlock(&rdma_vma.rwlock);
++	pr_info("Add mapping (start: %llx, end: %llx)\n", start, end);
++	return 0;
++}
++
++#include "include/cr_options.h"
++
++int add_rdma_vma_node(pid_t pid) {
++	char fname[4096 + 512];
++	FILE *f_smap;
++	char strln[1024];
++
++	sprintf(fname, "%s/rdma_pid_%d/rdma_smap", images_dir, pid);
++	f_smap = fopen(fname, "r");
++	if(!f_smap)
++		return 0;
++
++	while(fgets(strln, 1024, f_smap)) {
++		unsigned long long start, end;
++		if(sscanf(strln, "%llx-%llx", &start, &end) < 2)
++			continue;
++
++		if(add_one_rdma_vma_node(start, end)) {
++			fclose(f_smap);
++			return -1;
++		}
++	}
++
++	fclose(f_smap);
++	return 0;
++}
++
++/* Transfer the data structure of RDMA vma from list to array */
++struct unmapped_node *get_rdma_unmapped_node(int *pn_unmapped, int *err) {
++	int n_unmapped = 0;
++	struct unmapped_node *unmapped;
++	struct rdma_vma_node *iter_vma;
++	FILE *f_proc_smap;
++	char *fgets_proc;
++	char strln_proc_smap[1024];
++	int proc_pipe[2];
++	int curp = 0;
++	int __err;
++
++	*err = 1;
++
++	/* RDMA vma maintained in rbtree */
++	for_each_rbtree_entry(iter_vma, &rdma_vma, to_rdma_vma_node, node) {
++		n_unmapped++;
++	}
++
++	f_proc_smap = fopen("/proc/self/smaps", "r");
++	__err = pipe(proc_pipe);
++	if(!f_proc_smap || __err) {
++		return NULL;
++	}
++
++	/* Memory mapping created during RDMA establishment should also be considered */
++	while(fgets(strln_proc_smap, 1024, f_proc_smap)) {
++		unsigned long long start, end;
++		char str_3[128], str_4[128], str_5[128], str_6[128], str_7[512];
++		if(sscanf(strln_proc_smap, "%llx-%llx", &start, &end) < 2)
++			continue;
++
++		if(sscanf(strln_proc_smap, "%llx-%llx%s%s%s%s%s", &start, &end,
++							str_3, str_4, str_5, str_6, str_7) < 7 ||
++					strncmp(str_7, "/proc/rdma_uwrite/", strlen("/proc/rdma_uwrite/")))
++			continue;
++
++		dprintf(proc_pipe[1], "%s", strln_proc_smap);
++		n_unmapped++;
++	}
++
++	fclose(f_proc_smap);
++	close(proc_pipe[1]);
++
++	f_proc_smap = fdopen(proc_pipe[0], "r");
++
++	unmapped = malloc(n_unmapped * sizeof(*unmapped));
++	if(!unmapped) {
++		return NULL;
++	}
++
++	fgets_proc = fgets(strln_proc_smap, 1024, f_proc_smap);
++	iter_vma = to_rdma_vma_node(rb_first(&rdma_vma.tree));
++	while(iter_vma && fgets_proc) {
++		unsigned long long rdma_start, rdma_end, proc_start, proc_end;
++
++		sscanf(strln_proc_smap, "%llx-%llx", &proc_start, &proc_end);
++		rdma_start = iter_vma->start;
++		rdma_end = iter_vma->end;
++
++		if(rdma_start < proc_start) {
++			unmapped[curp].start = rdma_start;
++			unmapped[curp].end = rdma_end;
++			curp++;
++
++			iter_vma = to_rdma_vma_node(rb_next(&iter_vma->node));
++		}
++		else {
++			unmapped[curp].start = proc_start;
++			unmapped[curp].end = proc_end;
++			curp++;
++
++			while((fgets_proc = fgets(strln_proc_smap, 1024, f_proc_smap)) != NULL) {
++				if(sscanf(strln_proc_smap, "%llx-%llx", &proc_start, &proc_end) >= 2) {
++					break;
++				}
++			}
++		}
++	}
++
++	while(iter_vma) {
++		unsigned long long rdma_start, rdma_end;
++		rdma_start = iter_vma->start;
++		rdma_end = iter_vma->end;
++
++		unmapped[curp].start = rdma_start;
++		unmapped[curp].end = rdma_end;
++		curp++;
++
++		iter_vma = to_rdma_vma_node(rb_next(&iter_vma->node));
++	}
++
++	while(fgets_proc) {
++		unsigned long long proc_start, proc_end;
++		sscanf(strln_proc_smap, "%llx-%llx", &proc_start, &proc_end);
++		unmapped[curp].start = proc_start;
++		unmapped[curp].end = proc_end;
++		curp++;
++
++		while((fgets_proc = fgets(strln_proc_smap, 1024, f_proc_smap)) != NULL) {
++			if(sscanf(strln_proc_smap, "%llx-%llx", &proc_start, &proc_end) >= 2) {
++				break;
++			}
++		}
++	}
++
++	close(proc_pipe[0]);
++
++	*err = 0;
++	*pn_unmapped = n_unmapped;
++	return unmapped;
++}
+diff --git a/criu/sk-unix.c b/criu/sk-unix.c
+index 8411526..369dc42 100644
+--- a/criu/sk-unix.c
++++ b/criu/sk-unix.c
+@@ -1059,7 +1059,13 @@ static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct
+ 	 * Some other task restores this file. Pretend that
+ 	 * we're another user of it.
+ 	 */
++	if(owner->pid->max_fd < 0) {
+ 	fd = find_unused_fd(owner, -1);
++	}
++	else {
++		fd = owner->pid->max_fd + 1;
++		owner->pid->max_fd++;
++	}
+ 	pr_info("`- will add fake %d fd\n", fd);
+ 
+ 	if (e != NULL) {
+diff --git a/criu/timens.c b/criu/timens.c
+index 66c0c02..99fdec7 100644
+--- a/criu/timens.c
++++ b/criu/timens.c
+@@ -95,6 +95,8 @@ int prepare_timens(int id)
+ 	ts.tv_sec = te->monotonic->tv_sec - ts.tv_sec;
+ 	ts.tv_nsec = te->monotonic->tv_nsec - ts.tv_nsec;
+ 	normalize_timespec(&ts);
++	ts.tv_sec = 0;
++	ts.tv_nsec = 0;
+ 
+ 	pr_debug("timens: monotonic %ld %ld\n", ts.tv_sec, ts.tv_nsec);
+ 	if (dprintf(fd, "%d %ld %ld\n", CLOCK_MONOTONIC, ts.tv_sec, ts.tv_nsec) < 0) {
+@@ -110,6 +112,8 @@ int prepare_timens(int id)
+ 	ts.tv_sec = te->boottime->tv_sec - ts.tv_sec;
+ 	ts.tv_nsec = te->boottime->tv_nsec - ts.tv_nsec;
+ 	normalize_timespec(&ts);
++	ts.tv_sec = 0;
++	ts.tv_nsec = 0;
+ 
+ 	pr_debug("timens: boottime %ld %ld\n", ts.tv_sec, ts.tv_nsec);
+ 	if (dprintf(fd, "%d %ld %ld\n", CLOCK_BOOTTIME, ts.tv_sec, ts.tv_nsec) < 0) {
+@@ -134,3 +138,104 @@ err:
+ }
+ struct ns_desc time_ns_desc = NS_DESC_ENTRY(CLONE_NEWTIME, "time");
+ struct ns_desc time_for_children_ns_desc = NS_DESC_ENTRY(CLONE_NEWTIME, "time_for_children");
++
++int prepare_timens_v2(int id, pid_t pid)
++{
++	int exit_code = -1;
++	int ret, fd = -1;
++	struct cr_img *img;
++	TimensEntry *te;
++	struct timespec ts;
++	struct timespec prev_moff = {}, prev_boff = {};
++	char fname[128];
++
++	if (opts.unprivileged)
++		return 0;
++
++	img = open_image(CR_FD_TIMENS, O_RSTR, id);
++	if (!img)
++		return -1;
++
++	if (id == 0 && empty_image(img)) {
++		pr_warn("Clocks values have not been dumped\n");
++		close_image(img);
++		return 0;
++	}
++
++	ret = pb_read_one(img, &te, PB_TIMENS);
++	close_image(img);
++	if (ret < 0)
++		goto err;
++
++	if (parse_timens_offsets(&prev_boff, &prev_moff))
++		goto err;
++
++	sprintf(fname, "/proc/%d/timens_offsets", pid);
++	fd = open(fname, O_RDWR);
++	if (fd < 0)
++		goto err;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	ts.tv_sec = ts.tv_sec - prev_moff.tv_sec;
++	ts.tv_nsec = ts.tv_nsec - prev_moff.tv_nsec;
++
++	ts.tv_sec = te->monotonic->tv_sec - ts.tv_sec;
++	ts.tv_nsec = te->monotonic->tv_nsec - ts.tv_nsec;
++	normalize_timespec(&ts);
++
++	pr_debug("timens: monotonic %ld %ld\n", ts.tv_sec, ts.tv_nsec);
++	if (dprintf(fd, "%d %ld %ld\n", CLOCK_MONOTONIC, ts.tv_sec, ts.tv_nsec) < 0) {
++		pr_perror("Unable to set a monotonic clock offset");
++		goto err;
++	}
++
++	clock_gettime(CLOCK_BOOTTIME, &ts);
++
++	ts.tv_sec = ts.tv_sec - prev_boff.tv_sec;
++	ts.tv_nsec = ts.tv_nsec - prev_boff.tv_nsec;
++
++	ts.tv_sec = te->boottime->tv_sec - ts.tv_sec;
++	ts.tv_nsec = te->boottime->tv_nsec - ts.tv_nsec;
++	normalize_timespec(&ts);
++
++	pr_debug("timens: boottime %ld %ld\n", ts.tv_sec, ts.tv_nsec);
++	if (dprintf(fd, "%d %ld %ld\n", CLOCK_BOOTTIME, ts.tv_sec, ts.tv_nsec) < 0) {
++		pr_perror("Unable to set a boottime clock offset");
++		goto err;
++	}
++
++	timens_entry__free_unpacked(te, NULL);
++	close_safe(&fd);
++
++#if 0
++	fd = open_proc(PROC_SELF, "ns/time_for_children");
++	if (fd < 0) {
++		pr_perror("Unable to open ns/time_for_children");
++		goto err;
++	}
++	if (switch_ns_by_fd(fd, &time_ns_desc, NULL))
++		goto err;
++#endif
++	exit_code = 0;
++err:
++	close_safe(&fd);
++	return exit_code;
++}
++
++int join_new_timens(pid_t pid) {
++	int fd;
++	char fname[256];
++
++	sprintf(fname, "/proc/%d/ns/time_for_children", pid);
++	fd = open(fname, O_RDONLY);
++	if(fd < 0) {
++		pr_perror("Unable to open ns/time_for_children");
++		return -1;
++	}
++
++	if (switch_ns_by_fd(fd, &time_ns_desc, NULL))
++		return -1;
++
++	close_safe(&fd);
++	return 0;
++}
+diff --git a/images/rpc.proto b/images/rpc.proto
+index afd2c7b..defcfbf 100644
+--- a/images/rpc.proto
++++ b/images/rpc.proto
+@@ -177,6 +177,7 @@ enum criu_req_type {
+ 	PAGE_SERVER_CHLD = 12;
+ 
+ 	SINGLE_PRE_DUMP = 13;
++	SINGLE_PRE_DUMP_RDMA = 14;
+ }
+ 
+ /*

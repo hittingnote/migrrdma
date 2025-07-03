@@ -1,0 +1,4734 @@
+diff --git a/backports/0027-BACKPORT-drivers-infiniband-core-uverbs.h.patch b/backports/0027-BACKPORT-drivers-infiniband-core-uverbs.h.patch
+index 885c72b..e69de29 100644
+--- a/backports/0027-BACKPORT-drivers-infiniband-core-uverbs.h.patch
++++ b/backports/0027-BACKPORT-drivers-infiniband-core-uverbs.h.patch
+@@ -1,18 +0,0 @@
+-From: Valentine Fatiev <valentinef@mellanox.com>
+-Subject: [PATCH] BACKPORT: drivers/infiniband/core/uverbs.h
+-
+-Change-Id: Ia8a5104e09385febf90562d12867a09b505e0594
+----
+- drivers/infiniband/core/uverbs.h | 1 -
+- 1 file changed, 1 deletion(-)
+-
+---- a/drivers/infiniband/core/uverbs.h
+-+++ b/drivers/infiniband/core/uverbs.h
+-@@ -158,7 +158,6 @@ struct ib_uverbs_file {
+- 	struct mutex umap_lock;
+- 	struct list_head umaps;
+- 	struct page *disassociate_page;
+--
+- 	struct xarray		idr;
+- };
+- 
+diff --git a/drivers/infiniband/core/Makefile b/drivers/infiniband/core/Makefile
+index 5f97f8b..0da3595 100644
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@ -48,8 +48,9 @@ ib_uverbs-y :=			uverbs_main.o uverbs_cmd.o uverbs_marshall.o \
+ 				uverbs_std_types_async_fd.o \
+ 				uverbs_std_types_srq.o \
+ 				uverbs_std_types_wq.o \
+-				uverbs_std_types_qp.o
+-
++				uverbs_std_types_qp.o rdma_footprint.o rbtree_core.o \
++				res_mapping_kern.o res_mapping_user.o migrrdma_service.o #pause_ud_signal.o \
++				migr_channel.o migrrdma_service.o
+ 
+ ib_core-$(CONFIG_INFINIBAND_USER_MEM) += umem.o peer_mem.o 
+ ib_core-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += umem_odp.o
+diff --git a/drivers/infiniband/core/migr_channel.c b/drivers/infiniband/core/migr_channel.c
+new file mode 100644
+index 0000000..fcb733b
+--- /dev/null
++++ b/drivers/infiniband/core/migr_channel.c
+@@ -0,0 +1,116 @@
++#include "rdma_footprint.h"
++
++static inline int up_to_pow_two(int n) {
++	int tmp = n;
++	while(tmp & (tmp - 1))
++		tmp = (tmp & (tmp - 1));
++	
++	if(n > tmp)
++		return 2*tmp;
++	else
++		return tmp;
++}
++
++static void *expand_buf(void *buf, size_t orig_size, size_t new_size) {
++	void *buf_tmp = NULL;
++
++	if(up_to_pow_two(new_size) <= up_to_pow_two(orig_size))
++		return buf;
++	
++	buf_tmp = kzalloc(up_to_pow_two(new_size), GFP_KERNEL);
++	if(!buf_tmp) {
++		if(buf)
++			kfree(buf);
++		return NULL;
++	}
++
++	memset(buf_tmp, 0, up_to_pow_two(new_size));
++	memcpy(buf_tmp, buf, up_to_pow_two(orig_size));
++	if(buf)
++		kfree(buf);
++	buf = buf_tmp;
++	return buf;
++}
++
++static void *shrink_buf(void *buf, size_t *this_size, loff_t *off, int *err) {
++	void *buf_tmp = NULL;
++	size_t shrink_size;
++	*err = 0;
++
++	if(up_to_pow_two(*this_size - *off) >= up_to_pow_two(*this_size)) {
++		return buf;
++	}
++
++	shrink_size = *this_size - up_to_pow_two(*this_size - *off);
++	if(up_to_pow_two(*this_size - *off)) {
++		buf_tmp = kzalloc(up_to_pow_two(*this_size - *off), GFP_KERNEL);
++		if(!buf_tmp) {
++			if(buf)
++				kfree(buf);
++			*err = -ENOMEM;
++			return NULL;
++		}
++	}
++	else {
++		buf_tmp = NULL;
++	}
++
++	memset(buf_tmp, 0, up_to_pow_two(*this_size - *off));
++	memcpy(buf_tmp, buf + shrink_size, up_to_pow_two(*this_size - *off));
++	*off = *off - shrink_size;
++	*this_size = *this_size - shrink_size;
++
++	if(buf)
++		kfree(buf);
++	buf = buf_tmp;
++	return buf;
++}
++
++ssize_t channel_to_proc_write(void **channel_buf, size_t *orig_size,
++					const char __user *buf, size_t size) {
++	int err;
++
++	*channel_buf = expand_buf(*channel_buf, *orig_size, *orig_size + size);
++	if(!(*channel_buf)) {
++		*orig_size = 0;
++		return -ENOMEM;
++	}
++
++	err = copy_from_user(*channel_buf + *orig_size, buf, size);
++	if(err) {
++		kfree(*channel_buf);
++		*channel_buf = NULL;
++		*orig_size = 0;
++		return err;
++	}
++	
++	*orig_size = *orig_size + size;
++	return size;
++}
++
++ssize_t channel_from_frm_read(void **channel_buf, size_t *orig_size,
++					char __user *buf, size_t size, loff_t *off) {
++	int err;
++
++	printk(KERN_NOTICE "In %s(%d): orig_size: %d, off: %d\n", __FILE__, __LINE__,
++							*orig_size, *off);
++
++	err = copy_to_user(buf, *channel_buf + *off, size);
++	if(err) {
++		kfree(*channel_buf);
++		*channel_buf = NULL;
++		*off = 0;
++		*orig_size = 0;
++		return err;
++	}
++
++	*off = *off + size;
++	*channel_buf = shrink_buf(*channel_buf, orig_size, off, &err);
++	if(err) {
++		*off = 0;
++		*orig_size = 0;
++		return err;
++	}
++
++	return size;
++}
+diff --git a/drivers/infiniband/core/migrrdma_service.c b/drivers/infiniband/core/migrrdma_service.c
+new file mode 100644
+index 0000000..a0fc175
+--- /dev/null
++++ b/drivers/infiniband/core/migrrdma_service.c
+@@ -0,0 +1,151 @@
++#include "rdma_footprint.h"
++#include "rbtree_core.h"
++
++struct rkey_mapping_node {
++	pid_t					pid;
++	uint32_t				vrkey;
++	uint32_t				rkey;
++	struct rb_node			node;
++};
++
++declare_and_init_rbtree(rkey_mapping_table);
++
++static int rkey_mapping_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct rkey_mapping_node *ent1 =
++					n1? container_of(n1, struct rkey_mapping_node, node): NULL;
++	struct rkey_mapping_node *ent2 =
++					n2? container_of(n2, struct rkey_mapping_node, node): NULL;
++
++	return memcmp(ent1, ent2, offsetof(struct rkey_mapping_node, rkey));
++}
++
++static struct rkey_mapping_node *search(pid_t pid, uint32_t vrkey,
++					struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct rkey_mapping_node my_node;
++	struct rb_node *node;
++
++	memset(&my_node, 0, sizeof(my_node));
++	my_node.pid = pid;
++	my_node.vrkey = vrkey;
++
++	node = ___search(&my_node.node, &rkey_mapping_table, p_parent, p_insert,
++					SEARCH_EXACTLY, rkey_mapping_node_compare);
++	
++	return node? container_of(node, struct rkey_mapping_node, node): NULL;
++}
++
++int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey) {
++	struct rkey_mapping_node *mapping_node;
++	struct rb_node *parent, **insert;
++
++	write_lock(&rkey_mapping_table.rwlock);
++	mapping_node = search(pid, vrkey, &parent, &insert);
++	if(mapping_node) {
++		mapping_node->rkey = rkey;
++		write_unlock(&rkey_mapping_table.rwlock);
++		return 0;
++	}
++
++	mapping_node = kzalloc(sizeof(*mapping_node), GFP_KERNEL);
++	if(!mapping_node) {
++		write_unlock(&rkey_mapping_table.rwlock);
++		return -ENOMEM;
++	}
++
++	mapping_node->pid = pid;
++	mapping_node->vrkey = vrkey;
++	mapping_node->rkey = rkey;
++	rbtree_add_node(&mapping_node->node, parent, insert, &rkey_mapping_table);
++	write_unlock(&rkey_mapping_table.rwlock);
++
++	return 0;
++}
++
++int service_delete_rkey_mapping(pid_t pid, uint32_t vrkey) {
++	struct rkey_mapping_node *mapping_node;
++
++	write_lock(&rkey_mapping_table.rwlock);
++	mapping_node = search(pid, vrkey, NULL, NULL);
++	if(mapping_node) {
++		rbtree_rm_node(&mapping_node->node, &rkey_mapping_table);
++		kfree(mapping_node);
++	}
++	write_unlock(&rkey_mapping_table.rwlock);
++
++	return 0;
++}
++
++struct msg_fmt {
++	pid_t					pid;
++	uint32_t				vrkey;
++};
++
++static struct task_struct *rkey_service_task;
++static struct socket *sock;
++
++static int rkey_translate_service(void *unused) {
++	int err;
++	struct sockaddr_in local_addr, remote_addr;
++	struct msghdr msg;
++	struct kvec vec;
++	struct msg_fmt msg_content;
++	uint32_t rkey;
++	struct rkey_mapping_node *mapping_node;
++
++	err = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, 0, &sock);
++	if(err) {
++		err_info("socket create error\n");
++		return err;
++	}
++
++	local_addr.sin_family = AF_INET;
++	local_addr.sin_port = htons(45645);
++	local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++	err = kernel_bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr));
++	if(err) {
++		err_info("kernel_bind error\n");
++		return err;
++	}
++
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_name = (struct sockaddr *)&remote_addr;
++
++	while(1) {
++		memset(&vec, 0, sizeof(vec));
++
++		vec.iov_base = &msg_content;
++		vec.iov_len = sizeof(msg_content);
++		err = kernel_recvmsg(sock, &msg, &vec, 1, sizeof(msg_content), 0);
++		if(err < 0) {
++			err_info("kernel_recvmsg error\n");
++			continue;
++		}
++
++		read_lock(&rkey_mapping_table.rwlock);
++		mapping_node = search(msg_content.pid, msg_content.vrkey, NULL, NULL);
++		rkey = mapping_node? mapping_node->rkey: -1;
++		read_unlock(&rkey_mapping_table.rwlock);
++
++		memset(&vec, 0, sizeof(vec));
++
++		vec.iov_base = &rkey;
++		vec.iov_len = sizeof(rkey);
++		err = kernel_sendmsg(sock, &msg, &vec, 1, sizeof(rkey));
++		if(err < 0) {
++			err_info("kernel_sendmsg error\n");
++			continue;
++		}
++	}
++
++	return 0;
++}
++
++int init_rkey_translate_service(void) {
++	rkey_service_task = kthread_run(rkey_translate_service, NULL, "rkey_translate_service");
++	return !rkey_service_task;
++}
++
++void exit_rkey_translate_service(void) {
++	sock_release(sock);
++	kthread_stop(rkey_service_task);
++}
+diff --git a/drivers/infiniband/core/pause_ud_signal.c b/drivers/infiniband/core/pause_ud_signal.c
+new file mode 100644
+index 0000000..a3d5434
+--- /dev/null
++++ b/drivers/infiniband/core/pause_ud_signal.c
+@@ -0,0 +1,167 @@
++#include "rdma_footprint.h"
++#include "rbtree_core.h"
++
++struct gid_qpn_node {
++	union ib_gid					gid;
++	uint32_t						qpn;
++	struct rb_node					node;
++};
++
++static declare_and_init_rbtree(paused_gid_qpn_tree);
++
++static int compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct gid_qpn_node *ent1 =
++					n1? container_of(n1, struct gid_qpn_node, node): NULL;
++	struct gid_qpn_node *ent2 =
++					n2? container_of(n2, struct gid_qpn_node, node): NULL;
++	int compare;
++
++	compare = memcmp(&ent1->gid, &ent2->gid, sizeof(union ib_gid));
++	if(compare)
++		return compare;
++	
++	return memcmp(&ent1->qpn, &ent2->qpn, sizeof(uint32_t));
++}
++
++static struct gid_qpn_node *search(union ib_gid *gid, uint32_t qpn,
++					struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct gid_qpn_node my_node;
++	struct rb_node *node;
++
++	memcpy(&my_node.gid, gid, sizeof(*gid));
++	my_node.qpn = qpn;
++
++	node = ___search(&my_node.node, &paused_gid_qpn_tree, p_parent, p_insert,
++						SEARCH_EXACTLY, compare);
++	
++	return node? container_of(node, struct gid_qpn_node, node): NULL;
++}
++
++enum write_opcode {
++	GID_QPN_ADD,
++	GID_QPN_DEL,
++};
++
++struct gid_qpn_node_write {
++	union ib_gid					gid;
++	uint32_t						qpn;
++};
++
++struct header {
++	enum write_opcode				opcode;
++	struct gid_qpn_node_write		nodes[0];
++};
++
++static wait_queue_head_t pause_wait_queue;
++
++static ssize_t pause_entry_kernel_write(struct file *filep, const char __user *buf,
++								size_t size, loff_t *off) {
++	struct gid_qpn_node_write *kbuf;
++	struct header *opcode;
++	struct gid_qpn_node *node;
++	struct rb_node *parent, **insert;
++	int n_node, i;
++	int err;
++
++	if((size - sizeof(struct header)) % sizeof(struct gid_qpn_node_write)) {
++		return -EINVAL;
++	}
++
++	n_node = (size - sizeof(struct header)) / sizeof(struct gid_qpn_node_write);
++
++	kbuf = kzalloc(size, GFP_KERNEL);
++	if(!kbuf)
++		return -ENOMEM;
++	
++	err = copy_from_user(kbuf, buf, size);
++	if(err) {
++		kfree(kbuf);
++		return err;
++	}
++
++	opcode = (struct header *)kbuf;
++	kbuf = (void*)kbuf + offsetof(struct header, nodes);
++
++	write_lock(&paused_gid_qpn_tree.rwlock);
++	for(i = 0; i < n_node; i++) {
++		node = search(&kbuf[i].gid, kbuf[i].qpn, &parent, &insert);
++
++		switch(opcode->opcode) {
++			case GID_QPN_ADD:
++				if(!node) {
++					node = kzalloc(sizeof(*node), GFP_KERNEL);
++					if(!node) {
++						write_unlock(&paused_gid_qpn_tree.rwlock);
++						kfree(opcode);
++						return -ENOMEM;
++					}
++
++					memcpy(&node->gid, &kbuf[i].gid, sizeof(union ib_gid));
++					node->qpn = kbuf[i].qpn;
++					rbtree_add_node(&node->node, parent, insert, &paused_gid_qpn_tree);
++				}
++				break;
++
++			case GID_QPN_DEL:
++				if(node) {
++					rbtree_rm_node(&node->node, &paused_gid_qpn_tree);
++				}
++				break;
++		}
++	}
++	write_unlock(&paused_gid_qpn_tree.rwlock);
++
++	if(opcode->opcode == GID_QPN_DEL) {
++		wake_up_interruptible(&pause_wait_queue);
++	}
++
++	kfree(opcode);
++	return size;
++}
++
++static struct gid_qpn_node *search_with_lock(union ib_gid *gid, uint32_t qpn) {
++	struct gid_qpn_node my_node;
++	struct rb_node *node;
++
++	memcpy(&my_node.gid, gid, sizeof(*gid));
++	my_node.qpn = qpn;
++
++	read_lock(&paused_gid_qpn_tree.rwlock);
++	node = ___search(&my_node.node, &paused_gid_qpn_tree, NULL, NULL,
++						SEARCH_EXACTLY, compare);
++	read_unlock(&paused_gid_qpn_tree.rwlock);
++	
++	return node? container_of(node, struct gid_qpn_node, node): NULL;
++}
++
++static ssize_t pause_entry_user_write(struct file *filep, const char __user *buf,
++								size_t size, loff_t *off) {
++	struct gid_qpn_node_write kbuf;
++	struct gid_qpn_node *node;
++	int err;
++
++	if(size != sizeof(struct gid_qpn_node_write))
++		return -EINVAL;
++	
++	err = copy_from_user(&kbuf, buf, size);
++	if(err)
++		return err;
++	
++	wait_event_interruptible(pause_wait_queue,
++							!search_with_lock(&kbuf.gid, kbuf.qpn));
++	
++	return size;
++}
++
++struct proc_ops pause_entry_ops = {
++	.proc_write				= pause_entry_kernel_write,
++};
++
++struct proc_ops pause_uwrite_entry_ops = {
++	.proc_write				= pause_entry_user_write,
++};
++
++int init_ud_qp_pause_signal(void) {
++	init_waitqueue_head(&pause_wait_queue);
++	return 0;
++}
+diff --git a/drivers/infiniband/core/rbtree_core.c b/drivers/infiniband/core/rbtree_core.c
+new file mode 100644
+index 0000000..bc0d809
+--- /dev/null
++++ b/drivers/infiniband/core/rbtree_core.c
+@@ -0,0 +1,303 @@
++#include "rbtree_core.h"
++#include <linux/slab.h>
++#include <linux/list.h>
++
++enum TRAV_DIRECTION {
++	GO_LEFT,
++	GO_RIGHT,
++	NO_DIRECTION,
++};
++
++struct stack_elem {
++	struct rb_node				*current_node;
++	struct rb_node				*parent;
++	int							flag;
++	struct list_head			list;
++};
++
++static inline int push_stack(struct rb_node *cur,
++						struct rb_node *parent,
++						const int flag,
++						const struct list_head *stack) {
++	struct stack_elem *elem;
++	elem = kzalloc(sizeof(*elem), GFP_KERNEL);
++	if(!elem)
++		return -ENOMEM;
++	
++	elem->current_node = cur;
++	elem->parent = parent;
++	elem->flag = flag;
++	list_add(&elem->list, stack);
++	return 0;
++}
++
++static inline void pop_stack(const struct list_head *stack) {
++	struct stack_elem *first =
++			list_first_entry_or_null(stack, struct stack_elem, list);
++	if(!first)
++		return;
++	list_del(&first->list);
++	kfree(first);
++}
++
++static inline struct stack_elem *top_stack(const struct list_head *stack) {
++	return list_first_entry_or_null(stack, struct stack_elem, list);
++}
++
++static inline int stack_is_empty(const struct list_head *stack) {
++	return (list_first_entry_or_null(stack, struct stack_elem, list) == NULL);
++}
++
++struct rb_node *___search(const struct rb_node *target, const struct rbtree_struct *rbtree,
++						struct rb_node **p_parent, struct rb_node ***p_insert, enum search_ops ops,
++						int (*compare)(const struct rb_node*, const struct rb_node*)) {
++	struct rb_node *parent = NULL;
++	struct rb_node **insert = &rbtree->tree.rb_node;
++	struct rb_node *node = rbtree->tree.rb_node;
++	enum TRAV_DIRECTION direction = NO_DIRECTION;
++
++	while(node) {
++		parent = node;
++
++		if(compare(target, node) < 0) {
++			node = node->rb_left;
++			insert = &(*insert)->rb_left;
++			direction = GO_LEFT;
++		}
++		else if(compare(target, node) > 0) {
++			node = node->rb_right;
++			insert = &(*insert)->rb_right;
++			direction = GO_RIGHT;
++		}
++		else {
++			switch(ops) {
++			case SEARCH_EXACTLY:
++			case SEARCH_LAST_PRECURSOR_INC_ITSELF:
++			case SEARCH_FIRST_SUCCESSOR_INC_ITSELF:
++				parent = NULL;
++				insert = NULL;
++				goto out;
++			case SEARCH_LAST_PRECURSOR:
++				node = node->rb_left;
++				insert = &(*insert)->rb_left;
++				direction = GO_LEFT;
++				break;
++			case SEARCH_FIRST_SUCCESSOR:
++				node = node->rb_right;
++				insert = &(*insert)->rb_right;
++				direction = GO_RIGHT;
++				break;
++			}
++		}
++	}
++
++	if((!parent) || (ops == SEARCH_EXACTLY))
++		goto out;
++
++	if(p_parent)
++		*p_parent = parent;
++
++	while(parent && (((ops & SEARCH_LAST_PRECURSOR) && direction == GO_LEFT) ||
++				((ops & SEARCH_FIRST_SUCCESSOR) && direction == GO_RIGHT))) {
++		struct rb_node *grandpa = rb_parent(parent);
++		if(!grandpa)
++			direction = NO_DIRECTION;
++		else if(grandpa->rb_left == parent)
++			direction = GO_LEFT;
++		else
++			direction = GO_RIGHT;
++		parent = grandpa;
++	}
++
++	node = parent;
++
++	if(p_insert)
++		*p_insert = insert;
++	
++	return node;
++
++out:
++	if(p_parent)
++		*p_parent = parent;
++	if(p_insert)
++		*p_insert = insert;
++	return node;
++}
++
++void ___traverse(const struct rbtree_struct *rbtree,
++		void (*go_forward)(struct rb_node *cur, struct rb_node *child,
++						enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end),
++		void (*go_backward)(struct rb_node *cur, struct rb_node *parent,
++						enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end))
++{
++	struct list_head stack;
++	int err = 0;
++	INIT_LIST_HEAD(&stack);
++
++	if(!rbtree->tree.rb_node)
++		printk(KERN_NOTICE "In %s(%d): Empty traverse\n",
++								__FILE__, __LINE__);
++
++	err = push_stack(rbtree->tree.rb_node, NULL, 0, &stack);
++	if(err)
++		return;
++	
++	while(!stack_is_empty(&stack)) {
++		struct stack_elem *top = top_stack(&stack);
++		if(!top->current_node) {
++			pop_stack(&stack);
++				top = top_stack(&stack);
++			if(top && top->flag == 0 && go_backward)
++				go_backward(top->current_node->rb_left,
++							top->current_node, LEFT, NULL, NULL);
++			else if(top && top->flag == 1 && go_backward)
++				go_backward(top->current_node->rb_right,
++							top->current_node, RIGHT, NULL, NULL);
++			if(top)
++				top->flag++;
++			continue;
++		}
++
++		if(top->flag == 0) {
++			err = push_stack(top->current_node->rb_left,
++					top->current_node, 0, &stack);
++			if(err)
++				goto out;
++			
++			if(go_forward)
++				go_forward(top->current_node,
++						top->current_node->rb_left, LEFT, NULL, NULL);
++		}
++		else if(top->flag == 1) {
++			err = push_stack(top->current_node->rb_right,
++					top->current_node, 0, &stack);
++			if(err)
++				goto out;
++			
++			if(go_forward)
++				go_forward(top->current_node,
++						top->current_node->rb_right, RIGHT, NULL, NULL);
++		}
++		else {
++			pop_stack(&stack);
++			top = top_stack(&stack);
++			if(top && top->flag == 0 && go_backward)
++				go_backward(top->current_node->rb_left,
++							top->current_node, LEFT, NULL, NULL);
++			else if(top && top->flag == 1 && go_backward)
++				go_backward(top->current_node->rb_right,
++							top->current_node, RIGHT, NULL, NULL);
++			if(top)
++				top->flag++;
++		}
++	}
++
++out:
++	while(!stack_is_empty(&stack))
++		pop_stack(&stack);
++	return;
++}
++
++static inline struct rb_node *get_child(struct stack_elem *top,
++				enum TRACE_DIRECTION dir, struct rb_node *start, struct rb_node *end,
++				int (*compare)(const struct rb_node*, const struct rb_node*)) {
++	switch(dir) {
++	case LEFT:
++		if(top->parent && top->parent->rb_right == top->current_node &&
++						compare(end, top->parent) < 0)
++			return NULL;
++		else if(compare(top->current_node, start) < 0)
++			return NULL;
++		else
++			return top->current_node->rb_left;
++	case RIGHT:
++		if(top->parent && top->parent->rb_left == top->current_node &&
++							compare(top->parent, start) < 0)
++			return NULL;
++		else if(compare(end, top->current_node) < 0)
++			return NULL;
++		else
++			return top->current_node->rb_right;
++	}
++	return NULL;
++}
++
++void ___traverse_range(const struct rb_node *start,
++		const struct rb_node *end, const struct rbtree_struct *rbtree,
++		int (*compare)(const struct rb_node*, const struct rb_node*),
++		void (*go_forward)(struct rb_node *cur, struct rb_node *child,
++						enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end),
++		void (*go_backward)(struct rb_node *cur, struct rb_node *parent,
++						enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end))
++{
++	struct list_head stack;
++	int err = 0;
++	INIT_LIST_HEAD(&stack);
++
++	if(compare(start, end) > 0)
++		return;
++
++	if(!rbtree->tree.rb_node)
++		printk(KERN_NOTICE "In %s(%d): Empty traverse\n",
++								__FILE__, __LINE__);
++
++	err = push_stack(rbtree->tree.rb_node, NULL, 0, &stack);
++	if(err)
++		return;
++	
++	while(!stack_is_empty(&stack)) {
++		struct stack_elem *top = top_stack(&stack);
++		if(!top->current_node) {
++			pop_stack(&stack);
++				top = top_stack(&stack);
++			if(top && top->flag == 0 && go_backward)
++				go_backward(NULL, top->current_node, LEFT, start, end);
++			else if(top && top->flag == 1 && go_backward)
++				go_backward(NULL, top->current_node, RIGHT, start, end);
++			if(top)
++				top->flag++;
++			continue;
++		}
++
++		if(top->flag == 0) {
++			struct rb_node *child = get_child(top, LEFT, start, end, compare);
++			err = push_stack(child, top->current_node, 0, &stack);
++			if(err)
++				goto out;
++			
++			if(go_forward)
++				go_forward(top->current_node, child, LEFT, start, end);
++		}
++		else if(top->flag == 1) {
++			struct rb_node *child = get_child(top, RIGHT, start, end, compare);
++			err = push_stack(child, top->current_node, 0, &stack);
++			if(err)
++				goto out;
++			
++			if(go_forward)
++				go_forward(top->current_node, child, RIGHT, start, end);
++		}
++		else {
++			pop_stack(&stack);
++			top = top_stack(&stack);
++			if(top && top->flag == 0 && go_backward)
++				go_backward(get_child(top, LEFT, start, end, compare),
++							top->current_node, LEFT, start, end);
++			else if(top && top->flag == 1 && go_backward)
++				go_backward(get_child(top, RIGHT, start, end, compare),
++							top->current_node, RIGHT, start, end);
++			if(top)
++				top->flag++;
++		}
++	}
++
++out:
++	while(!stack_is_empty(&stack))
++		pop_stack(&stack);
++	return;
++}
++
+diff --git a/drivers/infiniband/core/rbtree_core.h b/drivers/infiniband/core/rbtree_core.h
+new file mode 100644
+index 0000000..5424fca
+--- /dev/null
++++ b/drivers/infiniband/core/rbtree_core.h
+@@ -0,0 +1,78 @@
++#ifndef __RB_TREE_CORE_H__
++#define __RB_TREE_CORE_H__
++
++#include <linux/rbtree.h>
++#include <linux/spinlock.h>
++#include <linux/rwlock.h>
++
++struct rbtree_struct {
++	struct rb_root				tree;
++	rwlock_t					rwlock;
++};
++
++enum search_ops {
++	/* Search the element exactly the same as what is specified */
++	SEARCH_EXACTLY									= 0,
++	/* Search the last precursor of the specified item */
++	SEARCH_LAST_PRECURSOR							= 2,
++	/* Search the last precursor of the specified item.
++	 * If there is the item exactly the same as what is specified,
++	 * then return it */
++	SEARCH_LAST_PRECURSOR_INC_ITSELF				= 3,
++	/* Search the first successor of the specified item */
++	SEARCH_FIRST_SUCCESSOR							= 4,
++	/* Search the first successor of the specified item.
++	 * If there is the item exactly the same as what is specified,
++	 * then return it */
++	SEARCH_FIRST_SUCCESSOR_INC_ITSELF				= 5,
++};
++
++enum TRACE_DIRECTION {
++	LEFT,
++	RIGHT,
++};
++
++#define declare_and_init_rbtree(var)								\
++	struct rbtree_struct var = {									\
++		.tree				= RB_ROOT,								\
++		.rwlock				= __RW_LOCK_UNLOCKED(var.rwlock),		\
++	}
++
++extern struct rb_node *___search(const struct rb_node *target, const struct rbtree_struct *rbtree,
++						struct rb_node **p_parent, struct rb_node ***p_insert, enum search_ops ops,
++						int (*compare)(const struct rb_node*, const struct rb_node*));
++
++extern void ___traverse(const struct rbtree_struct *rbtree,
++		void (*go_forward)(struct rb_node *cur, struct rb_node *child, enum TRACE_DIRECTION,
++						struct rb_node *start, struct rb_node *end),
++		void (*go_backward)(struct rb_node *cur, struct rb_node *parent, enum TRACE_DIRECTION,
++						struct rb_node *start, struct rb_node *end));
++
++extern void ___traverse_range(const struct rb_node *start,
++		const struct rb_node *end, const struct rbtree_struct *rbtree,
++		int (*compare)(const struct rb_node*, const struct rb_node*),
++		void (*go_forward)(struct rb_node *cur, struct rb_node *child, enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end),
++		void (*go_backward)(struct rb_node *cur, struct rb_node *parent, enum TRACE_DIRECTION dir,
++						struct rb_node *start, struct rb_node *end));
++
++static inline void rbtree_add_node(struct rb_node *new_node, struct rb_node *parent,
++					struct rb_node **insert, struct rbtree_struct *rbtree) {
++	rb_link_node(new_node, parent, insert);
++	rb_insert_color(new_node, &rbtree->tree);
++}
++
++static inline void rbtree_rm_node(struct rb_node *target, struct rbtree_struct *rbtree) {
++	rb_erase(target, &rbtree->tree);
++}
++
++static inline void clean_rbtree(struct rbtree_struct *rbtree,
++				void (*free_fn)(struct rb_node *node)) {
++	struct rb_node *root_node;
++	while((root_node = rbtree->tree.rb_node)) {
++		rb_erase(root_node, &rbtree->tree);
++		free_fn(root_node);
++	}
++}
++
++#endif
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 6d3ed7c..2efb4e5 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -41,6 +41,7 @@
+ #include "uverbs.h"
+ #include "core_priv.h"
+ #include "rdma_core.h"
++#include "rdma_footprint.h"
+ 
+ static void uverbs_uobject_free(struct kref *ref)
+ {
+@@ -928,6 +929,39 @@ uverbs_get_uobject_from_file(u16 object_id, enum uverbs_obj_access access,
+ 	const struct uverbs_api_object *obj =
+ 		uapi_get_object(attrs->ufile->device->uapi, object_id);
+ 
++	if(uobj_get_type(attrs, UVERBS_OBJECT_PD) == obj) {
++		int handle, err;
++		err = get_pd_handle(attrs->ufile, id, &handle);
++		if(err)
++			return err;
++		
++		id = (s64)handle;
++	}
++	else if(uobj_get_type(attrs, UVERBS_OBJECT_CQ) == obj) {
++		int handle, err;
++		err = get_cq_handle(attrs->ufile, id, &handle);
++		if(!err)
++			id = (s64)handle;
++	}
++	else if(uobj_get_type(attrs, UVERBS_OBJECT_MR) == obj) {
++		int handle, err;
++		err = get_mr_handle(attrs->ufile, id, &handle);
++		if(!err)
++			id = (s64)handle;
++	}
++	else if(uobj_get_type(attrs, UVERBS_OBJECT_QP) == obj) {
++		int handle, err;
++		err = get_qp_handle(attrs->ufile, id, &handle);
++		if(!err)
++			id = (s64)handle;
++	}
++	else if(uobj_get_type(attrs, UVERBS_OBJECT_SRQ) == obj) {
++		int handle, err;
++		err = get_srq_handle(attrs->ufile, id, &handle);
++		if(!err)
++			id = (s64)handle;
++	}
++
+ 	switch (access) {
+ 	case UVERBS_ACCESS_READ:
+ 		return rdma_lookup_get_uobject(obj, attrs->ufile, id,
+diff --git a/drivers/infiniband/core/rdma_core.h b/drivers/infiniband/core/rdma_core.h
+index 33706da..fee1a0d 100644
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -155,6 +155,7 @@ extern const struct uapi_definition uverbs_def_obj_async_fd[];
+ extern const struct uapi_definition uverbs_def_obj_counters[];
+ extern const struct uapi_definition uverbs_def_obj_cq[];
+ extern const struct uapi_definition uverbs_def_obj_device[];
++extern const struct uapi_definition uverbs_def_obj_footprint[];
+ extern const struct uapi_definition uverbs_def_obj_dm[];
+ extern const struct uapi_definition uverbs_def_obj_flow_action[];
+ extern const struct uapi_definition uverbs_def_obj_intf[];
+diff --git a/drivers/infiniband/core/rdma_footprint.c b/drivers/infiniband/core/rdma_footprint.c
+new file mode 100644
+index 0000000..997931c
+--- /dev/null
++++ b/drivers/infiniband/core/rdma_footprint.c
+@@ -0,0 +1,1354 @@
++#include <linux/proc_fs.h>
++#include <linux/sched.h>
++#include <linux/seq_file.h>
++#include <linux/device.h>
++#include <linux/kthread.h>
++#include <linux/ktime.h>
++#include <linux/delay.h>
++#include "rdma_footprint.h"
++#include "rbtree_core.h"
++#include "uverbs.h"
++
++#define FP_ACCESS_MODE					00400
++#define FP_UWRITE_MODE					S_IRUGO | S_IWUGO | S_IXUGO
++
++static struct proc_dir_entry *procfs_dir_ent;
++static struct proc_dir_entry *procfs_dir_uwrite_ent;
++
++struct proc_task_node {
++	struct task_struct				*task;
++	struct proc_dir_entry			*task_dir_ent;
++	struct proc_dir_entry			*task_dir_uwrite_ent;
++	uint32_t						proc_to_frm;
++	wait_queue_head_t				proc_to_frm_wait_queue;
++	int								proc_to_frm_wait_flag;
++	uint32_t						frm_to_proc;
++	wait_queue_head_t				frm_to_proc_wait_queue;
++	int								frm_to_proc_wait_flag;
++	void							*partner_buf;
++	int								partner_buf_size;
++
++	struct rb_node					node;
++	u64								refcnt;
++	struct rbtree_struct			qp_pause_symlink_tree;
++	pid_t							user_pid;
++};
++
++struct qp_symlink_node {
++	u32								vqpn;
++	u32								qp_num;
++	struct proc_dir_entry			*parent;
++	struct rb_node					node;
++};
++
++static declare_and_init_rbtree(proc_task_tree);
++
++static int compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct proc_task_node *ent1 =
++				n1? container_of(n1, struct proc_task_node, node): NULL;
++	struct proc_task_node *ent2 =
++				n2? container_of(n2, struct proc_task_node, node): NULL;
++	
++	if(!ent1 && !ent2)
++		return 0;
++	else if(!ent1)
++		return -1;
++	else if(!ent2)
++		return 1;
++	
++	return ent1->task->tgid - ent2->task->tgid;
++}
++
++static int qp_symlink_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct qp_symlink_node *ent1 =
++				n1? container_of(n1, struct qp_symlink_node, node): NULL;
++	struct qp_symlink_node *ent2 =
++				n2? container_of(n2, struct qp_symlink_node, node): NULL;
++	
++	if(ent1->qp_num < ent2->qp_num)
++		return -1;
++	else if(ent1->qp_num > ent2->qp_num)
++		return 1;
++	else
++		return 0;
++}
++
++static struct proc_task_node *search(struct task_struct *task, struct rb_node **p_parent,
++						struct rb_node ***p_insert) {
++	struct proc_task_node my_node = {.task = task};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &proc_task_tree, p_parent, p_insert,
++						SEARCH_EXACTLY, compare);
++	
++	return node? container_of(node, struct proc_task_node, node): NULL;
++}
++
++static void free_qp_symlink_node(struct rb_node *node) {
++	struct qp_symlink_node *qp_symlink_node =
++				node? container_of(node, struct qp_symlink_node, node): NULL;
++	char symlink_name[128];
++	
++	if(!qp_symlink_node)
++		return;
++	
++	sprintf(symlink_name, "qpn_%d_%d_%d", current->tgid, qp_symlink_node->vqpn, qp_symlink_node->qp_num);
++	remove_proc_entry(symlink_name, qp_symlink_node->parent);
++	kfree(qp_symlink_node);
++}
++
++static struct qp_symlink_node *search_qp_symlink(u32 qp_num, struct proc_task_node *task_node,
++						struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct qp_symlink_node my_node = {.qp_num = qp_num};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &task_node->qp_pause_symlink_tree, p_parent, p_insert,
++						SEARCH_EXACTLY, qp_symlink_compare);
++	
++	return node? container_of(node, struct qp_symlink_node, node): NULL;
++}
++
++static int register_qp_symlink(struct proc_dir_entry *dir_parent, u32 vqpn, u32 qp_num) {
++	struct proc_task_node *task_node;
++	struct qp_symlink_node *symlink_node;
++	struct rb_node *parent, **insert;
++
++	write_lock(&proc_task_tree.rwlock);
++	task_node = search(current, NULL, NULL);
++	if(!task_node) {
++		write_unlock(&proc_task_tree.rwlock);
++		return -ENOENT;
++	}
++
++	write_lock(&task_node->qp_pause_symlink_tree.rwlock);
++	symlink_node = search_qp_symlink(qp_num, task_node, &parent, &insert);
++	if(symlink_node) {
++		write_unlock(&task_node->qp_pause_symlink_tree.rwlock);
++		write_unlock(&proc_task_tree.rwlock);
++		return -EEXIST;
++	}
++
++	symlink_node = kzalloc(sizeof(*symlink_node), GFP_KERNEL);
++	if(!symlink_node) {
++		write_unlock(&task_node->qp_pause_symlink_tree.rwlock);
++		write_unlock(&proc_task_tree.rwlock);
++		return -ENOMEM;
++	}
++
++	symlink_node->vqpn = vqpn;
++	symlink_node->qp_num = qp_num;
++	symlink_node->parent = dir_parent;
++	rbtree_add_node(&symlink_node->node, parent, insert,
++				&task_node->qp_pause_symlink_tree);
++
++	write_unlock(&task_node->qp_pause_symlink_tree.rwlock);
++	write_unlock(&proc_task_tree.rwlock);
++
++	return 0;
++}
++
++void unregister_qp_symlink(u32 qp_num) {
++	struct proc_task_node *task_node;
++	struct qp_symlink_node *symlink_node;
++
++	write_lock(&proc_task_tree.rwlock);
++	task_node = search(current, NULL, NULL);
++	if(!task_node) {
++		write_unlock(&proc_task_tree.rwlock);
++		return;
++	}
++
++	write_lock(&task_node->qp_pause_symlink_tree.rwlock);
++	symlink_node = search_qp_symlink(qp_num, task_node, NULL, NULL);
++	if(symlink_node) {
++		write_unlock(&task_node->qp_pause_symlink_tree.rwlock);
++		write_unlock(&proc_task_tree.rwlock);
++		return;
++	}
++
++	rbtree_rm_node(&symlink_node->node, &task_node->qp_pause_symlink_tree);
++	write_unlock(&task_node->qp_pause_symlink_tree.rwlock);
++	write_unlock(&proc_task_tree.rwlock);
++}
++
++static int __register_framework_process_channel(struct proc_task_node *task_node, struct proc_dir_entry *parent,
++										struct proc_dir_entry *uwrite_parent);
++static int __register_framework_partner_buf(struct proc_task_node *task_node, struct proc_dir_entry *parent,
++										struct proc_dir_entry *uwrite_parent);
++
++#define register_footprint_info_seq(res_type, res, info_name, print_what)					\
++static void *seq_##res##_##info_name##_start(struct seq_file *m, loff_t *pos) {				\
++	if(*pos == 0)																			\
++		return m;																			\
++	return NULL;																			\
++}																							\
++																							\
++static void *seq_##res##_##info_name##_next(struct seq_file *m, void *v, loff_t *pos) {		\
++	++(*pos);																				\
++	return NULL;																			\
++}																							\
++																							\
++static void seq_##res##_##info_name##_stop(struct seq_file *m, void *v) {					\
++	return;																			\
++}																							\
++																							\
++static int seq_##res##_##info_name##_show(struct seq_file *m, void *v) {					\
++	res_type *res = m->private;																\
++	seq_printf(m, "%s", print_what);														\
++	return 0;																				\
++}																							\
++																							\
++static struct seq_operations seq_##res##_##info_name##_info_ops = {							\
++	.start								= seq_##res##_##info_name##_start,					\
++	.next								= seq_##res##_##info_name##_next,					\
++	.stop								= seq_##res##_##info_name##_stop,					\
++	.show								= seq_##res##_##info_name##_show,					\
++};																							\
++																							\
++static int res##_##info_name##_info_open(struct inode *inode, struct file *filep) {			\
++	struct seq_file *sf;																	\
++	int err;																				\
++																							\
++	err = seq_open(filep, &seq_##res##_##info_name##_info_ops);								\
++	if(err)																					\
++		return err;																			\
++																							\
++	sf = filep->private_data;																\
++	sf->private = PDE_DATA(inode);															\
++	return 0;																				\
++}																							\
++																							\
++static struct proc_ops res##_##info_name##_info_ops = {										\
++	.proc_open					= res##_##info_name##_info_open,							\
++	.proc_read					= seq_read,													\
++	.proc_lseek					= seq_lseek,												\
++	.proc_release				= seq_release,												\
++};																							\
++																							\
++static inline int __register_##res##_##info_name##_to_footprint(res_type *res,				\
++								struct proc_dir_entry *parent) {							\
++	struct proc_dir_entry *proc_ent;														\
++	proc_ent = proc_create_data(#info_name, FP_ACCESS_MODE, parent,							\
++					&res##_##info_name##_info_ops, res);									\
++	if(!proc_ent)																			\
++		return -ENOENT;																		\
++																							\
++	return 0;																				\
++}
++
++#define register_footprint_info_raw(res_type, res, info_name, print_addr, print_size)		\
++static ssize_t res##_##info_name##_info_read(struct file *filep, char __user *buf,			\
++						size_t size, loff_t *loff) {										\
++	res_type *res = filep->private_data;													\
++																							\
++	if(size != print_size)																	\
++		return -EINVAL;																		\
++																							\
++	return copy_to_user(buf, print_addr, print_size)? : size;								\
++}																							\
++																							\
++static int res##_##info_name##_info_open(struct inode *inode, struct file *filep) {			\
++	filep->private_data = PDE_DATA(inode);													\
++	return 0;																				\
++}																							\
++																							\
++static struct proc_ops res##_##info_name##_info_ops = {										\
++	.proc_open					= res##_##info_name##_info_open,							\
++	.proc_read					= res##_##info_name##_info_read,							\
++};																							\
++																							\
++static inline int __register_##res##_##info_name##_to_footprint(res_type *res,				\
++								struct proc_dir_entry *parent) {							\
++	struct proc_dir_entry *proc_ent;														\
++	proc_ent = proc_create_data(#info_name, FP_ACCESS_MODE, parent,							\
++					&res##_##info_name##_info_ops, res);									\
++	if(!proc_ent)																			\
++		return -ENOENT;																		\
++																							\
++	return 0;																				\
++}
++
++register_footprint_info_raw(struct proc_task_node, task_node, user_pid,
++					&task_node->user_pid, sizeof(pid_t));
++
++static struct proc_task_node *register_pid_entry(struct ib_device *ibdev,
++						struct task_struct *task) {
++	struct proc_task_node *task_node;
++	struct rb_node *parent, **insert;
++	char dirname[128];
++
++	write_lock(&proc_task_tree.rwlock);
++	task_node = search(task, &parent, &insert);
++	if(!task_node) {
++		task_node = kzalloc(sizeof(*task_node), GFP_KERNEL);
++		if(!task_node) {
++			write_unlock(&proc_task_tree.rwlock);
++			return ERR_PTR(-ENOMEM);
++		}
++
++		task_node->user_pid = task_tgid_nr_ns(current,
++							current->nsproxy->pid_ns_for_children);
++
++		task_node->task = task;
++		sprintf(dirname, "%d", task->tgid);
++		task_node->task_dir_ent = proc_mkdir_mode(dirname,
++							FP_ACCESS_MODE, procfs_dir_ent);
++		if(!task_node->task_dir_ent) {
++			write_unlock(&proc_task_tree.rwlock);
++			kfree(task_node);
++			return ERR_PTR(-ENODEV);
++		}
++
++		if(__register_task_node_user_pid_to_footprint(task_node, task_node->task_dir_ent)) {
++			write_unlock(&proc_task_tree.rwlock);
++			proc_remove(task_node->task_dir_ent);
++			kfree(task_node);
++			return ERR_PTR(-ENOENT);
++		}
++
++		task_node->task_dir_uwrite_ent = proc_mkdir_mode(dirname,
++							FP_UWRITE_MODE, procfs_dir_uwrite_ent);
++		if(!task_node->task_dir_uwrite_ent) {
++			write_unlock(&proc_task_tree.rwlock);
++			proc_remove(task_node->task_dir_ent);
++			kfree(task_node);
++			return ERR_PTR(-ENODEV);
++		}
++
++		if(__register_framework_process_channel(task_node, task_node->task_dir_ent,
++								task_node->task_dir_uwrite_ent)) {
++			write_unlock(&proc_task_tree.rwlock);
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			kfree(task_node);
++			return ERR_PTR(-ENOENT);
++		}
++
++		if(__register_framework_partner_buf(task_node, task_node->task_dir_ent,
++								task_node->task_dir_uwrite_ent)) {
++			write_unlock(&proc_task_tree.rwlock);
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			kfree(task_node);
++			return ERR_PTR(-ENOENT);
++		}
++
++		task_node->refcnt = 0;
++		rbtree_add_node(&task_node->node, parent, insert, &proc_task_tree);
++
++		task_node->qp_pause_symlink_tree.tree = RB_ROOT;
++		task_node->qp_pause_symlink_tree.rwlock =
++					__RW_LOCK_UNLOCKED(task_node->qp_pause_symlink_tree.rwlock);
++	}
++
++	task_node->refcnt++;
++
++	write_unlock(&proc_task_tree.rwlock);
++	return task_node;
++}
++
++static inline int uwrite_footprint_fn(struct ib_qp *qp) {
++	struct proc_dir_entry *uwrite_proc_ent;
++	char symlink_name[128];
++	char symlink_dest[128];
++
++	sprintf(symlink_name, "qpn_%d_%d_%d", current->tgid, qp->vqpn, qp->qp_num);
++	sprintf(symlink_dest, "/proc/rdma_uwrite/%d/%d/qp_%d/", current->tgid,
++						qp->cmd_fd, qp->vhandle);
++
++	uwrite_proc_ent = proc_symlink(symlink_name, qp->device->proc_ent, symlink_dest);
++	if(!uwrite_proc_ent)
++		return -ENOENT;
++
++	return register_qp_symlink(qp->device->proc_ent, qp->vqpn, qp->qp_num);
++}
++
++#define register_uwrite_footprint(res_type, res, info_name, can_write, uwrite_fn)			\
++static int res##_##info_name##_uwrite_and_kern_open(struct inode *inode,					\
++										struct file *filep) {								\
++	filep->private_data = PDE_DATA(inode);													\
++	return 0;																				\
++}																							\
++static ssize_t res##_##info_name##_uwrite_and_kern_read(struct file *filep,					\
++					char __user *buf, size_t size, loff_t *loff) {							\
++	res_type *res = filep->private_data;													\
++	int err;																				\
++																							\
++	if(can_write) {																			\
++		wait_event_interruptible((res)->info_name##_wait_queue,								\
++							!(res)->info_name##_wait_flag);									\
++																							\
++		if((res)->info_name##_wait_flag)													\
++			return -EPIPE;																	\
++	}																						\
++																							\
++	err = copy_to_user(buf, &res->info_name, size);											\
++	return err? err: size;																	\
++}																							\
++																							\
++static int res##_##info_name##_uwrite_and_kern_release(struct inode *inode,					\
++								struct file *filep) {										\
++	res_type *res = filep->private_data;													\
++	if(can_write)																			\
++		wake_up_interruptible(&(res)->info_name##_wait_queue);								\
++	return 0;																				\
++}																							\
++																							\
++static ssize_t res##_##info_name##_uwrite_write(struct file *filep,							\
++					const char __user *buf, size_t size, loff_t *loff) {					\
++	res_type *res = filep->private_data;													\
++	int (*__uwrite_fn)(res_type *res);														\
++	int err;																				\
++																							\
++	__uwrite_fn = uwrite_fn;																\
++	if(size != sizeof(res->info_name))														\
++		return -EINVAL;																		\
++																							\
++	err = copy_from_user(&res->info_name, buf, size);										\
++	if(can_write) {																			\
++		(res)->info_name##_wait_flag = 0;													\
++		wake_up_interruptible(&(res)->info_name##_wait_queue);								\
++	}																						\
++																							\
++	if(!err && __uwrite_fn)																	\
++		err = __uwrite_fn(res);																\
++	return err? err: size;																	\
++}																							\
++																							\
++static struct proc_ops res##_##info_name##_uwrite_info_ops = {								\
++	.proc_open				= res##_##info_name##_uwrite_and_kern_open,						\
++	.proc_write				= (can_write)? res##_##info_name##_uwrite_write: NULL,			\
++	.proc_read				= res##_##info_name##_uwrite_and_kern_read,						\
++	.proc_release			= res##_##info_name##_uwrite_and_kern_release,					\
++};																							\
++																							\
++static struct proc_ops res##_##info_name##_kern_info_ops = {								\
++	.proc_open				= res##_##info_name##_uwrite_and_kern_open,						\
++	.proc_read				= res##_##info_name##_uwrite_and_kern_read,						\
++	.proc_write				= res##_##info_name##_uwrite_write,								\
++	.proc_release			= res##_##info_name##_uwrite_and_kern_release,					\
++};																							\
++																							\
++static int __register_##res##_##info_name##_to_uwrite_footprint(res_type *res,				\
++			struct proc_dir_entry *parent, struct proc_dir_entry *uwrite_parent) {			\
++	struct proc_dir_entry *uwrite_proc_ent;													\
++	struct proc_dir_entry *proc_ent;														\
++																							\
++	init_waitqueue_head(&(res)->info_name##_wait_queue);									\
++	(res)->info_name##_wait_flag = 1;														\
++																							\
++	uwrite_proc_ent = proc_create_data(#info_name, (can_write)?								\
++						(S_IRUGO | S_IWUGO | S_IXUGO): 00444,								\
++					uwrite_parent, &res##_##info_name##_uwrite_info_ops, res);				\
++	if(!uwrite_proc_ent)																	\
++		return -ENOENT;																		\
++																							\
++	proc_ent = proc_create_data(#info_name, FP_ACCESS_MODE, parent,							\
++					&res##_##info_name##_kern_info_ops, res);								\
++	if(!proc_ent) {																			\
++		proc_remove(uwrite_proc_ent);														\
++		return -ENOENT;																		\
++	}																						\
++																							\
++	return 0;																				\
++}
++
++register_uwrite_footprint(struct ib_uverbs_file, ufile, ctx_resp, false, NULL);
++register_uwrite_footprint(struct ib_uverbs_file, ufile, ctx_uaddr, true, NULL);
++register_uwrite_footprint(struct ib_uverbs_file, ufile, nc_uar, true, NULL);
++
++inline int install_ctx_resp(struct ib_uverbs_file *ufile,
++				char __user *buf, size_t size) {
++	return copy_from_user(&ufile->ctx_resp, buf, size)? :
++					__register_ufile_ctx_resp_to_uwrite_footprint(ufile,
++					ufile->ufile_proc_ent, ufile->ufile_proc_uwrite_ent);
++}
++
++static int qp_pause_signal_open(struct inode *inode, struct file *filep) {
++	filep->private_data = PDE_DATA(inode);
++	return 0;
++}
++
++static ssize_t qp_pause_signal_read(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct ib_qp *qp = filep->private_data;
++
++	if(size)
++		return -EINVAL;
++	
++	wait_event_interruptible(qp->signal_pause_wait_queue, qp->signal_pause_wait_flag);
++
++	return 0;
++}
++
++static ssize_t qp_pause_signal_write(struct file *filep, const char __user *buf, size_t size, loff_t *loff) {
++	struct ib_qp *qp = filep->private_data;
++	char kbuf[1024];
++	int err;
++
++	err = kstrtoint_from_user(buf, size, 10, &qp->signal_pause_wait_flag);
++	if(err)
++		return err;
++
++	if(qp->signal_pause_wait_flag) {
++		qp->signal_pause_wait_flag = 1;
++		wake_up_interruptible(&qp->signal_pause_wait_queue);
++	}
++
++	return size;
++}
++
++static int qp_pause_signal_release(struct inode *inode, struct file *filep) {
++	struct ib_qp *qp = filep->private_data;
++	wake_up_interruptible(&qp->signal_pause_wait_queue);
++	return 0;
++}
++
++static struct proc_ops qp_pause_signal_ops = {
++	.proc_open					= qp_pause_signal_open,
++	.proc_read					= qp_pause_signal_read,
++	.proc_write					= qp_pause_signal_write,
++	.proc_release				= qp_pause_signal_release,
++};
++
++static int __register_qp_pause_signal(struct ib_qp *qp, struct proc_dir_entry *uwrite_parent) {
++	struct proc_dir_entry *uwrite_proc_ent;
++
++	init_waitqueue_head(&qp->signal_pause_wait_queue);
++	qp->signal_pause_wait_flag = 1;
++
++	uwrite_proc_ent = proc_create_data("pause_signal", 00644, uwrite_parent, &qp_pause_signal_ops, qp);
++	if(!uwrite_proc_ent)
++		return -ENOENT;
++
++	return 0;
++}
++
++static int proc_frm_fifo_open(struct inode *inode, struct file *filep) {
++	filep->private_data = PDE_DATA(inode);
++	return 0;
++}
++
++static ssize_t to_proc_write(struct file *filep, const char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++
++	if(size != sizeof(task_node->frm_to_proc))
++		return -EINVAL;
++	
++	wait_event_interruptible(task_node->frm_to_proc_wait_queue,
++					task_node->frm_to_proc == -1 &&
++					((err = copy_from_user(&task_node->frm_to_proc, buf, size)) || true));
++
++	if(err)
++		return err;
++
++	task_node->frm_to_proc_wait_flag = 0;
++	wake_up_interruptible(&task_node->frm_to_proc_wait_queue);
++
++	return size;
++}
++
++static ssize_t to_frm_write(struct file *filep, const char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++
++	if(size != sizeof(task_node->proc_to_frm))
++		return -EINVAL;
++	
++	wait_event_interruptible(task_node->proc_to_frm_wait_queue,
++						task_node->proc_to_frm == -1 &&
++						((err = copy_from_user(&task_node->proc_to_frm, buf, size)) || true));
++
++	if(err) {
++		return err;
++	}
++
++	task_node->proc_to_frm_wait_flag = 0;
++	wake_up_interruptible(&task_node->proc_to_frm_wait_queue);
++
++	return size;
++}
++
++static ssize_t from_proc_read(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++
++	if(size != sizeof(task_node->proc_to_frm))
++		return -EINVAL;
++	
++	wait_event_interruptible(task_node->proc_to_frm_wait_queue,
++				(!task_node->proc_to_frm_wait_flag) && (task_node->proc_to_frm_wait_flag = 1));
++
++	if(task_node->proc_to_frm == -1)
++		return -EPIPE;
++	
++	err = copy_to_user(buf, &task_node->proc_to_frm, size);
++	if(err) {
++		return err;
++	}
++
++	task_node->proc_to_frm = -1;
++	wake_up_interruptible(&task_node->proc_to_frm_wait_queue);
++
++	return size;
++}
++
++static ssize_t from_frm_read(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++
++	if(size != sizeof(task_node->frm_to_proc))
++		return -EINVAL;
++	
++	wait_event_interruptible(task_node->frm_to_proc_wait_queue,
++				(!task_node->frm_to_proc_wait_flag) && (task_node->frm_to_proc_wait_flag = 1));
++
++	if(task_node->frm_to_proc == -1)
++		return -EPIPE;
++
++	err = copy_to_user(buf, &task_node->frm_to_proc, size);
++	if(err)
++		return err;
++	
++	task_node->frm_to_proc = -1;
++	wake_up_interruptible(&task_node->frm_to_proc_wait_queue);
++
++	return size;
++}
++
++static int to_frm_release(struct inode *inode, struct file *filep) {
++	return 0;
++}
++
++static int to_proc_release(struct inode *inode, struct file *filep) {
++	return 0;
++}
++
++static struct proc_ops to_proc_ops = {
++	.proc_open					= proc_frm_fifo_open,
++	.proc_read					= from_proc_read,
++	.proc_write					= to_proc_write,
++	.proc_release				= to_proc_release,
++};
++
++static struct proc_ops to_frm_ops = {
++	.proc_open					= proc_frm_fifo_open,
++	.proc_read					= from_frm_read,
++	.proc_write					= to_frm_write,
++	.proc_release				= to_frm_release,
++};
++
++static int __register_framework_process_channel(struct proc_task_node *task_node, struct proc_dir_entry *parent,
++										struct proc_dir_entry *uwrite_parent) {
++	struct proc_dir_entry *proc_ent = NULL;
++	struct proc_dir_entry *uwrite_proc_ent = NULL;
++
++	init_waitqueue_head(&task_node->proc_to_frm_wait_queue);
++	init_waitqueue_head(&task_node->frm_to_proc_wait_queue);
++	task_node->proc_to_frm_wait_flag = 1;
++	task_node->frm_to_proc_wait_flag = 1;
++
++	task_node->proc_to_frm = -1;
++	task_node->frm_to_proc = -1;
++
++	proc_ent = proc_create_data("to_proc", 00600, parent, &to_proc_ops, task_node);
++	uwrite_proc_ent = proc_create_data("to_frm", S_IRUGO | S_IWUGO | S_IXUGO,
++						uwrite_parent, &to_frm_ops, task_node);
++	if(!proc_ent || !uwrite_proc_ent) {
++		if(proc_ent)
++			proc_remove(proc_ent);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++static int partner_buf_open(struct inode *inode, struct file *filep) {
++	filep->private_data = PDE_DATA(inode);
++	return 0;
++}
++
++static ssize_t partner_buf_write(struct file *filep, const char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++
++	task_node->partner_buf = kzalloc(size, GFP_KERNEL);
++	if(!task_node->partner_buf)
++		return -ENOMEM;
++	
++	err = copy_from_user(task_node->partner_buf, buf, size);
++	if(err) {
++		kfree(task_node->partner_buf);
++		return err;
++	}
++
++	task_node->partner_buf_size = size;
++	return size;
++}
++
++static ssize_t partner_buf_read(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct proc_task_node *task_node = filep->private_data;
++	int err;
++	ssize_t read_size = (task_node->partner_buf_size - *loff) > size?
++					size: (task_node->partner_buf_size - *loff);
++	
++	err = copy_to_user(buf, task_node->partner_buf + *loff, read_size);
++	if(err)
++		return err;
++
++	*loff += read_size;
++	return read_size;
++}
++
++static int partner_buf_release(struct inode *inode, struct file *filep) {
++	struct proc_task_node *task_node = filep->private_data;
++
++	if(task_node->partner_buf) {
++		kfree(task_node->partner_buf);
++		task_node->partner_buf = NULL;
++		task_node->partner_buf_size = 0;
++	}
++
++	return 0;
++}
++
++static struct proc_ops partner_buf_kern_ops = {
++	.proc_open					= partner_buf_open,
++	.proc_write					= partner_buf_write,
++};
++
++static struct proc_ops partner_buf_user_ops = {
++	.proc_open					= partner_buf_open,
++	.proc_read					= partner_buf_read,
++	.proc_release				= partner_buf_release,
++};
++
++static int __register_framework_partner_buf(struct proc_task_node *task_node, struct proc_dir_entry *parent,
++										struct proc_dir_entry *uwrite_parent) {
++	struct proc_dir_entry *proc_ent = NULL;
++	struct proc_dir_entry *uwrite_proc_ent = NULL;
++	struct proc_dir_entry *proc_ent_frm = NULL;
++	struct proc_dir_entry *uwrite_proc_ent_frm = NULL;
++
++	task_node->partner_buf = NULL;
++	task_node->partner_buf_size = 0;
++
++	proc_ent = proc_create_data("partner_buf", 00600, parent, &partner_buf_kern_ops, task_node);
++	uwrite_proc_ent = proc_create_data("partner_buf", S_IRUGO | S_IWUGO | S_IXUGO,
++						uwrite_parent, &partner_buf_user_ops, task_node);
++	if(!proc_ent || !uwrite_proc_ent) {
++		if(proc_ent)
++			proc_remove(proc_ent);
++		return -ENOENT;
++	}
++
++	proc_ent_frm = proc_create_data("frm_buf", 00600, parent, &partner_buf_user_ops, task_node);
++	uwrite_proc_ent_frm = proc_create_data("frm_buf", S_IRUGO | S_IWUGO | S_IXUGO,
++						uwrite_parent, &partner_buf_kern_ops, task_node);
++	if(!proc_ent_frm || !uwrite_proc_ent_frm) {
++		proc_remove(proc_ent);
++		proc_remove(uwrite_proc_ent);
++		if(proc_ent_frm)
++			proc_remove(proc_ent_frm);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++register_footprint_info_seq(struct ib_uverbs_file, ufile, cdev,
++					dev_name(&ufile->device->dev));
++register_uwrite_footprint(struct ib_uverbs_file, ufile, gid_table, false, NULL);
++
++static int init_rdma_dev_fd_entry(struct ib_uverbs_file *ufile,
++						struct proc_dir_entry *fd_entry) {
++	return __register_ufile_cdev_to_footprint(ufile, fd_entry);
++}
++
++register_footprint_info_raw(struct ib_uverbs_file, ufile, async_fd,
++					&ufile->default_async_file->async_fd, sizeof(int));
++
++int register_async_fd(struct ib_uverbs_file *ufile, int async_fd) {
++	struct ib_uverbs_async_event_file *event_file =
++					ufile->default_async_file;
++
++	event_file->async_fd = async_fd;
++	return __register_ufile_async_fd_to_footprint(ufile, ufile->ufile_proc_ent);
++}
++
++#define def_res_footprint_func(res_type, res, parent_type, parent, init_fn, dump_fn)		\
++static int res##_ctx_open(struct inode *inode, struct file *filep) {						\
++	filep->private_data = PDE_DATA(inode);													\
++	return 0;																				\
++}																							\
++																							\
++static struct proc_ops res##_ctx_ops = {													\
++	.proc_open				= res##_ctx_open,												\
++	.proc_read				= dump_fn,														\
++};																							\
++																							\
++int register_##res##_to_footprint(res_type *res, parent_type *parent, int vhandle) {		\
++	struct proc_dir_entry *res##_ent;														\
++	struct proc_dir_entry *dump_ent;														\
++	char filename[128];																		\
++	int err;																				\
++																							\
++	if(strcmp(#res, "ufile")) {																\
++		sprintf(filename, #res "_%d", vhandle);												\
++		res##_ent = proc_mkdir_mode(filename, FP_ACCESS_MODE, parent->parent##_proc_ent);	\
++		if(!res##_ent)																		\
++			return -ENODEV;																	\
++																							\
++		res->res##_proc_ent = res##_ent;													\
++	}																						\
++																							\
++	if(res##_ctx_ops.proc_read) {															\
++		dump_ent = proc_create_data(#res "_ctx", FP_ACCESS_MODE,							\
++					res->res##_proc_ent, &res##_ctx_ops, res);								\
++		if(!dump_ent) {																		\
++			proc_remove(res##_ent);															\
++			res->res##_proc_ent = NULL;														\
++			return err;																		\
++		}																					\
++	}																						\
++																							\
++	err = init_fn(res, parent);																\
++	if(err) {																				\
++		if(res##_ctx_ops.proc_read)															\
++			proc_remove(dump_ent);															\
++		proc_remove(res##_ent);																\
++		res->res##_proc_ent = NULL;															\
++		return err;																			\
++	}																						\
++																							\
++	return 0;																				\
++}																							\
++																							\
++void deregister_##res##_from_footprint(res_type *res) {										\
++	if(!res->res##_proc_ent)																\
++		return;																				\
++																							\
++	proc_remove(res->res##_proc_ent);														\
++	res->res##_proc_ent = NULL;																\
++}
++
++#define def_res_uwrite_footprint_func(res_type, res, parent_type, parent, init_fn)			\
++int register_##res##_to_uwrite_footprint(													\
++				res_type *res, parent_type *parent, int vhandle) {							\
++	struct proc_dir_entry *res##_uwrite_ent;												\
++	char filename[128];																		\
++	int err;																				\
++																							\
++	sprintf(filename, #res "_%d", vhandle);													\
++	res##_uwrite_ent = proc_mkdir_mode(filename, FP_UWRITE_MODE,							\
++					parent->parent##_proc_uwrite_ent);										\
++	if(!res##_uwrite_ent)																	\
++		return -ENODEV;																		\
++																							\
++	res->res##_proc_uwrite_ent = res##_uwrite_ent;											\
++																							\
++	err = init_fn(res, parent);																\
++	if(err) {																				\
++		proc_remove(res##_uwrite_ent);														\
++		res->res##_proc_uwrite_ent = NULL;													\
++		return err;																			\
++	}																						\
++																							\
++	return 0;																				\
++}																							\
++																							\
++void deregister_##res##_from_uwrite_footprint(res_type *res) {								\
++	if(!res->res##_proc_uwrite_ent)															\
++		return;																				\
++																							\
++	proc_remove(res->res##_proc_uwrite_ent);												\
++	res->res##_proc_uwrite_ent = NULL;														\
++}
++
++static inline int proc_pd_init_fn(struct ib_pd *pd, struct ib_uverbs_file *ufile) {
++	return 0;
++}
++
++register_footprint_info_raw(struct ib_cq, cq, cq_size, &cq->cqe, sizeof(cq->cqe));
++register_footprint_info_raw(struct ib_cq, cq, comp_fd, &cq->comp_fd, sizeof(cq->comp_fd));
++
++static inline int proc_cq_init_fn(struct ib_cq *cq, struct ib_uverbs_file *ufile) {
++	return __register_cq_cq_size_to_footprint(cq, cq->cq_proc_ent) ||
++			__register_cq_comp_fd_to_footprint(cq, cq->cq_proc_ent);
++}
++
++static int cq_meta_uaddr_fn(struct ib_cq *cq) {
++	cq->uobject->uevent.uobject.user_handle = cq->meta_uaddr;
++	return 0;
++}
++
++register_uwrite_footprint(struct ib_cq, cq, meta_uaddr, true, cq_meta_uaddr_fn);
++register_uwrite_footprint(struct ib_cq, cq, buf_addr, true, NULL);
++register_uwrite_footprint(struct ib_cq, cq, db_addr, true, NULL);
++
++static inline int proc_uwrite_cq_init_fn(struct ib_cq *cq, struct ib_uverbs_file *ufile) {
++	return __register_cq_meta_uaddr_to_uwrite_footprint(cq, cq->cq_proc_ent,
++							cq->cq_proc_uwrite_ent) ||
++			__register_cq_buf_addr_to_uwrite_footprint(cq, cq->cq_proc_ent,
++							cq->cq_proc_uwrite_ent) ||
++			__register_cq_db_addr_to_uwrite_footprint(cq, cq->cq_proc_ent,
++							cq->cq_proc_uwrite_ent);
++}
++
++register_uwrite_footprint(struct ib_qp, qp, meta_uaddr, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, cur_qp_state, false, NULL);
++register_uwrite_footprint(struct ib_qp, qp, init_attr, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, attr_0, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, attr_1, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, attr_2, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, mask_0, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, mask_1, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, mask_2, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, send_cur_post, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, recv_head, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, recv_tail, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, bf_uar_addr, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, signal_fd, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, rc_dest_pgid, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, dest_pqpn, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, send_cq_handle, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, recv_cq_handle, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, vqpn, true, uwrite_footprint_fn);
++register_uwrite_footprint(struct ib_qp, qp, buf_addr, true, NULL);
++register_uwrite_footprint(struct ib_qp, qp, db_addr, true, NULL);
++
++static inline int proc_uwrite_qp_init_fn(struct ib_qp *qp, struct ib_uverbs_file *ufile) {
++	return __register_qp_meta_uaddr_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_cur_qp_state_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_send_cur_post_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_recv_head_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_recv_tail_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_send_cq_handle_to_uwrite_footprint(qp, qp->qp_proc_ent, qp->qp_proc_uwrite_ent) ||
++			__register_qp_recv_cq_handle_to_uwrite_footprint(qp, qp->qp_proc_ent, qp->qp_proc_uwrite_ent) ||
++			__register_qp_rc_dest_pgid_to_uwrite_footprint(qp, qp->qp_proc_ent, qp->qp_proc_uwrite_ent) ||
++			__register_qp_dest_pqpn_to_uwrite_footprint(qp, qp->qp_proc_ent, qp->qp_proc_uwrite_ent) ||
++			__register_qp_init_attr_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_attr_0_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_attr_1_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_attr_2_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_mask_0_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_mask_1_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_mask_2_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_bf_uar_addr_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_vqpn_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_pause_signal(qp, qp->qp_proc_uwrite_ent) ||
++			__register_qp_signal_fd_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_buf_addr_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent) ||
++			__register_qp_db_addr_to_uwrite_footprint(qp, qp->qp_proc_ent,
++							qp->qp_proc_uwrite_ent);
++}
++
++register_footprint_info_raw(struct ib_mr, mr, iova, &mr->iova, sizeof(u64));
++register_footprint_info_raw(struct ib_mr, mr, length, &mr->length, sizeof(u64));
++register_footprint_info_raw(struct ib_mr, mr, access_flags,
++						&mr->access_flags, sizeof(int));
++
++register_uwrite_footprint(struct ib_mr, mr, vlkey, true, NULL);
++register_uwrite_footprint(struct ib_mr, mr, vrkey, true, NULL);
++
++static inline int proc_mr_init_fn(struct ib_mr *mr, struct ib_pd *pd) {
++	return __register_mr_iova_to_footprint(mr, mr->mr_proc_ent) ||
++			__register_mr_length_to_footprint(mr, mr->mr_proc_ent) ||
++			__register_mr_access_flags_to_footprint(mr, mr->mr_proc_ent);
++}
++
++static inline int proc_uwrite_mr_init_fn(struct ib_mr *mr, struct ib_uverbs_file *ufile) {
++	return __register_mr_vlkey_to_uwrite_footprint(mr, mr->mr_proc_ent,
++								mr->mr_proc_uwrite_ent) ||
++			__register_mr_vrkey_to_uwrite_footprint(mr, mr->mr_proc_ent,
++								mr->mr_proc_uwrite_ent);
++}
++
++register_footprint_info_raw(struct ib_qp, qp, qp_state, &qp->cur_qp_state,
++					sizeof(qp->cur_qp_state));
++register_footprint_info_raw(struct ib_qp, qp, usr_idx, &qp->usr_idx,
++					sizeof(qp->usr_idx));
++register_footprint_info_raw(struct ib_qp, qp, rc_dest_gid, &qp->rc_dest_gid,
++					sizeof(qp->rc_dest_gid));
++
++static inline int proc_qp_init_fn(struct ib_qp *qp, struct ib_pd *pd) {
++	qp->cur_qp_state = IB_QPS_RESET;
++	return __register_qp_qp_state_to_footprint(qp, qp->qp_proc_ent) ||
++			__register_qp_usr_idx_to_footprint(qp, qp->qp_proc_ent) ||
++			__register_qp_rc_dest_gid_to_footprint(qp, qp->qp_proc_ent);
++}
++
++static ssize_t dump_qp_fn(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct char_64 {
++		__aligned_u64						m[8];
++	};
++	struct char_144 {
++		uint32_t							m[36];
++	};
++	struct ibv_resume_qp_param {
++		int									pd_vhandle;
++		int									qp_vhandle;
++		int									send_cq_vhandle;
++		int									recv_cq_vhandle;
++		enum ib_qp_state					qp_state;
++		struct char_64						init_attr;
++		struct char_144						modify_qp_attr[3];
++		int									modify_qp_mask[3];
++		__aligned_u64						meta_uaddr;
++		uint32_t							vqpn;
++		__aligned_u64						buf_addr;
++		__aligned_u64						db_addr;
++		uint32_t							send_cur_post;
++		uint32_t							recv_head;
++		uint32_t							recv_tail;
++		int32_t								usr_idx;
++	} param;
++	struct ib_qp *qp = filep->private_data;
++
++	if(size != sizeof(param)) {
++		return -EINVAL;
++	}
++
++	param.qp_state					= qp->cur_qp_state;
++	memcpy(&param.init_attr, &qp->init_attr, sizeof(param.init_attr));
++	memcpy(&param.modify_qp_attr[0], &qp->attr_0, sizeof(char_144));
++	memcpy(&param.modify_qp_attr[1], &qp->attr_1, sizeof(char_144));
++	memcpy(&param.modify_qp_attr[2], &qp->attr_2, sizeof(char_144));
++	param.modify_qp_mask[0]			= qp->mask_0;
++	param.modify_qp_mask[1]			= qp->mask_1;
++	param.modify_qp_mask[2]			= qp->mask_2;
++	param.meta_uaddr				= qp->meta_uaddr;
++	param.vqpn						= qp->vqpn;
++	param.buf_addr					= qp->buf_addr;
++	param.db_addr					= qp->db_addr;
++	param.usr_idx					= qp->usr_idx;
++
++	return copy_to_user(buf, &param, size)? : size;
++}
++
++register_uwrite_footprint(struct ib_srq, srq, meta_uaddr, true, NULL);
++register_uwrite_footprint(struct ib_srq, srq, buf_addr, true, NULL);
++register_uwrite_footprint(struct ib_srq, srq, db_addr, true, NULL);
++register_uwrite_footprint(struct ib_srq, srq, srq_init_attr, true, NULL);
++
++static inline int proc_srq_init_fn(struct ib_srq *srq, struct ib_pd *pd) {
++	return 0;
++}
++
++static inline int proc_uwrite_srq_init_fn(struct ib_srq *srq, struct ib_uverbs_file *ufile) {
++	return __register_srq_meta_uaddr_to_uwrite_footprint(srq, srq->srq_proc_ent,
++										srq->srq_proc_uwrite_ent) ||
++			__register_srq_buf_addr_to_uwrite_footprint(srq, srq->srq_proc_ent,
++										srq->srq_proc_uwrite_ent) ||
++			__register_srq_db_addr_to_uwrite_footprint(srq, srq->srq_proc_ent,
++										srq->srq_proc_uwrite_ent) ||
++			__register_srq_srq_init_attr_to_uwrite_footprint(srq, srq->srq_proc_ent,
++										srq->srq_proc_uwrite_ent);
++}
++
++static ssize_t dump_srq_fn(struct file *filep, char __user *buf, size_t size, loff_t *loff) {
++	struct char_24 {
++		uint64_t					m[3];
++	};
++	struct ibv_resume_srq_param {
++		char_24					srq_init_attr;
++		__aligned_u64			meta_uaddr;
++		__aligned_u64			buf_addr;
++		__aligned_u64			db_addr;
++		int				pd_vhandle;
++		int				vhandle;
++	} param;
++	struct ib_srq *srq = filep->private_data;
++
++	if(size != sizeof(param))
++		return -EINVAL;
++
++	memcpy(&param.srq_init_attr, &srq->srq_init_attr, sizeof(srq->srq_init_attr));
++	param.meta_uaddr	= srq->meta_uaddr;
++	param.buf_addr		= srq->buf_addr;
++	param.db_addr		= srq->db_addr;
++
++	return copy_to_user(buf, &param, size)? : size;
++}
++
++static inline int proc_comp_channel_init_fn(struct ib_uverbs_completion_event_file *uverbs_completion_event_file,
++							struct ib_uverbs_file *ufile) {
++	return 0;
++}
++
++def_res_footprint_func(struct ib_pd, pd, struct ib_uverbs_file, ufile, proc_pd_init_fn, NULL);
++def_res_footprint_func(struct ib_cq, cq, struct ib_uverbs_file, ufile, proc_cq_init_fn, NULL);
++def_res_footprint_func(struct ib_mr, mr, struct ib_pd, pd, proc_mr_init_fn, NULL);
++def_res_footprint_func(struct ib_qp, qp, struct ib_pd, pd, proc_qp_init_fn, dump_qp_fn);
++def_res_footprint_func(struct ib_srq, srq, struct ib_pd, pd, proc_srq_init_fn, dump_srq_fn);
++def_res_footprint_func(struct ib_uverbs_completion_event_file, uverbs_completion_event_file,
++							struct ib_uverbs_file, ufile, proc_comp_channel_init_fn, NULL);
++def_res_uwrite_footprint_func(struct ib_cq, cq, struct ib_uverbs_file, ufile, proc_uwrite_cq_init_fn);
++def_res_uwrite_footprint_func(struct ib_qp, qp, struct ib_uverbs_file, ufile, proc_uwrite_qp_init_fn);
++def_res_uwrite_footprint_func(struct ib_mr, mr, struct ib_uverbs_file, ufile, proc_uwrite_mr_init_fn);
++def_res_uwrite_footprint_func(struct ib_srq, srq, struct ib_uverbs_file, ufile, proc_uwrite_srq_init_fn);
++
++int register_rdma_dev_fd_entry(int cmd_fd,
++						struct ib_uverbs_file *ufile) {
++	struct proc_task_node *task_node;
++	struct proc_dir_entry *fd_entry;
++	struct proc_dir_entry *fd_uwrite_entry;
++	struct ib_uverbs_gid_entry entries[256];
++	ssize_t size;
++	char dirname[128];
++	int err, i;
++
++	task_node = register_pid_entry(ufile->ucontext->device, current);
++	if(IS_ERR(task_node))
++		return PTR_ERR(task_node);
++
++	sprintf(dirname, "%d", cmd_fd);
++	fd_entry = proc_mkdir_mode(dirname, FP_ACCESS_MODE, task_node->task_dir_ent);
++	if(!fd_entry)
++		return -ENODEV;
++	
++	fd_uwrite_entry = proc_mkdir_mode(dirname, FP_UWRITE_MODE, task_node->task_dir_uwrite_ent);
++	if(!fd_uwrite_entry) {
++		proc_remove(fd_entry);
++		return -ENODEV;
++	}
++	
++	err = init_rdma_dev_fd_entry(ufile, fd_entry);
++	if(err) {
++		proc_remove(fd_uwrite_entry);
++		proc_remove(fd_entry);
++		write_lock(&proc_task_tree.rwlock);
++		task_node->refcnt--;
++		if(!task_node->refcnt) {
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			rbtree_rm_node(&task_node->node, &proc_task_tree);
++			kfree(task_node);
++		}
++		write_unlock(&proc_task_tree.rwlock);
++		return err;
++	}
++	
++	ufile->ufile_proc_ent = fd_entry;
++	ufile->ufile_proc_uwrite_ent = fd_uwrite_entry;
++	ufile->task_node = task_node;
++
++	size = rdma_query_gid_table(ufile->ucontext->device, entries, 256);
++	if(size < 0) {
++		proc_remove(fd_uwrite_entry);
++		proc_remove(fd_entry);
++		write_lock(&proc_task_tree.rwlock);
++		task_node->refcnt--;
++		if(!task_node->refcnt) {
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			rbtree_rm_node(&task_node->node, &proc_task_tree);
++			kfree(task_node);
++		}
++		write_unlock(&proc_task_tree.rwlock);
++		return size;
++	}
++
++	memset(ufile->gid_table, 0, sizeof(ufile->gid_table));
++	for(i = 0; i < size; i++) {
++		memcpy(&ufile->gid_table[i].gid, &entries[i].gid, sizeof(entries[i].gid));
++		ufile->gid_table[i].gid_index = entries[i].gid_index;
++		ufile->gid_table[i].gid_type = entries[i].gid_type;
++	}
++
++	err = __register_ufile_gid_table_to_uwrite_footprint(ufile,
++					ufile->ufile_proc_ent, ufile->ufile_proc_uwrite_ent) ||
++			__register_ufile_ctx_uaddr_to_uwrite_footprint(ufile,
++					ufile->ufile_proc_ent, ufile->ufile_proc_uwrite_ent) ||
++			__register_ufile_nc_uar_to_uwrite_footprint(ufile,
++					ufile->ufile_proc_ent, ufile->ufile_proc_uwrite_ent);
++	if(err) {
++		proc_remove(fd_uwrite_entry);
++		proc_remove(fd_entry);
++		write_lock(&proc_task_tree.rwlock);
++		task_node->refcnt--;
++		if(!task_node->refcnt) {
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			rbtree_rm_node(&task_node->node, &proc_task_tree);
++			kfree(task_node);
++		}
++		write_unlock(&proc_task_tree.rwlock);
++		return err;
++	}
++
++	err = register_new_ufile_mapping(ufile);
++	if(err) {
++		proc_remove(fd_uwrite_entry);
++		proc_remove(fd_entry);
++		write_lock(&proc_task_tree.rwlock);
++		task_node->refcnt--;
++		if(!task_node->refcnt) {
++			proc_remove(task_node->task_dir_uwrite_ent);
++			proc_remove(task_node->task_dir_ent);
++			rbtree_rm_node(&task_node->node, &proc_task_tree);
++			kfree(task_node);
++		}
++		write_unlock(&proc_task_tree.rwlock);
++		return err;
++	}
++
++	INIT_LIST_HEAD(&ufile->remote_rkey_trans_list);
++	ufile->trans_list_lock = __RW_LOCK_UNLOCKED(ufile->trans_list_lock);
++	ufile->cmd_fd = cmd_fd;
++
++	return 0;
++}
++
++void deregister_rdma_dev_fd_entry(struct ib_uverbs_file *ufile) {
++	struct proc_task_node *task_node;
++
++	if(!ufile->ufile_proc_ent || !ufile->task_node)
++		return;
++
++	deregister_new_ufile_mapping(ufile);
++
++	proc_remove(ufile->ufile_proc_uwrite_ent);
++	proc_remove(ufile->ufile_proc_ent);
++	ufile->ufile_proc_uwrite_ent = NULL;
++	ufile->ufile_proc_ent = NULL;
++
++	task_node = ufile->task_node;
++	ufile->task_node = NULL;
++	write_lock(&proc_task_tree.rwlock);
++	task_node->refcnt--;
++	if(!task_node->refcnt) {
++		clean_rbtree(&task_node->qp_pause_symlink_tree,
++						free_qp_symlink_node);
++		proc_remove(task_node->task_dir_uwrite_ent);
++		proc_remove(task_node->task_dir_ent);
++		rbtree_rm_node(&task_node->node, &proc_task_tree);
++		kfree(task_node);
++	}
++	write_unlock(&proc_task_tree.rwlock);
++}
++
++static inline struct proc_dir_entry *rdma_footprint_mkdir_data(const char *name,
++									umode_t mode, void *data) {
++	return proc_mkdir_data(name, mode, procfs_dir_ent, data);
++}
++
++static int proc_mmap_ops_open(struct inode *inode, struct file *filep) {
++	filep->private_data = PDE_DATA(inode);
++	return 0;
++}
++
++static int proc_mmap_ops_mmap(struct file *filep, struct vm_area_struct *vma) {
++	struct ib_device *ibdev = filep->private_data;
++	return remap_vmalloc_range(vma, ibdev->qpn_dict, 0);
++}
++
++static struct proc_ops proc_mmap_ops = {
++	.proc_open				= proc_mmap_ops_open,
++	.proc_mmap				= proc_mmap_ops_mmap,
++};
++
++int mkdir_ibdev_sig_link(struct ib_device *ibdev) {
++	struct proc_dir_entry *ibdev_proc_ent;
++	struct proc_dir_entry *ibdev_uwrite_proc_ent;
++	struct proc_dir_entry *proc_mmap;
++
++	ibdev_proc_ent = rdma_footprint_mkdir_data(ibdev->name, 00400, ibdev);
++	if(!ibdev_proc_ent) {
++		err_info("Failed to create proc_dir for ibdev\n");
++		return -ENOENT;
++	}
++
++	ibdev_uwrite_proc_ent = proc_mkdir_data(ibdev->name, S_IRUGO | S_IWUGO | S_IXUGO,
++						procfs_dir_uwrite_ent, ibdev);
++	if(!ibdev_uwrite_proc_ent) {
++		err_info("Failed to create proc_dir for ibdev\n");
++		proc_remove(ibdev_proc_ent);
++		return -ENOENT;
++	}
++
++	ibdev->qpn_dict = vmalloc_user(4096 * 4096 * sizeof(uint32_t));
++	if(!ibdev->qpn_dict) {
++		err_info("No enough memory for qpn_dict\n");
++		proc_remove(ibdev_proc_ent);
++		proc_remove(ibdev_uwrite_proc_ent);
++		return -ENOMEM;
++	}
++
++	proc_mmap = proc_create_data("qpn_dict", S_IRUGO,
++					ibdev_uwrite_proc_ent, &proc_mmap_ops, ibdev);
++	if(!proc_mmap) {
++		err_info("Failed to create proc_mmap\n");
++		proc_remove(ibdev_proc_ent);
++		proc_remove(ibdev_uwrite_proc_ent);
++		vfree(ibdev->qpn_dict);
++		return -ENOENT;
++	}
++
++	ibdev->proc_ent = ibdev_proc_ent;
++	ibdev->uwrite_proc_ent = ibdev_uwrite_proc_ent;
++	return 0;
++}
++
++inline void rmdir_ibdev_sig_link(struct ib_device *ibdev) {
++	if(ibdev->proc_ent)
++		proc_remove(ibdev->proc_ent);
++	ibdev->proc_ent = NULL;
++
++	if(ibdev->uwrite_proc_ent)
++		proc_remove(ibdev->uwrite_proc_ent);
++	ibdev->uwrite_proc_ent = NULL;
++
++	if(ibdev->qpn_dict)
++		vfree(ibdev->qpn_dict);
++	ibdev->qpn_dict = NULL;
++}
++
++int rdma_footprint_init(void) {
++	int err;
++
++	procfs_dir_ent = proc_mkdir_mode("rdma", 00400, NULL);
++	if(!procfs_dir_ent) {
++		err_info("Failed to create rdma directory in procfs\n");
++		return -ENOENT;
++	}
++
++	procfs_dir_uwrite_ent = proc_mkdir_mode("rdma_uwrite", FP_UWRITE_MODE, NULL);
++	if(!procfs_dir_uwrite_ent) {
++		proc_remove(procfs_dir_ent);
++		err_info("Failed to create rdma_uwrite directory in procfs\n");
++		return -ENOENT;
++	}
++
++	err = init_rkey_translate_service();
++	if(err) {
++		proc_remove(procfs_dir_uwrite_ent);
++		proc_remove(procfs_dir_ent);
++		err_info("Failed to init_rkey_translate_service\n");
++		return err;
++	}
++
++	return 0;
++}
++
++void rdma_footprint_exit(void) {
++	exit_rkey_translate_service();
++	proc_remove(procfs_dir_uwrite_ent);
++	proc_remove(procfs_dir_ent);
++}
+diff --git a/drivers/infiniband/core/rdma_footprint.h b/drivers/infiniband/core/rdma_footprint.h
+new file mode 100644
+index 0000000..d588c76
+--- /dev/null
++++ b/drivers/infiniband/core/rdma_footprint.h
+@@ -0,0 +1,124 @@
++#ifndef __RDMA_FOOTPRINT_H__
++#define __RDMA_FOOTPRINT_H__
++
++#include <rdma/ib_verbs.h>
++#include <rdma/ib_cache.h>
++#include <linux/proc_fs.h>
++
++#define dbg_info(fmt, args...)												\
++	printk(KERN_NOTICE "In %s(%d): " fmt, __FILE__, __LINE__, ##args)
++
++#define err_info(fmt, args...)												\
++	printk(KERN_ERR, "Err at %s(%d): " fmt, __FILE__, __LINE__, ##args)
++
++#define CHECK(cond) ({														\
++	int ___r = !!(cond);													\
++	dbg_info("CHECK (%s)? %s\n", #cond, ___r? "true": "false");				\
++	___r;																	\
++})
++
++#define PRINT(var, fmt) ({													\
++	typeof(var) ___r = (var);												\
++	dbg_info("PRINT (%s): " fmt "\n", #var, ___r);							\
++	___r;																	\
++})
++
++struct proc_task_node;
++
++struct footprint_gid_entry {
++	__aligned_u64					gid[2];
++	__u32							gid_index;
++	__u32							gid_type;
++};
++
++#include "uverbs.h"
++
++#define declare_res_footprint_func(res_type, res, parent_type, parent)		\
++extern int register_##res##_to_footprint(res_type *res,						\
++				parent_type *parent, int vhandle);							\
++extern void deregister_##res##_from_footprint(res_type *res)
++
++#define declare_res_uwrite_footprint_func(res_type, res, parent_type, parent)			\
++extern int register_##res##_to_uwrite_footprint(res_type *res,							\
++				parent_type *parent, int vhandle);										\
++extern void deregister_##res##_from_uwrite_footprint(res_type *res)
++
++#define declare_handle_mapping_func(res_type, res)										\
++extern int register_##res##_handle_mapping(struct ib_uverbs_file *ufile,				\
++			res_type *res, int vhandle, int handle);									\
++extern void unregister_##res##_handle_mapping(struct ib_uverbs_file *ufile,				\
++									res_type *res);										\
++extern int get_##res##_handle(struct ib_uverbs_file *ufile, int vhandle, int *handle)
++
++#define declare_user_mmap(map_field, key_type, value_type)								\
++extern int add_##map_field##_mapping(struct ib_uverbs_file *ufile,						\
++										key_type key, value_type value);				\
++extern int update_##map_field##_mapping(struct ib_uverbs_file *ufile,					\
++										key_type key, value_type value);				\
++extern void del_##map_field##_mapping(struct ib_uverbs_file *ufile, key_type key)
++
++extern int rdma_footprint_init(void);
++extern void rdma_footprint_exit(void);
++extern int init_rkey_translate_service(void);
++extern void exit_rkey_translate_service(void);
++extern int register_rdma_dev_fd_entry(int cmd_fd,
++			struct ib_uverbs_file *ufile);
++extern void deregister_rdma_dev_fd_entry(struct ib_uverbs_file *ufile);
++extern int register_async_fd(struct ib_uverbs_file *ufile, int async_fd);
++extern int register_new_ufile_mapping(struct ib_uverbs_file *ufile);
++extern void deregister_new_ufile_mapping(struct ib_uverbs_file *ufile);
++
++extern ssize_t channel_to_proc_write(void **channel_buf, size_t *orig_size,
++					const char __user *buf, size_t size);
++extern ssize_t channel_from_frm_read(void **channel_buf, size_t *orig_size,
++					char __user *buf, size_t size, loff_t *off);
++
++declare_res_footprint_func(struct ib_pd, pd, struct ib_uverbs_file, ufile);
++declare_res_footprint_func(struct ib_cq, cq, struct ib_uverbs_file, ufile);
++declare_res_footprint_func(struct ib_mr, mr, struct ib_pd, pd);
++declare_res_footprint_func(struct ib_qp, qp, struct ib_pd, pd);
++declare_res_footprint_func(struct ib_srq, srq, struct ib_pd, pd);
++declare_res_footprint_func(struct ib_uverbs_completion_event_file, uverbs_completion_event_file,
++							struct ib_uverbs_file, ufile);
++
++declare_res_uwrite_footprint_func(struct ib_cq, cq, struct ib_uverbs_file, ufile);
++declare_res_uwrite_footprint_func(struct ib_qp, qp, struct ib_uverbs_file, ufile);
++declare_res_uwrite_footprint_func(struct ib_mr, mr, struct ib_uverbs_file, ufile);
++declare_res_uwrite_footprint_func(struct ib_srq, srq, struct ib_uverbs_file, ufile);
++
++declare_handle_mapping_func(struct ib_pd, pd);
++declare_handle_mapping_func(struct ib_cq, cq);
++declare_handle_mapping_func(struct ib_mr, mr);
++declare_handle_mapping_func(struct ib_qp, qp);
++declare_handle_mapping_func(struct ib_srq, srq);
++
++declare_user_mmap(lkey, uint32_t, uint32_t);
++declare_user_mmap(lqpn, uint32_t, uint32_t);
++declare_user_mmap(local_rkey, uint32_t, uint32_t);
++
++#undef declare_res_footprint_func
++#undef declare_handle_mapping_func
++#undef declare_res_uwrite_footprint_func
++#undef declare_user_mmap
++
++extern int ufile_alloc_mapping(struct ib_uverbs_file *ufile);
++extern void ufile_dealloc_mapping(struct ib_uverbs_file *ufile);
++
++extern int mkdir_ibdev_sig_link(struct ib_device *ibdev);
++extern void rmdir_ibdev_sig_link(struct ib_device *ibdev);
++
++//extern struct proc_ops pause_entry_ops;
++//extern struct proc_ops pause_uwrite_entry_ops;
++extern int init_ud_qp_pause_signal(void);
++
++extern int install_ctx_resp(struct ib_uverbs_file *ufile,
++				char __user *buf, size_t size);
++
++extern void unregister_qp_symlink(u32 vqpn);
++
++extern int register_remote_rkey_mapping(struct ib_uverbs_file *ufile,
++						union ib_gid *gid, pid_t pid);
++extern int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey);
++extern int service_delete_rkey_mapping(pid_t pid, uint32_t vrkey);
++
++#endif
+diff --git a/drivers/infiniband/core/res_mapping_kern.c b/drivers/infiniband/core/res_mapping_kern.c
+new file mode 100644
+index 0000000..69562f7
+--- /dev/null
++++ b/drivers/infiniband/core/res_mapping_kern.c
+@@ -0,0 +1,270 @@
++#include <linux/sched.h>
++#include "rdma_footprint.h"
++#include "rbtree_core.h"
++
++struct ufile_mapping_node {
++	struct ib_uverbs_file			*ufile;
++	struct rbtree_struct			pd_mapping;
++	struct rbtree_struct			cq_mapping;
++	struct rbtree_struct			mr_mapping;
++	struct rbtree_struct			qp_mapping;
++	struct rbtree_struct			srq_mapping;
++	struct rb_node					node;
++};
++
++struct mapping_node {
++	struct rb_node					node;
++	int								vhandle;
++	int								handle;
++};
++
++static void free_mapping_node(struct rb_node *node) {
++	struct mapping_node *nd = node?
++				container_of(node, struct mapping_node, node): NULL;
++	if(nd)
++		kfree(nd);
++}
++
++static int mapping_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct mapping_node *ent1 =
++				n1? container_of(n1, struct mapping_node, node): NULL;
++	struct mapping_node *ent2 =
++				n2? container_of(n2, struct mapping_node, node): NULL;
++	
++	return ent1->vhandle - ent2->vhandle;
++}
++
++static int ufile_mapping_compare(const struct rb_node *n1, const struct rb_node *n2) {
++	struct ufile_mapping_node *ent1 =
++				n1? container_of(n1, struct ufile_mapping_node, node): NULL;
++	struct ufile_mapping_node *ent2 =
++				n2? container_of(n2, struct ufile_mapping_node, node): NULL;
++
++	if(!ent1 || !ent2) {
++		return -1;
++	}
++
++	if(ent1->ufile < ent2->ufile) {
++		return -1;
++	}
++	else if(ent1->ufile > ent2->ufile) {
++		return 1;
++	}
++	else {
++		return 0;
++	}
++}
++
++static declare_and_init_rbtree(per_ufile_mapping);
++
++static struct mapping_node *search_mapping(int vhandle, const struct rbtree_struct *rbtree,
++					struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct mapping_node my_node = {.vhandle = vhandle};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, rbtree, p_parent, p_insert, SEARCH_EXACTLY, mapping_compare);
++
++	return node? container_of(node, struct mapping_node, node): NULL;
++}
++
++static struct ufile_mapping_node *search_ufile_mapping(struct ib_uverbs_file *ufile,
++					struct rb_node **p_parent, struct rb_node ***p_insert) {
++	struct ufile_mapping_node my_node = {.ufile = ufile};
++	struct rb_node *node;
++
++	node = ___search(&my_node.node, &per_ufile_mapping, p_parent, p_insert,
++						SEARCH_EXACTLY, ufile_mapping_compare);
++	
++	return node? container_of(node, struct ufile_mapping_node, node): NULL;
++}
++
++int register_new_ufile_mapping(struct ib_uverbs_file *ufile) {
++	struct ufile_mapping_node *ufile_mapping;
++	struct rb_node *parent, **insert;
++
++	write_lock(&per_ufile_mapping.rwlock);
++	ufile_mapping = search_ufile_mapping(ufile, &parent, &insert);
++	if(ufile_mapping) {
++		write_unlock(&per_ufile_mapping.rwlock);
++		return -EEXIST;
++	}
++
++	ufile_mapping = kzalloc(sizeof(*ufile_mapping), GFP_KERNEL);
++	if(!ufile_mapping) {
++		write_unlock(&per_ufile_mapping.rwlock);
++		return -ENOMEM;
++	}
++
++	ufile_mapping->ufile = ufile;
++	ufile_mapping->pd_mapping.tree = RB_ROOT;
++	ufile_mapping->pd_mapping.rwlock =
++			__RW_LOCK_UNLOCKED(ufile_mapping->pd_mapping.rwlock);
++	ufile_mapping->cq_mapping.tree = RB_ROOT;
++	ufile_mapping->cq_mapping.rwlock =
++			__RW_LOCK_UNLOCKED(ufile_mapping->cq_mapping.rwlock);
++	ufile_mapping->mr_mapping.tree = RB_ROOT;
++	ufile_mapping->mr_mapping.rwlock =
++			__RW_LOCK_UNLOCKED(ufile_mapping->mr_mapping.rwlock);
++	ufile_mapping->qp_mapping.tree = RB_ROOT;
++	ufile_mapping->qp_mapping.rwlock =
++			__RW_LOCK_UNLOCKED(ufile_mapping->qp_mapping.rwlock);
++	ufile_mapping->srq_mapping.tree = RB_ROOT;
++	ufile_mapping->srq_mapping.rwlock =
++			__RW_LOCK_UNLOCKED(ufile_mapping->srq_mapping.rwlock);
++	rbtree_add_node(&ufile_mapping->node, parent, insert, &per_ufile_mapping);
++	write_unlock(&per_ufile_mapping.rwlock);
++
++	return 0;
++}
++
++void deregister_new_ufile_mapping(struct ib_uverbs_file *ufile) {
++	struct ufile_mapping_node *ufile_mapping;
++
++	write_lock(&per_ufile_mapping.rwlock);
++	ufile_mapping = search_ufile_mapping(ufile, NULL, NULL);
++	if(!ufile_mapping) {
++		write_unlock(&per_ufile_mapping.rwlock);
++		return;
++	}
++
++	clean_rbtree(&ufile_mapping->pd_mapping, free_mapping_node);
++	clean_rbtree(&ufile_mapping->cq_mapping, free_mapping_node);
++	clean_rbtree(&ufile_mapping->mr_mapping, free_mapping_node);
++	clean_rbtree(&ufile_mapping->qp_mapping, free_mapping_node);
++	clean_rbtree(&ufile_mapping->srq_mapping, free_mapping_node);
++	rbtree_rm_node(&ufile_mapping->node, &per_ufile_mapping);
++	kfree(ufile_mapping);
++	write_unlock(&per_ufile_mapping.rwlock);
++}
++
++static inline void unregister_handle_mapping_fn(struct ib_qp *qp) {
++	char symlink_name[128];
++
++	sprintf(symlink_name, "qpn_%d_%d_%d", current->tgid, qp->vqpn, qp->qp_num);
++	remove_proc_entry(symlink_name, qp->device->proc_ent);
++	unregister_qp_symlink(qp->qp_num);
++}
++
++#define def_handle_mapping_func(res_type, res, unregister_mapping_fn)				\
++int register_##res##_handle_mapping(struct ib_uverbs_file *ufile,					\
++					res_type *res, int vhandle, int handle) {						\
++	struct ufile_mapping_node *ufile_mapping;										\
++	struct mapping_node *res##_map_ent;												\
++	struct rbtree_struct *rbtree;													\
++	struct rb_node *parent, **insert;												\
++																					\
++	write_lock(&per_ufile_mapping.rwlock);											\
++	ufile_mapping = search_ufile_mapping(ufile, NULL, NULL);						\
++	if(!ufile_mapping) {															\
++		write_unlock(&per_ufile_mapping.rwlock);									\
++		return -ENOENT;																\
++	}																				\
++																					\
++	rbtree = &ufile_mapping->res##_mapping;											\
++																					\
++	write_lock(&rbtree->rwlock);													\
++	res##_map_ent = search_mapping(vhandle, rbtree, &parent, &insert);				\
++	if(!res##_map_ent) {															\
++		res##_map_ent = kzalloc(sizeof(*res##_map_ent), GFP_KERNEL);				\
++		if(!res##_map_ent) {														\
++			write_unlock(&rbtree->rwlock);											\
++			write_unlock(&per_ufile_mapping.rwlock);								\
++			return -ENOMEM;															\
++		}																			\
++																					\
++		res##_map_ent->vhandle = vhandle;											\
++		res##_map_ent->handle = handle;												\
++		rbtree_add_node(&res##_map_ent->node, parent, insert, rbtree);				\
++	}																				\
++	else {																			\
++		res##_map_ent->handle = handle;												\
++	}																				\
++																					\
++	write_unlock(&rbtree->rwlock);													\
++	write_unlock(&per_ufile_mapping.rwlock);										\
++	res->res##_map_ent = res##_map_ent;												\
++	printk(KERN_NOTICE "Add " #res " mapping: vhandle: %d, handle: %d\n",			\
++						res##_map_ent->vhandle, res##_map_ent->handle);				\
++																					\
++	return 0;																		\
++}																					\
++																					\
++void unregister_##res##_handle_mapping(struct ib_uverbs_file *ufile,				\
++								res_type *res) {									\
++	struct ufile_mapping_node *ufile_mapping;										\
++	struct mapping_node *res##_map_ent;												\
++	struct rbtree_struct *rbtree;													\
++	void (*__unregister_fn)(res_type *res);											\
++																					\
++	__unregister_fn = unregister_mapping_fn;										\
++	write_lock(&per_ufile_mapping.rwlock);											\
++	ufile_mapping = search_ufile_mapping(ufile, NULL, NULL);						\
++	if(!ufile_mapping) {															\
++		write_unlock(&per_ufile_mapping.rwlock);									\
++		return;																		\
++	}																				\
++																					\
++	rbtree = &ufile_mapping->res##_mapping;											\
++																					\
++	write_lock(&rbtree->rwlock);													\
++	res##_map_ent = res->res##_map_ent;												\
++	res##_map_ent = search_mapping(res##_map_ent->vhandle, rbtree, NULL, NULL);		\
++	if(!res##_map_ent) {															\
++		write_unlock(&rbtree->rwlock);												\
++		write_unlock(&per_ufile_mapping.rwlock);									\
++		return;																		\
++	}																				\
++	printk(KERN_NOTICE "Del " #res " map: vhandle: %d, handle: %d\n",				\
++					res##_map_ent->vhandle, res##_map_ent->handle);					\
++	rbtree_rm_node(&res##_map_ent->node, rbtree);									\
++	kfree(res##_map_ent);															\
++	res->res##_map_ent = NULL;														\
++																					\
++	write_unlock(&rbtree->rwlock);													\
++	write_unlock(&per_ufile_mapping.rwlock);										\
++																					\
++	if(__unregister_fn) {															\
++		__unregister_fn(res);														\
++	}																				\
++}																					\
++																					\
++int get_##res##_handle(struct ib_uverbs_file *ufile,								\
++					int vhandle, int *handle) {										\
++	struct ufile_mapping_node *ufile_mapping;										\
++	struct mapping_node *res##_map_ent;												\
++	struct rbtree_struct *rbtree;													\
++																					\
++	read_lock(&per_ufile_mapping.rwlock);											\
++	ufile_mapping = search_ufile_mapping(ufile, NULL, NULL);						\
++	if(!ufile_mapping) {															\
++		read_unlock(&per_ufile_mapping.rwlock);										\
++		return -ENOENT;																\
++	}																				\
++																					\
++	rbtree = &ufile_mapping->res##_mapping;											\
++																					\
++	read_lock(&rbtree->rwlock);														\
++	res##_map_ent = search_mapping(vhandle, rbtree, NULL, NULL);					\
++	if(!res##_map_ent) {															\
++		read_unlock(&rbtree->rwlock);												\
++		read_unlock(&per_ufile_mapping.rwlock);										\
++		return -ENOENT;																\
++	}																				\
++																					\
++	printk(KERN_NOTICE "Get " #res " mapping: vhandle: %d, handle: %d\n",			\
++							res##_map_ent->vhandle, res##_map_ent->handle);			\
++																					\
++	if(handle)																		\
++		*handle = res##_map_ent->handle;											\
++																					\
++	read_unlock(&rbtree->rwlock);													\
++	read_unlock(&per_ufile_mapping.rwlock);											\
++																					\
++	return 0;																		\
++}
++
++def_handle_mapping_func(struct ib_pd, pd, NULL);
++def_handle_mapping_func(struct ib_cq, cq, NULL);
++def_handle_mapping_func(struct ib_mr, mr, NULL);
++def_handle_mapping_func(struct ib_qp, qp, unregister_handle_mapping_fn);
++def_handle_mapping_func(struct ib_srq, srq, NULL);
+diff --git a/drivers/infiniband/core/res_mapping_user.c b/drivers/infiniband/core/res_mapping_user.c
+new file mode 100644
+index 0000000..2a6bf3e
+--- /dev/null
++++ b/drivers/infiniband/core/res_mapping_user.c
+@@ -0,0 +1,311 @@
++#include <linux/proc_fs.h>
++#include "rdma_footprint.h"
++
++#define register_user_mmap(map_field, is_write)														\
++static int ufile_##map_field##_mmap_open(struct inode *inode, struct file *filep) {					\
++	filep->private_data = PDE_DATA(inode);															\
++	return 0;																						\
++}																									\
++																									\
++static int ufile_##map_field##_mmap_mmap(struct file *filep, struct vm_area_struct *vma) {			\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++	ufile->map_field##_mmap_addr = vma->vm_start;													\
++	return remap_vmalloc_range(vma, ufile->map_field##_mapping, 0);									\
++}																									\
++																									\
++static struct proc_ops ufile_##map_field##_mmap_ops = {												\
++	.proc_open						= ufile_##map_field##_mmap_open,								\
++	.proc_mmap						= ufile_##map_field##_mmap_mmap,								\
++};																									\
++																									\
++static ssize_t ufile_##map_field##_mmap_kern_read(struct file *filep,								\
++					char __user *buf, size_t size, loff_t *off) {									\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++																									\
++	return copy_to_user(buf, ufile->map_field##_mapping, size)? : size;								\
++}																									\
++																									\
++static ssize_t ufile_##map_field##_mmap_kern_write(struct file *filep,								\
++						const char __user *buf, size_t size, loff_t *off) {							\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++																									\
++	return copy_from_user(ufile->map_field##_mapping, buf, size)? : size;							\
++}																									\
++																									\
++static ssize_t ufile_##map_field##_mmap_addr_read(struct file *filep,								\
++					char __user *buf, size_t size, loff_t *off) {									\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++																									\
++	if(size != sizeof(ufile->map_field##_mmap_addr))												\
++		return -EINVAL;																				\
++																									\
++	return copy_to_user(buf, &ufile->map_field##_mmap_addr, size)? : size;							\
++}																									\
++																									\
++static ssize_t ufile_##map_field##_mmap_fd_write(struct file *filep,								\
++						const char __user *buf, size_t size, loff_t *off) {							\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++	int err;																						\
++																									\
++	if(size != sizeof(ufile->map_field##_fd))														\
++		return -EINVAL;																				\
++																									\
++	if(!ufile->map_field##_fd_wait_flag)															\
++		return -EEXIST;																				\
++																									\
++	err = copy_from_user(&ufile->map_field##_fd, buf, size);										\
++	ufile->map_field##_fd_wait_flag = 0;															\
++	wake_up_interruptible(&ufile->map_field##_fd_wait_queue);										\
++	return err? err: size;																			\
++}																									\
++																									\
++static ssize_t ufile_##map_field##_mmap_fd_read(struct file *filep,									\
++					char __user *buf, size_t size, loff_t *off) {									\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++	int err;																						\
++																									\
++	if(size != sizeof(ufile->map_field##_fd))														\
++		return -EINVAL;																				\
++																									\
++	wait_event_interruptible(ufile->map_field##_fd_wait_queue,										\
++							!ufile->map_field##_fd_wait_flag);										\
++																									\
++	if(ufile->map_field##_fd_wait_flag)																\
++		return -EPIPE;																				\
++																									\
++	err = copy_to_user(buf, &ufile->map_field##_fd, size);											\
++	return err? err: size;																			\
++}																									\
++																									\
++static int ufile_##map_field##_mmap_fd_release(struct inode *inode,									\
++									struct file *filep) {											\
++	struct ib_uverbs_file *ufile = filep->private_data;												\
++	wake_up_interruptible(&ufile->map_field##_fd_wait_queue);										\
++	return 0;																						\
++}																									\
++																									\
++static struct proc_ops ufile_##map_field##_mmap_kern_ops = {										\
++	.proc_open						= ufile_##map_field##_mmap_open,								\
++	.proc_read						= ufile_##map_field##_mmap_kern_read,							\
++	.proc_write						= ufile_##map_field##_mmap_kern_write,							\
++};																									\
++/*																									\
++static struct proc_ops ufile_##map_field##_mmap_addr_ops = {										\
++	.proc_open						= ufile_##map_field##_mmap_open,								\
++	.proc_read						= ufile_##map_field##_mmap_addr_read,							\
++};																									\
++*/																									\
++static struct proc_ops ufile_##map_field##_mmap_fd_ops = {											\
++	.proc_open						= ufile_##map_field##_mmap_open,								\
++	.proc_write						= ufile_##map_field##_mmap_fd_write,							\
++	.proc_release					= ufile_##map_field##_mmap_fd_release,							\
++};																									\
++																									\
++static struct proc_ops ufile_##map_field##_mmap_fd_kern_ops = {										\
++	.proc_open						= ufile_##map_field##_mmap_open,								\
++	.proc_read						= ufile_##map_field##_mmap_fd_read,								\
++	.proc_release					= ufile_##map_field##_mmap_fd_release,							\
++};																									\
++																									\
++static int __register_ufile_##map_field##_mmap(struct ib_uverbs_file *ufile) {						\
++	struct proc_dir_entry *proc_ent;																\
++	struct proc_dir_entry *proc_ent_kern;															\
++	struct proc_dir_entry *proc_ent_mmap;															\
++	struct proc_dir_entry *proc_ent_mmap_user;														\
++	struct proc_dir_entry *proc_ent_fd;																\
++																									\
++	proc_ent = proc_create_data(#map_field "_map",													\
++								(is_write)? 00666: 00644, ufile->ufile_proc_uwrite_ent,				\
++								&ufile_##map_field##_mmap_ops, ufile);								\
++	if(!proc_ent) {																					\
++		return -ENOENT;																				\
++	}																								\
++																									\
++	proc_ent_kern = proc_create_data(#map_field "_map", 00400, ufile->ufile_proc_ent,				\
++								&ufile_##map_field##_mmap_kern_ops, ufile);							\
++	if(!proc_ent_kern) {																			\
++		proc_remove(proc_ent);																		\
++		return -ENOENT;																				\
++	}																								\
++/*																									\
++	proc_ent_mmap = proc_create_data(#map_field "_mmap_addr", 00400, ufile->ufile_proc_ent,			\
++								&ufile_##map_field##_mmap_addr_ops, ufile);							\
++	if(!proc_ent_mmap) {																			\
++		proc_remove(proc_ent_kern);																	\
++		proc_remove(proc_ent);																		\
++		return -ENOENT;																				\
++	}																								\
++*/																									\
++	proc_ent_fd = proc_create_data(#map_field "_mmap_fd", 00666, ufile->ufile_proc_uwrite_ent,		\
++								&ufile_##map_field##_mmap_fd_ops, ufile);							\
++	if(!proc_ent_fd) {																				\
++		proc_remove(proc_ent_mmap);																	\
++		proc_remove(proc_ent_kern);																	\
++		proc_remove(proc_ent);																		\
++		return -ENOENT;																				\
++	}																								\
++/*																									\
++	proc_ent_mmap_user = proc_create_data(#map_field "_mmap_addr", 00666,							\
++								ufile->ufile_proc_uwrite_ent,										\
++								&ufile_##map_field##_mmap_addr_ops, ufile);							\
++	if(!proc_ent_mmap_user) {																		\
++		proc_remove(proc_ent_fd);																	\
++		proc_remove(proc_ent_mmap);																	\
++		proc_remove(proc_ent_kern);																	\
++		proc_remove(proc_ent);																		\
++		return -ENOENT;																				\
++	}																								\
++*/																									\
++	if(!proc_create_data(#map_field "_mmap_fd", 00400, ufile->ufile_proc_ent,						\
++								&ufile_##map_field##_mmap_fd_kern_ops, ufile)) {					\
++		proc_remove(proc_ent_mmap_user);															\
++		proc_remove(proc_ent_fd);																	\
++		proc_remove(proc_ent_mmap);																	\
++		proc_remove(proc_ent_kern);																	\
++		proc_remove(proc_ent);																		\
++		return -ENOENT;																				\
++	}																								\
++																									\
++	init_waitqueue_head(&ufile->map_field##_fd_wait_queue);											\
++	ufile->map_field##_fd_wait_flag = 1;															\
++																									\
++	return 0;																						\
++}
++
++register_user_mmap(lkey, false);
++register_user_mmap(rkey, false);
++
++int ufile_alloc_mapping(struct ib_uverbs_file *ufile) {
++	ufile->lkey_mapping = vmalloc_user(PAGE_SIZE);
++	if(!ufile->lkey_mapping)
++		return -ENOMEM;
++	memset(ufile->lkey_mapping, 0, PAGE_SIZE);
++
++	ufile->rkey_mapping = vmalloc_user(PAGE_SIZE);
++	if(!ufile->rkey_mapping) {
++		vfree(ufile->lkey_mapping);
++		return -ENOMEM;
++	}
++	memset(ufile->rkey_mapping, 0, PAGE_SIZE);
++
++	if(__register_ufile_lkey_mmap(ufile) || __register_ufile_rkey_mmap(ufile)) {
++		vfree(ufile->rkey_mapping);
++		vfree(ufile->lkey_mapping);
++		return -ENOENT;
++	}
++
++	return 0;
++}
++
++void ufile_dealloc_mapping(struct ib_uverbs_file *ufile) {
++	vfree(ufile->rkey_mapping);
++	vfree(ufile->lkey_mapping);
++}
++
++struct remote_rkey_trans_node {
++	union ib_gid					remote_gid;
++	pid_t							remote_pid;
++	void							*mmap_user;
++	int								refcnt;
++	struct list_head				list;
++};
++
++static int remote_rkey_mapping_open(struct inode *inode, struct file *filep) {
++	filep->private_data = PDE_DATA(inode);
++	return 0;
++}
++
++static int remote_rkey_mapping_mmap(struct file *filep, struct vm_area_struct *vma) {
++	struct remote_rkey_trans_node *rkey_trans = filep->private_data;
++	return remap_vmalloc_range(vma, rkey_trans->mmap_user, 0);
++}
++
++static ssize_t remote_rkey_mapping_kern_read(struct file *filep,								\
++				char __user *buf, size_t size, loff_t *off) {
++	struct remote_rkey_trans_node *rkey_trans = filep->private_data;
++	return copy_to_user(buf, rkey_trans->mmap_user, size)? : size;
++}
++
++static ssize_t remote_rkey_mapping_kern_write(struct file *filep,								\
++				const char __user *buf, size_t size, loff_t *off) {
++	struct remote_rkey_trans_node *rkey_trans = filep->private_data;
++	return copy_from_user(rkey_trans->mmap_user, buf, size)? : size;
++}
++
++static int remote_rkey_mapping_release(struct inode *inode, struct file *filep) {
++	struct remote_rkey_trans_node *rkey_trans = filep->private_data;
++	rkey_trans->refcnt--;
++	if(!rkey_trans->refcnt) {
++		list_del(&rkey_trans->list);
++	}
++
++	return 0;
++}
++
++static struct proc_ops remote_rkey_mapping_ops = {
++	.proc_open					= remote_rkey_mapping_open,
++	.proc_mmap					= remote_rkey_mapping_mmap,
++	.proc_release				= remote_rkey_mapping_release,
++};
++
++static struct proc_ops remote_rkey_mmaping_kern_ops = {
++	.proc_open					= remote_rkey_mapping_open,
++	.proc_read					= remote_rkey_mapping_kern_read,
++	.proc_write					= remote_rkey_mapping_kern_write,
++};
++
++int register_remote_rkey_mapping(struct ib_uverbs_file *ufile,
++						union ib_gid *gid, pid_t pid) {
++	struct proc_dir_entry *proc_ent;
++	struct proc_dir_entry *proc_ent_kern;
++	struct remote_rkey_trans_node *node;
++	char fname[1024];
++
++	write_lock(&ufile->trans_list_lock);
++	list_for_each_entry(node, &ufile->remote_rkey_trans_list, list) {
++		if(!memcmp(&node->remote_gid, gid, sizeof(*gid)) && node->remote_pid == pid)
++			break;
++	}
++
++	if(&node->list != &ufile->remote_rkey_trans_list) {
++		node->refcnt++;
++		write_unlock(&ufile->trans_list_lock);
++		return 0;
++	}
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if(!node) {
++		write_unlock(&ufile->trans_list_lock);
++		return -ENOMEM;
++	}
++
++	memcpy(&node->remote_gid, gid, sizeof(*gid));
++	node->remote_pid = pid;
++	node->mmap_user = vmalloc_user(PAGE_SIZE);
++	if(!node->mmap_user) {
++		write_unlock(&ufile->trans_list_lock);
++		kfree(node);
++		return -ENOMEM;
++	}
++	node->refcnt = 1;
++	memset(node->mmap_user, 0, PAGE_SIZE);
++
++	list_add_tail(&node->list, &ufile->remote_rkey_trans_list);
++	write_unlock(&ufile->trans_list_lock);
++
++	sprintf(fname, "<%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x>_%d",
++				gid->raw[0], gid->raw[1], gid->raw[2], gid->raw[3], gid->raw[4], gid->raw[5], gid->raw[6], gid->raw[7],
++				gid->raw[8], gid->raw[9], gid->raw[10], gid->raw[11], gid->raw[12], gid->raw[13], gid->raw[14], gid->raw[15], pid);
++	proc_ent = proc_create_data(fname, 00666, ufile->ufile_proc_uwrite_ent, &remote_rkey_mapping_ops, node);
++	if(!proc_ent) {
++		return -ENOENT;
++	}
++
++	proc_ent_kern = proc_create_data(fname, 00400, ufile->ufile_proc_ent, &remote_rkey_mmaping_kern_ops, node);
++	if(!proc_ent_kern) {
++		proc_remove(proc_ent);
++		return -ENOENT;
++	}
++
++	return 0;
++}
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index 53a1047..062bb1b 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -126,13 +126,25 @@ struct ib_uverbs_async_event_file {
+ 	struct ib_uobject			uobj;
+ 	struct ib_uverbs_event_queue		ev_queue;
+ 	struct ib_event_handler			event_handler;
++	int								async_fd;
+ };
+ 
+ struct ib_uverbs_completion_event_file {
+ 	struct ib_uobject			uobj;
+ 	struct ib_uverbs_event_queue		ev_queue;
++	struct proc_dir_entry				*uverbs_completion_event_file_proc_ent;
++	int									comp_fd;
+ };
+ 
++#include "rdma_footprint.h"
++
++#define declare_ufile_member(map_field)													\
++	void								*map_field##_mapping;							\
++	__aligned_u64						map_field##_mmap_addr;							\
++	int									map_field##_fd;									\
++	wait_queue_head_t					map_field##_fd_wait_queue;						\
++	int									map_field##_fd_wait_flag
++
+ struct ib_uverbs_file {
+ 	struct kref				ref;
+ 	struct ib_uverbs_device		       *device;
+@@ -159,6 +171,32 @@ struct ib_uverbs_file {
+ 	struct list_head umaps;
+ 	struct page *disassociate_page;
+ 
++	char						ctx_resp[256];
++	wait_queue_head_t			ctx_resp_wait_queue;
++	int							ctx_resp_wait_flag;
++
++	struct proc_dir_entry		*ufile_proc_ent;
++	struct proc_dir_entry		*ufile_proc_uwrite_ent;
++	struct proc_task_node		*task_node;
++	struct footprint_gid_entry	gid_table[256];
++	wait_queue_head_t			gid_table_wait_queue;
++	int							gid_table_wait_flag;
++
++	__aligned_u64				ctx_uaddr;
++	wait_queue_head_t			ctx_uaddr_wait_queue;
++	int							ctx_uaddr_wait_flag;
++
++	__aligned_u64				nc_uar;
++	wait_queue_head_t			nc_uar_wait_queue;
++	int							nc_uar_wait_flag;
++
++	declare_ufile_member(lkey);
++	declare_ufile_member(rkey);
++
++	struct list_head	remote_rkey_trans_list;
++	rwlock_t			trans_list_lock;
++	int					cmd_fd;
++
+ 	struct xarray		idr;
+ };
+ 
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index c75540f..0be5950 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -46,6 +46,7 @@
+ 
+ #include "uverbs.h"
+ #include "core_priv.h"
++#include "rdma_footprint.h"
+ 
+ /*
+  * Copy a response to userspace. If the provided 'resp' is larger than the
+@@ -697,6 +698,7 @@ static int ib_uverbs_reg_mr(struct uverbs_attr_bundle *attrs)
+ 	int                          ret;
+ 	struct ib_device *ib_dev;
+ 	u32 access_flags;
++	int pd_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -717,6 +719,10 @@ static int ib_uverbs_reg_mr(struct uverbs_attr_bundle *attrs)
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
++	ret = get_pd_handle(attrs->ufile, cmd.pd_handle, &pd_handle);
++	if(ret)
++		goto err_free;
++	cmd.pd_handle = pd_handle;
+ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+ 	if (!pd) {
+ 		ret = -EINVAL;
+@@ -776,6 +782,7 @@ static int ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs)
+ 	int                          ret;
+ 	struct ib_uobject	    *uobj;
+ 	u32 access_flags = 0;
++	int mr_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -789,6 +796,10 @@ static int ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs)
+ 	     (cmd.start & ~PAGE_MASK) != (cmd.hca_va & ~PAGE_MASK)))
+ 			return -EINVAL;
+ 
++	ret = get_mr_handle(attrs->ufile, cmd.mr_handle, &mr_handle);
++	if(ret)
++		return ret;
++	cmd.mr_handle = mr_handle;
+ 	uobj = uobj_get_write(UVERBS_OBJECT_MR, cmd.mr_handle, attrs);
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+@@ -811,6 +822,11 @@ static int ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs)
+ 	}
+ 
+ 	if (cmd.flags & IB_MR_REREG_PD) {
++		int pd_handle;
++		ret = get_pd_handle(attrs->ufile, cmd.pd_handle, &pd_handle);
++		if(ret)
++			goto put_uobjs;
++		cmd.pd_handle = pd_handle;
+ 		pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle,
+ 				       attrs);
+ 		if (!pd) {
+@@ -873,6 +889,7 @@ static int ib_uverbs_alloc_mw(struct uverbs_attr_bundle *attrs)
+ 	struct ib_mw                  *mw;
+ 	int                            ret;
+ 	struct ib_device *ib_dev;
++	int pd_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -882,6 +899,10 @@ static int ib_uverbs_alloc_mw(struct uverbs_attr_bundle *attrs)
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
++	ret = get_pd_handle(attrs->ufile, cmd.pd_handle, &pd_handle);
++	if(ret)
++		goto err_free;
++	cmd.pd_handle = pd_handle;
+ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+ 	if (!pd) {
+ 		ret = -EINVAL;
+@@ -954,7 +975,13 @@ static int ib_uverbs_create_comp_channel(struct uverbs_attr_bundle *attrs)
+ 	uobj_finalize_uobj_create(uobj, attrs);
+ 
+ 	resp.fd = uobj->id;
+-	return uverbs_response(attrs, &resp, sizeof(resp));
++	ret = uverbs_response(attrs, &resp, sizeof(resp));
++	if(ret)
++		return ret;
++
++	ev_file->comp_fd = uobj->id;
++	return register_uverbs_completion_event_file_to_footprint(ev_file,
++							attrs->ufile, uobj->id);
+ }
+ 
+ static int create_cq(struct uverbs_attr_bundle *attrs,
+@@ -1074,11 +1101,16 @@ static int ib_uverbs_resize_cq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_uverbs_resize_cq_resp	resp = {};
+ 	struct ib_cq			*cq;
+ 	int ret;
++	int cq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_cq_handle(attrs->ufile, cmd.cq_handle, &cq_handle);
++	if(ret)
++		return ret;
++	cmd.cq_handle = cq_handle;
+ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+ 	if (!cq)
+ 		return -EINVAL;
+@@ -1136,11 +1168,16 @@ static int ib_uverbs_poll_cq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_cq                  *cq;
+ 	struct ib_wc                   wc;
+ 	int                            ret;
++	int								cq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_cq_handle(attrs->ufile, cmd.cq_handle, &cq_handle);
++	if(ret)
++		return ret;
++	cmd.cq_handle = cq_handle;
+ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+ 	if (!cq)
+ 		return -EINVAL;
+@@ -1185,11 +1222,16 @@ static int ib_uverbs_req_notify_cq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_uverbs_req_notify_cq cmd;
+ 	struct ib_cq                  *cq;
+ 	int ret;
++	int cq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+-
++	
++	ret = get_cq_handle(attrs->ufile, cmd.cq_handle, &cq_handle);
++	if(ret)
++		return ret;
++	cmd.cq_handle = cq_handle;
+ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+ 	if (!cq)
+ 		return -EINVAL;
+@@ -1245,6 +1287,7 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 	struct ib_rwq_ind_table *ind_tbl = NULL;
+ 	bool has_sq = true;
+ 	struct ib_device *ib_dev;
++	int pd_handle;
+ 
+ 	if (cmd->qp_type == IB_QPT_RAW_PACKET && !capable(CAP_NET_RAW))
+ 		return -EPERM;
+@@ -1298,6 +1341,12 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 			cmd->max_recv_sge = 0;
+ 		} else {
+ 			if (cmd->is_srq) {
++				int srq_handle;
++				int ret;
++				ret = get_srq_handle(attrs->ufile, cmd->srq_handle, &srq_handle);
++				if(ret)
++					goto err_put;
++				cmd->srq_handle = srq_handle;
+ 				srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ,
+ 							cmd->srq_handle, attrs);
+ 				if (!srq || srq->srq_type == IB_SRQT_XRC) {
+@@ -1308,6 +1357,14 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 
+ 			if (!ind_tbl) {
+ 				if (cmd->recv_cq_handle != cmd->send_cq_handle) {
++					int cq_handle, err;
++					err = get_cq_handle(attrs->ufile,
++								cmd->recv_cq_handle, &cq_handle);
++					if(err) {
++						ret = err;
++						goto err_put;
++					}
++					cmd->recv_cq_handle = cq_handle;
+ 					rcq = uobj_get_obj_read(
+ 						cq, UVERBS_OBJECT_CQ,
+ 						cmd->recv_cq_handle, attrs);
+@@ -1319,11 +1376,23 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 			}
+ 		}
+ 
+-		if (has_sq)
++		if (has_sq) {
++			int cq_handle, err;
++			err = get_cq_handle(attrs->ufile, cmd->send_cq_handle, &cq_handle);
++			if(err) {
++				ret = err;
++				goto err_put;
++			}
++			cmd->send_cq_handle = cq_handle;
+ 			scq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ,
+ 						cmd->send_cq_handle, attrs);
++		}
+ 		if (!ind_tbl)
+ 			rcq = rcq ?: scq;
++		ret = get_pd_handle(attrs->ufile, cmd->pd_handle, &pd_handle);
++		if(ret)
++			goto err_put;
++		cmd->pd_handle = pd_handle;
+ 		pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle,
+ 				       attrs);
+ 		if (!pd || (!scq && has_sq)) {
+@@ -1629,6 +1698,7 @@ static int ib_uverbs_query_qp(struct uverbs_attr_bundle *attrs)
+ 	struct ib_qp_attr              *attr;
+ 	struct ib_qp_init_attr         *init_attr;
+ 	int                            ret;
++	int qp_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -1641,6 +1711,10 @@ static int ib_uverbs_query_qp(struct uverbs_attr_bundle *attrs)
+ 		goto out;
+ 	}
+ 
++	ret = get_qp_handle(attrs->ufile, cmd.qp_handle, &qp_handle);
++	if(ret)
++		goto out;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp) {
+ 		ret = -EINVAL;
+@@ -1754,11 +1828,16 @@ static int modify_qp(struct uverbs_attr_bundle *attrs,
+ 	struct ib_qp_attr *attr;
+ 	struct ib_qp *qp;
+ 	int ret;
++	int qp_handle;
+ 
+ 	attr = kzalloc(sizeof(*attr), GFP_KERNEL);
+ 	if (!attr)
+ 		return -ENOMEM;
+ 
++	ret = get_qp_handle(attrs->ufile, cmd->base.qp_handle, &qp_handle);
++	if(ret)
++		return ret;
++	cmd->base.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd->base.qp_handle,
+ 			       attrs);
+ 	if (!qp) {
+@@ -1900,11 +1979,18 @@ static int modify_qp(struct uverbs_attr_bundle *attrs,
+ 	if (cmd->base.attr_mask & IB_QP_ALT_PATH)
+ 		copy_ah_attr_from_uverbs(qp, &attr->alt_ah_attr,
+ 					 &cmd->base.alt_dest);
++	
++	if(cmd->base.attr_mask & IB_QP_AV) {
++		memcpy(&qp->rc_dest_gid, cmd->base.dest.dgid, sizeof(union ib_gid));
++	}
+ 
+ 	ret = ib_modify_qp_with_udata(qp, attr,
+ 				      modify_qp_mask(qp->qp_type,
+ 						     cmd->base.attr_mask),
+ 				      &attrs->driver_udata);
++	
++	if(cmd->base.attr_mask & IB_QP_STATE)
++		qp->cur_qp_state = cmd->base.qp_state;
+ 
+ release_qp:
+ 	rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
+@@ -2010,6 +2096,7 @@ static int ib_uverbs_post_send(struct uverbs_attr_bundle *attrs)
+ 	const struct ib_sge __user *sgls;
+ 	const void __user *wqes;
+ 	struct uverbs_req_iter iter;
++	int qp_handle;
+ 
+ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -2029,6 +2116,10 @@ static int ib_uverbs_post_send(struct uverbs_attr_bundle *attrs)
+ 	if (!user_wr)
+ 		return -ENOMEM;
+ 
++	ret = get_qp_handle(attrs->ufile, cmd.qp_handle, qp_handle);
++	if(ret)
++		return ret;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp) {
+ 		ret = -EINVAL;
+@@ -2296,6 +2387,7 @@ static int ib_uverbs_post_recv(struct uverbs_attr_bundle *attrs)
+ 	struct ib_qp                   *qp;
+ 	int ret, ret2;
+ 	struct uverbs_req_iter iter;
++	int qp_handle;
+ 
+ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -2306,6 +2398,10 @@ static int ib_uverbs_post_recv(struct uverbs_attr_bundle *attrs)
+ 	if (IS_ERR(wr))
+ 		return PTR_ERR(wr);
+ 
++	ret = get_qp_handle(attrs->ufile, cmd.qp_handle, &qp_handle);
++	if(ret)
++		return ret;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp) {
+ 		ret = -EINVAL;
+@@ -2347,6 +2443,7 @@ static int ib_uverbs_post_srq_recv(struct uverbs_attr_bundle *attrs)
+ 	struct ib_srq                      *srq;
+ 	int ret, ret2;
+ 	struct uverbs_req_iter iter;
++	int srq_handle;
+ 
+ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -2357,6 +2454,10 @@ static int ib_uverbs_post_srq_recv(struct uverbs_attr_bundle *attrs)
+ 	if (IS_ERR(wr))
+ 		return PTR_ERR(wr);
+ 
++	ret = get_srq_handle(attrs->ufile, cmd.srq_handle, &srq_handle);
++	if(ret)
++		goto out;
++	cmd.srq_handle = srq_handle;
+ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+ 	if (!srq) {
+ 		ret = -EINVAL;
+@@ -2400,6 +2501,7 @@ static int ib_uverbs_create_ah(struct uverbs_attr_bundle *attrs)
+ 	struct rdma_ah_attr		attr = {};
+ 	int ret;
+ 	struct ib_device *ib_dev;
++	int pd_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -2414,6 +2516,10 @@ static int ib_uverbs_create_ah(struct uverbs_attr_bundle *attrs)
+ 		goto err;
+ 	}
+ 
++	ret = get_pd_handle(attrs->ufile, cmd.pd_handle, &pd_handle);
++	if(ret)
++		goto err;
++	cmd.pd_handle = pd_handle;
+ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+ 	if (!pd) {
+ 		ret = -EINVAL;
+@@ -2479,11 +2585,16 @@ static int ib_uverbs_attach_mcast(struct uverbs_attr_bundle *attrs)
+ 	struct ib_uqp_object         *obj;
+ 	struct ib_uverbs_mcast_entry *mcast;
+ 	int                           ret;
++	int qp_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_qp_handle(attrs->ufile, cmd.qp_handle, &qp_handle);
++	if(ret)
++		return ret;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp)
+ 		return -EINVAL;
+@@ -2529,11 +2640,16 @@ static int ib_uverbs_detach_mcast(struct uverbs_attr_bundle *attrs)
+ 	struct ib_uverbs_mcast_entry *mcast;
+ 	int                           ret;
+ 	bool                          found = false;
++	int qp_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_qp_handle(attrs->ufile, cmd.qp_handle, &qp_handle);
++	if(ret)
++		return ret;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp)
+ 		return -EINVAL;
+@@ -2893,6 +3009,7 @@ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_wq *wq;
+ 	struct ib_wq_init_attr wq_init_attr = {};
+ 	struct ib_device *ib_dev;
++	int pd_handle, cq_handle;
+ 
+ 	err = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (err)
+@@ -2906,12 +3023,20 @@ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs)
+ 	if (IS_ERR(obj))
+ 		return PTR_ERR(obj);
+ 
++	err = get_pd_handle(attrs->ufile, cmd.pd_handle, &pd_handle);
++	if(err)
++		goto err_uobj;
++	cmd.pd_handle = pd_handle;
+ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, attrs);
+ 	if (!pd) {
+ 		err = -EINVAL;
+ 		goto err_uobj;
+ 	}
+ 
++	err = get_cq_handle(attrs->ufile, cmd.cq_handle, &cq_handle);
++	if(err)
++		goto err_put_pd;
++	cmd.cq_handle = cq_handle;
+ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+ 	if (!cq) {
+ 		err = -EINVAL;
+@@ -3172,6 +3297,7 @@ static int ib_uverbs_ex_create_flow(struct uverbs_attr_bundle *attrs)
+ 	void *ib_spec;
+ 	int i;
+ 	struct ib_device *ib_dev;
++	int qp_handle;
+ 
+ 	err = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
+ 	if (err)
+@@ -3231,6 +3357,10 @@ static int ib_uverbs_ex_create_flow(struct uverbs_attr_bundle *attrs)
+ 		goto err_free_attr;
+ 	}
+ 
++	err = get_qp_handle(attrs->ufile, cmd.qp_handle, &qp_handle);
++	if(err)
++		goto err_free_attr;
++	cmd.qp_handle = qp_handle;
+ 	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, cmd.qp_handle, attrs);
+ 	if (!qp) {
+ 		err = -EINVAL;
+@@ -3349,6 +3479,7 @@ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ 	int ret;
+ 	struct ib_uobject *xrcd_uobj;
+ 	struct ib_device *ib_dev;
++	int pd_handle;
+ 
+ 	obj = (struct ib_usrq_object *)uobj_alloc(UVERBS_OBJECT_SRQ, attrs,
+ 						  &ib_dev);
+@@ -3377,6 +3508,11 @@ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ 	}
+ 
+ 	if (ib_srq_has_cq(cmd->srq_type)) {
++		int cq_handle;
++		ret = get_cq_handle(attrs->ufile, cmd->cq_handle, &cq_handle);
++		if(ret)
++			goto err_put_xrcd;
++		cmd->cq_handle = cq_handle;
+ 		attr.ext.cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ,
+ 						cmd->cq_handle, attrs);
+ 		if (!attr.ext.cq) {
+@@ -3385,6 +3521,10 @@ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ 		}
+ 	}
+ 
++	ret = get_pd_handle(attrs->ufile, cmd->pd_handle, &pd_handle);
++	if(ret)
++		goto err_put_cq;
++	cmd->pd_handle = pd_handle;
+ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd->pd_handle, attrs);
+ 	if (!pd) {
+ 		ret = -EINVAL;
+@@ -3488,11 +3628,16 @@ static int ib_uverbs_modify_srq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_srq              *srq;
+ 	struct ib_srq_attr          attr;
+ 	int                         ret;
++	int srq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_srq_handle(attrs->ufile, cmd.srq_handle, &srq_handle);
++	if(ret)
++		return -EINVAL;
++	cmd.srq_handle = srq_handle;
+ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+ 	if (!srq)
+ 		return -EINVAL;
+@@ -3516,11 +3661,16 @@ static int ib_uverbs_query_srq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_srq_attr              attr;
+ 	struct ib_srq                   *srq;
+ 	int                             ret;
++	int								srq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+ 		return ret;
+ 
++	ret = get_srq_handle(attrs->ufile, cmd.srq_handle, &srq_handle);
++	if(ret)
++		return -EINVAL;
++	cmd.srq_handle = srq_handle;
+ 	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+ 	if (!srq)
+ 		return -EINVAL;
+@@ -3636,6 +3786,7 @@ static int ib_uverbs_ex_modify_cq(struct uverbs_attr_bundle *attrs)
+ 	struct ib_uverbs_ex_modify_cq cmd;
+ 	struct ib_cq *cq;
+ 	int ret;
++	int cq_handle;
+ 
+ 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ 	if (ret)
+@@ -3647,6 +3798,10 @@ static int ib_uverbs_ex_modify_cq(struct uverbs_attr_bundle *attrs)
+ 	if (cmd.attr_mask > IB_CQ_MODERATE)
+ 		return -EOPNOTSUPP;
+ 
++	ret = get_cq_handle(attrs->ufile, cmd.cq_handle, &cq_handle);
++	if(ret)
++		return ret;
++	cmd.cq_handle = cq_handle;
+ 	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, cmd.cq_handle, attrs);
+ 	if (!cq)
+ 		return -EINVAL;
+diff --git a/drivers/infiniband/core/uverbs_ioctl.c b/drivers/infiniband/core/uverbs_ioctl.c
+index 9b35fa5..e62eb5c 100644
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -334,6 +334,9 @@ static int uverbs_process_attr(struct bundle_priv *pbundle,
+ 			if (put_user(id, &pbundle->user_attrs[uattr_idx].data))
+ 				return -EFAULT;
+ 		}
++		else if (spec->type == UVERBS_ATTR_TYPE_FD) {
++			o_attr->uobject->id = uattr->data_s64;
++		}
+ 
+ 		break;
+ 
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 37794d8..94972ef 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -285,6 +285,45 @@ static ssize_t ib_uverbs_comp_event_read(struct file *filp, char __user *buf,
+ 				    sizeof(struct ib_uverbs_comp_event_desc));
+ }
+ 
++static ssize_t ib_uverbs_comp_event_write(struct file *filp, const char __user *buf,
++					size_t size, loff_t *off) {
++	struct ib_uverbs_completion_event_file *comp_ev_file =
++								filp->private_data;
++	struct ib_uverbs_event_queue *ev_queue = &comp_ev_file->ev_queue;
++	ssize_t write_size = 0;
++
++	spin_lock_irq(&ev_queue->lock);
++	while(write_size + sizeof(struct ib_uverbs_comp_event_desc) <= size) {
++		struct ib_uverbs_event *entry;
++
++		entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
++		if(!entry) {
++			spin_unlock_irq(&ev_queue->lock);
++			return -ENOMEM;
++		}
++
++		if(copy_from_user(&entry->desc.comp, buf + write_size,
++					sizeof(struct ib_uverbs_comp_event_desc))) {
++			kfree(entry);
++			spin_unlock_irq(&ev_queue->lock);
++			return -EFAULT;
++		}
++
++		entry->desc.comp.flag = 0;
++		entry->counter = NULL;
++
++		list_add_tail(&entry->list, &ev_queue->event_list);
++		write_size += sizeof(struct ib_uverbs_comp_event_desc);
++	}
++
++	spin_unlock_irq(&ev_queue->lock);
++
++	wake_up_interruptible(&ev_queue->poll_wait);
++	kill_fasync(&ev_queue->async_queue, SIGIO, POLL_IN);
++
++	return write_size;
++}
++
+ static __poll_t ib_uverbs_event_poll(struct ib_uverbs_event_queue *ev_queue,
+ 					 struct file *filp,
+ 					 struct poll_table_struct *wait)
+@@ -338,6 +377,7 @@ static int ib_uverbs_comp_event_fasync(int fd, struct file *filp, int on)
+ const struct file_operations uverbs_event_fops = {
+ 	.owner	 = THIS_MODULE,
+ 	.read	 = ib_uverbs_comp_event_read,
++	.write	 = ib_uverbs_comp_event_write,
+ 	.poll    = ib_uverbs_comp_event_poll,
+ 	.release = uverbs_uobject_fd_release,
+ 	.fasync  = ib_uverbs_comp_event_fasync,
+@@ -378,6 +418,7 @@ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
+ 	uobj = cq->uobject;
+ 
+ 	entry->desc.comp.cq_handle = cq->uobject->uevent.uobject.user_handle;
++	entry->desc.comp.flag		= 1;
+ 	entry->counter		   = &uobj->comp_events_reported;
+ 
+ 	list_add_tail(&entry->list, &ev_queue->event_list);
+@@ -930,6 +971,9 @@ static int ib_uverbs_open(struct inode *inode, struct file *filp)
+ 		goto err;
+ 	}
+ 
++	file->ufile_proc_ent = NULL;
++	file->task_node = NULL;
++
+ 	file->device	 = dev;
+ 	kref_init(&file->ref);
+ 	mutex_init(&file->ucontext_lock);
+@@ -962,10 +1006,15 @@ err:
+ 	return ret;
+ }
+ 
++#include "rdma_footprint.h"
++
+ static int ib_uverbs_close(struct inode *inode, struct file *filp)
+ {
+ 	struct ib_uverbs_file *file = filp->private_data;
+ 
++//	ufile_dealloc_mapping(file);
++	deregister_rdma_dev_fd_entry(file);
++
+ 	uverbs_destroy_ufile_hw(file, RDMA_REMOVE_CLOSE);
+ 
+ 	mutex_lock(&file->device->lists_mutex);
+@@ -1105,6 +1154,9 @@ static int ib_uverbs_add_one(struct ib_device *device)
+ 	struct ib_uverbs_device *uverbs_dev;
+ 	int ret;
+ 
++	device->proc_ent = NULL;
++	device->uwrite_proc_ent = NULL;
++	device->qpn_dict = NULL;
+ 	if (!device->ops.alloc_ucontext)
+ 		return -EOPNOTSUPP;
+ 
+@@ -1159,6 +1211,12 @@ static int ib_uverbs_add_one(struct ib_device *device)
+ 	ret = cdev_device_add(&uverbs_dev->cdev, &uverbs_dev->dev);
+ 	if (ret)
+ 		goto err_uapi;
++	
++	ret = mkdir_ibdev_sig_link(device);
++	if(ret) {
++		cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
++		goto err_uapi;
++	}
+ 
+ 	ib_set_client_data(device, &uverbs_client, uverbs_dev);
+ 	return 0;
+@@ -1210,6 +1268,7 @@ static void ib_uverbs_remove_one(struct ib_device *device, void *client_data)
+ 	struct ib_uverbs_device *uverbs_dev = client_data;
+ 	int wait_clients = 1;
+ 
++	rmdir_ibdev_sig_link(device);
+ 	cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
+ 	ida_free(&uverbs_ida, uverbs_dev->devnum);
+ 
+@@ -1285,6 +1344,13 @@ static int __init ib_uverbs_init(void)
+ 		goto out_class;
+ 	}
+ 
++	ret = rdma_footprint_init();
++	if(ret) {
++		pr_err("user_verbs: couldn't init footprint\n");
++		ib_unregister_client(&uverbs_client);
++		goto out_class;
++	}
++
+ 	return 0;
+ 
+ out_class:
+@@ -1304,6 +1370,7 @@ out:
+ 
+ static void __exit ib_uverbs_cleanup(void)
+ {
++	rdma_footprint_exit();
+ 	ib_unregister_client(&uverbs_client);
+ 	class_destroy(uverbs_class);
+ 	unregister_chrdev_region(IB_UVERBS_BASE_DEV,
+diff --git a/drivers/infiniband/core/uverbs_std_types.c b/drivers/infiniband/core/uverbs_std_types.c
+index 08c39cf..240f598 100644
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -122,6 +122,9 @@ static int uverbs_free_pd(struct ib_uobject *uobject,
+ 	if (ret)
+ 		return ret;
+ 
++	unregister_pd_handle_mapping(attrs->ufile, pd);
++	deregister_pd_from_footprint(pd);
++
+ 	ib_dealloc_pd_user(pd, &attrs->driver_udata);
+ 	return 0;
+ }
+@@ -159,6 +162,7 @@ uverbs_completion_event_file_destroy_uobj(struct ib_uobject *uobj,
+ 			     uobj);
+ 
+ 	ib_uverbs_free_event_queue(&file->ev_queue);
++	deregister_uverbs_completion_event_file_from_footprint(file);
+ 	return 0;
+ }
+ 
+@@ -174,7 +178,7 @@ DECLARE_UVERBS_NAMED_OBJECT(
+ 			     uverbs_completion_event_file_destroy_uobj,
+ 			     &uverbs_event_fops,
+ 			     "[infinibandevent]",
+-			     O_RDONLY));
++			     O_RDWR));
+ 
+ DECLARE_UVERBS_NAMED_METHOD_DESTROY(
+ 	UVERBS_METHOD_MW_DESTROY,
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index b1c7dac..560ce5e 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -33,6 +33,7 @@
+ #include <rdma/uverbs_std_types.h>
+ #include "rdma_core.h"
+ #include "uverbs.h"
++#include "rdma_footprint.h"
+ 
+ static int uverbs_free_cq(struct ib_uobject *uobject,
+ 			  enum rdma_remove_reason why,
+@@ -44,6 +45,10 @@ static int uverbs_free_cq(struct ib_uobject *uobject,
+ 		container_of(uobject, struct ib_ucq_object, uevent.uobject);
+ 	int ret;
+ 
++	unregister_cq_handle_mapping(attrs->ufile, cq);
++	deregister_cq_from_footprint(cq);
++	deregister_cq_from_uwrite_footprint(cq);
++
+ 	ret = ib_destroy_cq_user(cq, &attrs->driver_udata);
+ 	if (ib_is_destroy_retryable(ret, why, uobject))
+ 		return ret;
+diff --git a/drivers/infiniband/core/uverbs_std_types_device.c b/drivers/infiniband/core/uverbs_std_types_device.c
+index 626fce3..5c661ea 100644
+--- a/drivers/infiniband/core/uverbs_std_types_device.c
++++ b/drivers/infiniband/core/uverbs_std_types_device.c
+@@ -207,6 +207,413 @@ static int UVERBS_HANDLER(UVERBS_METHOD_QUERY_PORT)(
+ 					     &resp, sizeof(resp));
+ }
+ 
++#include "rdma_footprint.h"
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_QPN_DICT)(
++				struct uverbs_attr_bundle *attrs) {
++	int real_qpn, vqpn;
++	int ret;
++	uint32_t *qpn_dict;
++
++	ret = uverbs_copy_from(&real_qpn, attrs, 0);
++	ret = uverbs_copy_from(&vqpn, attrs, 1);
++	if(ret)
++		return ret;
++
++	qpn_dict = attrs->ufile->device->ib_dev->qpn_dict;
++	qpn_dict[real_qpn] = vqpn;
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_FOOTPRINT)(
++				struct uverbs_attr_bundle *attrs) {
++	int cmd_fd;
++	int ret;
++
++	ret = uverbs_copy_from(&cmd_fd, attrs, UVERBS_ATTR_FOOTPRINT_IN_FD);
++	if(ret)
++		return ret;
++	
++	ret = register_rdma_dev_fd_entry(cmd_fd, attrs->ufile);
++	if(ret)
++		return ret;
++
++	return ufile_alloc_mapping(attrs->ufile);
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_CTX_RESP)(
++				struct uverbs_attr_bundle *attrs) {
++	char __user *buf;
++	size_t size;
++	int ret;
++
++	ret = uverbs_copy_from(&buf, attrs, UVERBS_ATTR_RESP_PTR);
++	if(ret)
++		return ret;
++	
++	ret = uverbs_copy_from(&size, attrs, UVERBS_ATTR_RESP_SZ);
++	if(ret)
++		return ret;
++
++	return install_ctx_resp(attrs->ufile, buf, size);
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	struct ib_mr *mr;
++	struct ib_uobject *uobj;
++	int vhandle, handle;
++	int ret;
++
++	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++
++	uobj = uobj_get_write(UVERBS_OBJECT_MR, handle, attrs);
++	if(IS_ERR(uobj))
++		return PTR_ERR(uobj);
++	mr = uobj->object;
++
++	ret = register_mr_to_footprint(mr, mr->pd, vhandle);
++	if(ret) {
++		uobj_put_write(uobj);
++		return ret;
++	}
++
++	ret = register_mr_to_uwrite_footprint(mr, attrs->ufile, vhandle);
++	if(ret) {
++		uobj_put_write(uobj);
++		return ret;
++	}
++
++	ret = register_mr_handle_mapping(attrs->ufile, mr, vhandle, handle);
++	if(ret) {
++		uobj_put_write(uobj);
++		return ret;
++	}
++
++	uobj_put_write(uobj);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING)(
++					struct uverbs_attr_bundle *attrs) {
++	struct ib_srq *srq;
++	int vhandle, handle;
++	int ret;
++
++	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++
++	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, handle, attrs);
++	if(!srq || srq->srq_type == IB_SRQT_XRC) {
++		if(srq) {
++			rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
++									UVERBS_LOOKUP_READ);
++		}
++		return -EINVAL;
++	}
++
++	ret = register_srq_to_footprint(srq, srq->pd, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
++									UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	ret = register_srq_handle_mapping(attrs->ufile, srq, vhandle, handle);
++	if(ret) {
++		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
++									UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	srq->vhandle = vhandle;
++
++	ret = register_srq_to_uwrite_footprint(srq, attrs->ufile, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
++									UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
++								UVERBS_LOOKUP_READ);
++	return 0;
++ }
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING)(
++					struct uverbs_attr_bundle *attrs) {
++	struct ib_qp *qp;
++	int vhandle, handle;
++	int ret;
++
++	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++	
++	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, handle, attrs);
++	if(!qp)
++		return -EINVAL;
++
++	ret = register_qp_to_footprint(qp, qp->pd, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
++								UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	qp->cmd_fd = attrs->ufile->cmd_fd;
++
++	ret = register_qp_handle_mapping(attrs->ufile, qp, vhandle, handle);
++	if(ret) {
++		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
++								UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	qp->vhandle = vhandle;
++
++	ret = register_qp_to_uwrite_footprint(qp, attrs->ufile, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
++								UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
++						UVERBS_LOOKUP_READ);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	struct ib_pd *pd;
++	int vhandle, handle;
++	int ret;
++
++	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++	
++	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, handle, attrs);
++	if(!pd) {
++		return -EINVAL;
++	}
++
++	ret = register_pd_to_footprint(pd, attrs->ufile, vhandle);
++	if(ret) {
++		uobj_put_obj_read(pd);
++		return ret;
++	}
++
++	ret = register_pd_handle_mapping(attrs->ufile, pd, vhandle, handle);
++	if(ret) {
++		uobj_put_obj_read(pd);
++		return ret;
++	}
++
++	uobj_put_obj_read(pd);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	struct ib_cq *cq;
++	int vhandle, handle;
++	int ret;
++
++	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++	
++	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, handle, attrs);
++	if(!cq) {
++		return -EINVAL;
++	}
++
++	cq->comp_fd = cq->cq_context?
++						container_of(cq->cq_context, struct ib_uverbs_completion_event_file,
++								ev_queue)->comp_fd : -1;
++
++	ret = register_cq_to_footprint(cq, attrs->ufile, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
++						UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	ret = register_cq_to_uwrite_footprint(cq, attrs->ufile, vhandle);
++	if(ret) {
++		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
++						UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	ret = register_cq_handle_mapping(attrs->ufile, cq, vhandle, handle);
++	if(ret) {
++		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
++						UVERBS_LOOKUP_READ);
++		return ret;
++	}
++
++	rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
++						UVERBS_LOOKUP_READ);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LQPN_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vqpn, qpn;
++	int ret;
++
++	ret = uverbs_copy_from(&vqpn, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&qpn, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++
++#if 0
++	if(update_lqpn_mapping(attrs->ufile, vqpn, qpn))
++		return add_lqpn_mapping(attrs->ufile, vqpn, qpn);
++	else
++		return 0;
++#endif
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LKEY_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vlkey, lkey;
++	int ret;
++	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
++
++	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&lkey, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++
++	lkey_arr[vlkey] = lkey;
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vrkey, rkey;
++	int ret;
++	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
++
++	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
++	ret = uverbs_copy_from(&rkey, attrs, UVERBS_ATTR_HANDLE);
++	if(ret)
++		return ret;
++
++	rkey_arr[vrkey] = rkey;
++	return service_register_rkey_mapping(current->tgid, vrkey, rkey);
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vrkey;
++	int ret;
++	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
++
++	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
++	if(ret)
++		return ret;
++
++	rkey_arr[vrkey] = 0;
++	return service_delete_rkey_mapping(current->tgid, vrkey);
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LQPN_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vqpn;
++	int ret;
++
++	ret = uverbs_copy_from(&vqpn, attrs, UVERBS_ATTR_VHANDLE);
++	if(ret)
++		return ret;
++	
++//	del_lqpn_mapping(attrs->ufile, vqpn);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LKEY_MAPPING)(
++				struct uverbs_attr_bundle *attrs) {
++	uint32_t vlkey;
++	int ret;
++	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
++
++	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
++	if(ret)
++		return ret;
++
++	lkey_arr[vlkey] = 0;
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_REGISTER_REMOTE_GID_PID)(
++				struct uverbs_attr_bundle *attrs) {
++	union ib_gid gid;
++	pid_t pid;
++	int ret;
++
++	ret = uverbs_copy_from(&gid, attrs, 0);
++	ret = uverbs_copy_from(&pid, attrs, 1);
++	if(ret)
++		return ret;
++
++	return register_remote_rkey_mapping(attrs->ufile, &gid, pid);
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_GET_LOCAL_RDMA_PID)(
++				struct uverbs_attr_bundle *attrs) {
++	pid_t rdma_pid = current->tgid;
++	return uverbs_copy_to(attrs, 0, &rdma_pid, sizeof(rdma_pid));
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD)(
++				struct uverbs_attr_bundle *attrs) {
++	struct ib_uobject *ev_file_uobj;
++	struct ib_uverbs_completion_event_file *ev_file;
++
++	ev_file_uobj = uverbs_attr_get_uobject(attrs, 0);
++	if(IS_ERR(ev_file_uobj)) {
++		return PTR_ERR(ev_file_uobj);
++	}
++
++	uverbs_uobject_get(ev_file_uobj);
++
++	ev_file = container_of(ev_file_uobj,
++					struct ib_uverbs_completion_event_file, uobj);
++	if(ev_file->uobj.id != ev_file->comp_fd) {
++		deregister_uverbs_completion_event_file_from_footprint(ev_file);
++		ev_file->comp_fd = ev_file->uobj.id;
++		register_uverbs_completion_event_file_to_footprint(ev_file, attrs->ufile, ev_file->comp_fd);
++	}
++
++	uverbs_uobject_put(ev_file_uobj);
++	return 0;
++}
++
++static int UVERBS_HANDLER(UVERBS_METHOD_REGISTER_ASYNC_FD)(
++				struct uverbs_attr_bundle *attrs) {
++	int async_fd;
++	int ret;
++
++	ret = uverbs_copy_from(&async_fd, attrs, UVERBS_ATTR_FOOTPRINT_IN_FD);
++	if(ret)
++		return ret;
++	
++	return register_async_fd(attrs->ufile, async_fd);
++}
++
+ static int UVERBS_HANDLER(UVERBS_METHOD_GET_CONTEXT)(
+ 	struct uverbs_attr_bundle *attrs)
+ {
+@@ -430,6 +837,118 @@ out:
+ 	return ret;
+ }
+ 
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_FOOTPRINT,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FOOTPRINT_IN_FD,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_QPN_DICT,
++	UVERBS_ATTR_PTR_IN(0,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(1,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_CTX_RESP,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESP_PTR,
++				UVERBS_ATTR_TYPE(__aligned_u64), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESP_SZ,
++				UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_REGISTER_ASYNC_FD,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FOOTPRINT_IN_FD,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_LQPN_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_LKEY_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_DELETE_LQPN_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_DELETE_LKEY_MAPPING,
++	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_GET_LOCAL_RDMA_PID,
++	UVERBS_ATTR_PTR_OUT(0,
++				UVERBS_ATTR_TYPE(pid_t), UA_MANDATORY));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD,
++	UVERBS_ATTR_FD(0, UVERBS_OBJECT_COMP_CHANNEL,
++			UVERBS_ACCESS_READ, UA_OPTIONAL));
++
++DECLARE_UVERBS_NAMED_METHOD(
++	UVERBS_METHOD_REGISTER_REMOTE_GID_PID,
++	UVERBS_ATTR_PTR_IN(0,
++				UVERBS_ATTR_TYPE(union ib_gid), UA_MANDATORY),
++	UVERBS_ATTR_PTR_IN(1,
++				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
++
+ DECLARE_UVERBS_NAMED_METHOD(
+ 	UVERBS_METHOD_GET_CONTEXT,
+ 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_GET_CONTEXT_NUM_COMP_VECTORS,
+@@ -497,7 +1016,32 @@ DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_DEVICE,
+ 			      &UVERBS_METHOD(UVERBS_METHOD_QUERY_GID_TABLE),
+ 			      &UVERBS_METHOD(UVERBS_METHOD_QUERY_GID_ENTRY));
+ 
++DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_FOOTPRINT,
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_QPN_DICT),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_FOOTPRINT),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_CTX_RESP),
++				&UVERBS_METHOD(UVERBS_METHOD_REGISTER_ASYNC_FD),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LQPN_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LKEY_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LQPN_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LKEY_MAPPING),
++				&UVERBS_METHOD(UVERBS_METHOD_REGISTER_REMOTE_GID_PID),
++				&UVERBS_METHOD(UVERBS_METHOD_GET_LOCAL_RDMA_PID),
++				&UVERBS_METHOD(UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD));
++
+ const struct uapi_definition uverbs_def_obj_device[] = {
+ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_DEVICE),
+ 	{},
+ };
++
++const struct uapi_definition uverbs_def_obj_footprint[] = {
++	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_FOOTPRINT),
++	{},
++};
+diff --git a/drivers/infiniband/core/uverbs_std_types_mr.c b/drivers/infiniband/core/uverbs_std_types_mr.c
+index bee533b..20dc6a6 100644
+--- a/drivers/infiniband/core/uverbs_std_types_mr.c
++++ b/drivers/infiniband/core/uverbs_std_types_mr.c
+@@ -33,11 +33,15 @@
+ #include "rdma_core.h"
+ #include "uverbs.h"
+ #include <rdma/uverbs_std_types.h>
++#include "rdma_footprint.h"
+ 
+ static int uverbs_free_mr(struct ib_uobject *uobject,
+ 			  enum rdma_remove_reason why,
+ 			  struct uverbs_attr_bundle *attrs)
+ {
++	unregister_mr_handle_mapping(attrs->ufile, (struct ib_mr *)uobject->object);
++	deregister_mr_from_footprint((struct ib_mr *)uobject->object);
++	deregister_mr_from_uwrite_footprint((struct ib_mr *)uobject->object);
+ 	return ib_dereg_mr_user((struct ib_mr *)uobject->object,
+ 				&attrs->driver_udata);
+ }
+diff --git a/drivers/infiniband/core/uverbs_std_types_qp.c b/drivers/infiniband/core/uverbs_std_types_qp.c
+index 3bf8dcd..3596ac3 100644
+--- a/drivers/infiniband/core/uverbs_std_types_qp.c
++++ b/drivers/infiniband/core/uverbs_std_types_qp.c
+@@ -7,6 +7,7 @@
+ #include "rdma_core.h"
+ #include "uverbs.h"
+ #include "core_priv.h"
++#include "rdma_footprint.h"
+ 
+ static int uverbs_free_qp(struct ib_uobject *uobject,
+ 			  enum rdma_remove_reason why,
+@@ -17,6 +18,10 @@ static int uverbs_free_qp(struct ib_uobject *uobject,
+ 		container_of(uobject, struct ib_uqp_object, uevent.uobject);
+ 	int ret;
+ 
++	unregister_qp_handle_mapping(attrs->ufile, qp);
++	deregister_qp_from_footprint(qp);
++	deregister_qp_from_uwrite_footprint(qp);
++
+ 	/*
+ 	 * If this is a user triggered destroy then do not allow destruction
+ 	 * until the user cleans up all the mcast bindings. Unlike in other
+diff --git a/drivers/infiniband/core/uverbs_uapi.c b/drivers/infiniband/core/uverbs_uapi.c
+index 5addc8f..07daae1 100644
+--- a/drivers/infiniband/core/uverbs_uapi.c
++++ b/drivers/infiniband/core/uverbs_uapi.c
+@@ -630,6 +630,7 @@ static const struct uapi_definition uverbs_core_api[] = {
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_counters),
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_cq),
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_device),
++	UAPI_DEF_CHAIN(uverbs_def_obj_footprint),
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_dm),
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_flow_action),
+ 	UAPI_DEF_CHAIN(uverbs_def_obj_intf),
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index a937ca9..a701c53 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -751,9 +751,13 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 		return err;
+ 	}
+ 
++	cq->ibcq.buf_addr = ucmd.buf_addr;
++
+ 	err = mlx5_ib_db_map_user(context, udata, ucmd.db_addr, &cq->db);
+ 	if (err)
+ 		goto err_umem;
++	
++	cq->ibcq.db_addr = ucmd.db_addr;
+ 
+ 	mlx5_ib_cont_pages(cq->buf.umem, ucmd.buf_addr, 0, &npages, &page_shift,
+ 			   &ncont, NULL);
+@@ -1342,6 +1346,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+ 		ib_umem_release(cq->buf.umem);
+ 		cq->buf.umem = cq->resize_umem;
+ 		cq->resize_umem = NULL;
++		cq->ibcq.buf_addr = cq->buf.umem->address;
+ 	} else {
+ 		struct mlx5_ib_cq_buf tbuf;
+ 		int resized = 0;
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index cffa6d7..800d87a 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1138,6 +1138,7 @@ static void set_mr_fields(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr,
+ 	mr->ibmr.rkey = mr->mmkey.key;
+ 	mr->ibmr.length = length;
+ 	mr->access_flags = access_flags;
++	mr->ibmr.access_flags = access_flags;
+ 	mr->dev = dev;
+ }
+ 
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 5b97345..7c86dfa 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1103,6 +1103,8 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 		ubuffer->umem = NULL;
+ 	}
+ 
++	qp->ibqp.buf_addr = ucmd->buf_addr;
++
+ 	*inlen = MLX5_ST_SZ_BYTES(create_qp_in) +
+ 		 MLX5_FLD_SZ_BYTES(create_qp_in, pas[0]) * ncont;
+ 	*in = kvzalloc(*inlen, GFP_KERNEL);
+@@ -1135,6 +1137,8 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 		goto err_free;
+ 	}
+ 
++	qp->ibqp.db_addr = ucmd->db_addr;
++
+ 	return 0;
+ 
+ err_free:
+@@ -3228,6 +3232,8 @@ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attr,
+ 		err = get_qp_uidx(qp, &params);
+ 		if (err)
+ 			goto free_qp;
++		
++		qp->ibqp.usr_idx = params.uidx;
+ 	}
+ 	err = process_create_flags(dev, qp, attr);
+ 	if (err)
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index de4d02d..d4f272e 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1559,6 +1559,9 @@ struct ib_pd {
+ 
+ 	u32			unsafe_global_rkey;
+ 
++	struct proc_dir_entry			*pd_proc_ent;
++	void							*pd_map_ent;
++
+ 	/*
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+@@ -1593,6 +1596,11 @@ enum ib_poll_context {
+ 	IB_POLL_DIRECT,		   /* caller context, no hw completions */
+ };
+ 
++#define declare_uwrite_info_member(info_type, info_name)									\
++	info_type				info_name;														\
++	wait_queue_head_t		info_name##_wait_queue;											\
++	int						info_name##_wait_flag
++
+ struct ib_cq {
+ 	struct ib_device       *device;
+ 	struct ib_ucq_object   *uobject;
+@@ -1618,12 +1626,23 @@ struct ib_cq {
+ 	u8 shared:1;
+ 	unsigned int comp_vector;
+ 
++	struct proc_dir_entry		*cq_proc_ent;
++	struct proc_dir_entry		*cq_proc_uwrite_ent;
++	void						*cq_map_ent;
++	int							comp_fd;
++
++	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
++	declare_uwrite_info_member(__aligned_u64, buf_addr);
++	declare_uwrite_info_member(__aligned_u64, db_addr);
++
+ 	/*
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+ 	struct rdma_restrack_entry res;
+ };
+ 
++typedef char char_24[24];
++
+ struct ib_srq {
+ 	struct ib_device       *device;
+ 	struct ib_pd	       *pd;
+@@ -1642,6 +1661,16 @@ struct ib_srq {
+ 			} xrc;
+ 		};
+ 	} ext;
++
++	int vhandle;
++	struct proc_dir_entry			*srq_proc_ent;
++	struct proc_dir_entry			*srq_proc_uwrite_ent;
++	void							*srq_map_ent;
++
++	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
++	declare_uwrite_info_member(__aligned_u64, buf_addr);
++	declare_uwrite_info_member(__aligned_u64, db_addr);
++	declare_uwrite_info_member(char_24, srq_init_attr);
+ };
+ 
+ enum ib_raw_packet_caps {
+@@ -1768,6 +1797,9 @@ struct ib_qp_security {
+ 	int			error_comps_pending;
+ };
+ 
++typedef char char_64[64];
++typedef char char_144[144];
++
+ /*
+  * @max_write_sge: Maximum SGE elements per RDMA WRITE request.
+  * @max_read_sge:  Maximum SGE elements per RDMA READ request.
+@@ -1803,6 +1835,41 @@ struct ib_qp {
+ 	struct ib_qp_security  *qp_sec;
+ 	u32			port;
+ 
++	struct proc_dir_entry			*qp_proc_ent;
++	struct proc_dir_entry			*qp_proc_uwrite_ent;
++	void							*qp_map_ent;
++
++	declare_uwrite_info_member(enum ib_qp_state, cur_qp_state);
++	int32_t							usr_idx;
++	union ib_gid					rc_dest_gid;
++
++	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
++	declare_uwrite_info_member(__aligned_u64, buf_addr);
++	declare_uwrite_info_member(__aligned_u64, db_addr);
++	declare_uwrite_info_member(u32, send_cur_post);
++	declare_uwrite_info_member(u32, recv_head);
++	declare_uwrite_info_member(u32, recv_tail);
++	declare_uwrite_info_member(__u32, send_cq_handle);
++	declare_uwrite_info_member(__u32, recv_cq_handle);
++	declare_uwrite_info_member(char_64, init_attr);
++	declare_uwrite_info_member(char_144, attr_0);
++	declare_uwrite_info_member(char_144, attr_1);
++	declare_uwrite_info_member(char_144, attr_2);
++	declare_uwrite_info_member(__u32, mask_0);
++	declare_uwrite_info_member(__u32, mask_1);
++	declare_uwrite_info_member(__u32, mask_2);
++	declare_uwrite_info_member(__aligned_u64, bf_uar_addr);
++	declare_uwrite_info_member(u32, vqpn);
++	declare_uwrite_info_member(u32, signal_fd);
++	declare_uwrite_info_member(union ib_gid, rc_dest_pgid);
++	declare_uwrite_info_member(u32, dest_pqpn);
++
++	wait_queue_head_t				signal_pause_wait_queue;
++	int								signal_pause_wait_flag;
++
++	int				vhandle;
++	int				cmd_fd;
++
+ 	bool			integrity_en;
+ 	/*
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+@@ -1829,6 +1896,7 @@ struct ib_mr {
+ 	u64		   iova;
+ 	u64		   length;
+ 	unsigned int	   page_size;
++	int			access_flags;
+ 	enum ib_mr_type	   type;
+ 	bool		   need_inval;
+ 	union {
+@@ -1836,6 +1904,13 @@ struct ib_mr {
+ 		struct list_head	qp_entry;	/* FR */
+ 	};
+ 
++	struct proc_dir_entry	*mr_proc_ent;
++	struct proc_dir_entry	*mr_proc_uwrite_ent;
++	void					*mr_map_ent;
++
++	declare_uwrite_info_member(u32, vlkey);
++	declare_uwrite_info_member(u32, vrkey);
++
+ 	struct ib_dm      *dm;
+ 	struct ib_sig_attrs *sig_attrs; /* only for IB_MR_TYPE_INTEGRITY MRs */
+ 	/*
+@@ -2689,6 +2764,8 @@ struct ib_core_device {
+ 	struct ib_device *owner; /* reach back to owner ib_device */
+ };
+ 
++#include <linux/proc_fs.h>
++
+ struct rdma_restrack_root;
+ struct ib_device {
+ 	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+@@ -2697,6 +2774,10 @@ struct ib_device {
+ 	char                          name[IB_DEVICE_NAME_MAX];
+ 	struct rcu_head rcu_head;
+ 
++	struct proc_dir_entry			*proc_ent;
++	struct proc_dir_entry			*uwrite_proc_ent;
++	void							*qpn_dict;
++
+ 	struct list_head              event_handler_list;
+ 	/* Protects event_handler_list */
+ 	struct rw_semaphore event_handler_rwsem;
+diff --git a/include/uapi/rdma/ib_user_ioctl_cmds.h b/include/uapi/rdma/ib_user_ioctl_cmds.h
+index 7968a18..562db96 100644
+--- a/include/uapi/rdma/ib_user_ioctl_cmds.h
++++ b/include/uapi/rdma/ib_user_ioctl_cmds.h
+@@ -57,6 +57,7 @@ enum uverbs_default_objects {
+ 	UVERBS_OBJECT_DM,
+ 	UVERBS_OBJECT_COUNTERS,
+ 	UVERBS_OBJECT_ASYNC_EVENT,
++	UVERBS_OBJECT_FOOTPRINT,
+ };
+ 
+ enum {
+@@ -350,6 +351,41 @@ enum uverbs_method_async_event {
+ 	UVERBS_METHOD_ASYNC_EVENT_ALLOC,
+ };
+ 
++enum uverbs_method_rdma_footprint {
++	UVERBS_METHOD_INSTALL_FOOTPRINT,
++	UVERBS_METHOD_INSTALL_CTX_RESP,
++	UVERBS_METHOD_REGISTER_ASYNC_FD,
++	UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING,
++	UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING,
++	UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING,
++	UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING,
++	UVERBS_METHOD_INSTALL_QPN_DICT,
++	UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING,
++	UVERBS_METHOD_INSTALL_LQPN_MAPPING,
++	UVERBS_METHOD_INSTALL_LKEY_MAPPING,
++	UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING,
++	UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING,
++	UVERBS_METHOD_DELETE_LQPN_MAPPING,
++	UVERBS_METHOD_DELETE_LKEY_MAPPING,
++	UVERBS_METHOD_REGISTER_REMOTE_GID_PID,
++	UVERBS_METHOD_GET_LOCAL_RDMA_PID,
++	UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD,
++};
++
++enum uverbs_attrs_install_footprint {
++	UVERBS_ATTR_FOOTPRINT_IN_FD,
++};
++
++enum uverbs_attrs_install_ctx_resp {
++	UVERBS_ATTR_RESP_PTR,
++	UVERBS_ATTR_RESP_SZ,
++};
++
++enum uverbs_attr_install_handle_mapping {
++	UVERBS_ATTR_VHANDLE,
++	UVERBS_ATTR_HANDLE,
++};
++
+ enum uverbs_attrs_async_event_create {
+ 	UVERBS_ATTR_ASYNC_EVENT_ALLOC_FD_HANDLE,
+ };
+diff --git a/include/uapi/rdma/ib_user_verbs.h b/include/uapi/rdma/ib_user_verbs.h
+index 0474c74..352114a 100644
+--- a/include/uapi/rdma/ib_user_verbs.h
++++ b/include/uapi/rdma/ib_user_verbs.h
+@@ -124,6 +124,7 @@ struct ib_uverbs_async_event_desc {
+ 
+ struct ib_uverbs_comp_event_desc {
+ 	__aligned_u64 cq_handle;
++	__u64			flag;
+ };
+ 
+ struct ib_uverbs_cq_moderation_caps {
