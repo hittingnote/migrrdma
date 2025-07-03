@@ -1,0 +1,4 @@
+*.tar.gz
+*.tgz
+*.swp
+MLNX_OFED_LINUX*
