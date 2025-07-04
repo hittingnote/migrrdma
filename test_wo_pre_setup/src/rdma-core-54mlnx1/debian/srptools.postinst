@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Error handler for init script errors
+srptools_error_handler() {
+	echo "$0: It seems the srp_daemon failed. But moving on anyway"
+}
+
+#DEBHELPER#
+
+if [ "$1" = "configure" ]; then
+    # we ship udev rules, so trigger an update. This has to be done after
+    # DEBHELPER restarts systemd to get our new service files loaded.
+    udevadm trigger --subsystem-match=infiniband_mad --action=change || true
+fi
