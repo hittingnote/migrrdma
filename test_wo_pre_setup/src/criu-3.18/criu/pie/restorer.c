@@ -2206,6 +2206,7 @@ long __export_restore_task(struct task_restore_args *args)
 			return -1;
 		}
 	}
+	pr_info("Full restore RDMA finish\n");
 
 	sys_munmap(args->rst_mem, args->rst_mem_size);
 

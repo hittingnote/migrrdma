@@ -1003,10 +1003,13 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 skip_hook:
 	sprintf(ta->images_dir, "%.127s", images_dir);
 
+	pr_info("Start to pre-restore RDMA\n");
 	if(restore_rdma(pid, images_dir)) {
 		pr_err("restore_rdma failed. errno: %d\n", errno);
 		return -1;
 	}
+	pr_info("Pre-restore RDMA finish\n");
+
 	if (prepare_fds(current))
 		return -1;
 
@@ -2231,7 +2234,11 @@ static int restore_task_with_children(void *_arg)
 
 		close(sock);
 	}
+#endif
 
+	pr_info("Full restore starts.\n");
+
+#if 0
 	{
 		char *sockname;
 		char buf[32];

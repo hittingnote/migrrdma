@@ -2220,6 +2220,8 @@ int cr_dump_tasks(pid_t pid)
 	{
 		char args[4][256];
 		char *argvs[4];
+
+		pr_info("Start to dump RDMA\n");
 		sprintf(args[1], "%d", root_item->pid->real);
 		sprintf(args[2], "%.110s", images_dir);
 		sprintf(args[3], "192.168.2.15");
@@ -2230,6 +2232,7 @@ int cr_dump_tasks(pid_t pid)
 		if(rdma_plugin_main(4, argvs)) {
 			goto err;
 		}
+		pr_info("Dump RDMA finish\n");
 	}
 
 	for_each_pstree_item(item) {
