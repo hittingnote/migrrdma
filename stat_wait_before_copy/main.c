@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include "rbtree.h"
 
 static inline double get_timestamp(char *strln) {
 	double ret;
@@ -71,8 +72,12 @@ static struct pid_to_range_node *add_pid_to_range_node(pid_t pid) {
 static struct pid_to_range_node *get_pid_to_range_node(pid_t pid) {
 	struct pid_to_range_node *ent;
 
-	ent = search_pid_range_node(pid, &parent, &insert);
+	ent = search_pid_range_node(pid, NULL, NULL);
 	return ent;
+}
+
+static inline void parse_raw_str(char *s1, char *s2, char *s3, const char *strln) {
+	sscanf(strln, "%s%s%s", s1, s2, s3);
 }
 
 int main(int argc, char *argv[]) {
@@ -146,12 +151,16 @@ int main(int argc, char *argv[]) {
 		struct pid_to_range_node *node;
 		pid_t pid;
 		double start;
+		char str[4][256];
 
 		if(!strstr(strln, "metadata")) {
 			continue;
 		}
 
-		sscanf(strln, "%lf%d", &start, &pid);
+		parse_raw_str(str[0], str[1], str[2]);
+		sscanf(str[0], "%lf", &start);
+		sscanf(str[2], "%d", &pid);
+
 		if(pid == 1) {
 			continue;
 		}
@@ -175,7 +184,10 @@ int main(int argc, char *argv[]) {
 			continue;
 		}
 
-		sscanf(strln, "%lf%d", &end, &pid);
+		parse_raw_str(str[0], str[1], str[2]);
+		sscanf(str[0], "%lf", &end);
+		sscanf(str[2], "%d", &pid);
+
 		if(pid == 1) {
 			continue;
 		}
