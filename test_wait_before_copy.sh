@@ -17,8 +17,9 @@ get_exec_pid() {
 
 mkdir /dev/shm/dump /dev/shm/dumprdma /dev/shm/restorerdma/ /dev/shm/workpath
 
-docker run -d --name test --hostname test --ulimit nofile=32768:32768 --net=host --device=/dev/infiniband/ --cap-add=ALL --privileged -v /dev/shm/:/dev/shm/ -v /dev/null/:/dev/null/ ubuntu2004:rdma $@
+docker run -d --name test --hostname test --ulimit nofile=32768:32768 --net=host --device=/dev/infiniband/ --cap-add=ALL --privileged -v /dev/shm/:/dev/shm/ -v /dev/null/:/dev/null/ ubuntu2004:rdma /init_proc
 
+docker exec -it test bash
 sleep 30
 
 docker run -d --name test1 --hostname test1 --ulimit nofile=32768:32768 --net=host --device=/dev/infiniband/ --cap-add=ALL --privileged -v /dev/shm/:/dev/shm/ -v /dev/null/:/dev/null/ ubuntu2004:rdma /init_proc
@@ -90,14 +91,14 @@ runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.container
 
 checkpoint_time_raw=`cat /dev/shm/dump_*.log | tail -n 1 | awk -F '[()]+' '{print $2}'`
 checkpoint_time=`echo "scale=3; $checkpoint_time_raw * 1000.0" | bc`
-start_raw=`cat /dev/shm/restore*.log | grep "Full restore" | awk -F '[()]+' '{print $2}'`
+start_raw=`cat /dev/shm/restore*.log | grep "Full restore" | awk -F '[()]+' '{print $2}' | head -n 1`
 start=`echo "scale=3; $start_raw * 1000.0" | bc`
 end_raw=`cat /dev/shm/restore*.log | tail -n 1 | awk -F '[()]+' '{print $2}'`
 end=`echo "scale=3; $end_raw * 1000.0" | bc`
 restore_time_total=`echo "scale=3; $end - $start" | bc`
-start_raw=`cat /dev/shm/restore*.log | grep "metadata" | awk -F '[()]+' '{print $2}'`
+start_raw=`cat /dev/shm/restore*.log | grep "metadata" | grep -v "pie: 1:" | awk -F '[()]+' '{print $2}'`
 start=`echo "scale=3; $start_raw * 1000.0" | bc`
-end_raw=`cat /dev/shm/restore*.log | grep "Restore RDMA communication" | awk -F '[()]+' '{print $2}'`
+end_raw=`cat /dev/shm/restore*.log | grep "Restore RDMA communication" | grep -v "pie: 1:" | awk -F '[()]+' '{print $2}'`
 end=`echo "scale=3; $end_raw * 1000.0" | bc`
 restore_comm=`echo "scale=3; $end - $start" | bc`
 restore_time=`echo "scale=3; $restore_time_total - $restore_comm" | bc`

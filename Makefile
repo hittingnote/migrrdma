@@ -1,4 +1,4 @@
-utils:=init_proc migrrdma_daemon prerestore rdma_plugin
+utils:=init_proc migrrdma_daemon prerestore rdma_plugin fork
 
 all:
 	@for i in $(utils); do \

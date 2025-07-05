@@ -5,6 +5,7 @@ docker run -d --name test --hostname test --net=host --device=/dev/infiniband/ -
 docker cp MLNX_OFED_LINUX-5.4-1.0.3.0-ubuntu20.04-x86_64 test:/
 docker cp sources.list test:/etc/apt/
 docker cp init_proc/init_proc test:/
+docker cp fork/fork_perftest test:/
 
 docker exec test /bin/sh -c 'apt-get update; \
 	apt-get -y install iputils-ping net-tools build-essential wget git vim \
