@@ -14,7 +14,7 @@ index c856d0d..c6b4cd7 100644
  PROTOBUF_GEN := scripts/protobuf-gen.sh
  
 diff --git a/criu/cr-dump.c b/criu/cr-dump.c
-index 59d7d56..bff7701 100644
+index 59d7d56..62f9d70 100644
 --- a/criu/cr-dump.c
 +++ b/criu/cr-dump.c
 @@ -2100,6 +2100,8 @@ static int cr_dump_finish(int ret)
@@ -26,13 +26,15 @@ index 59d7d56..bff7701 100644
  int cr_dump_tasks(pid_t pid)
  {
  	InventoryEntry he = INVENTORY_ENTRY__INIT;
-@@ -2215,6 +2217,21 @@ int cr_dump_tasks(pid_t pid)
+@@ -2215,6 +2217,24 @@ int cr_dump_tasks(pid_t pid)
  	if (collect_and_suspend_lsm() < 0)
  		goto err;
  
 +	{
 +		char args[4][256];
 +		char *argvs[4];
++
++		pr_info("Start to dump RDMA\n");
 +		sprintf(args[1], "%d", root_item->pid->real);
 +		sprintf(args[2], "%.110s", images_dir);
 +		sprintf(args[3], "192.168.2.15");
@@ -43,16 +45,17 @@ index 59d7d56..bff7701 100644
 +		if(rdma_plugin_main(4, argvs)) {
 +			goto err;
 +		}
++		pr_info("Dump RDMA finish\n");
 +	}
 +
  	for_each_pstree_item(item) {
  		int fd;
  		char fname[128];
 diff --git a/criu/cr-restore.c b/criu/cr-restore.c
-index a94c508..ae65400 100644
+index a94c508..eed6bcc 100644
 --- a/criu/cr-restore.c
 +++ b/criu/cr-restore.c
-@@ -981,6 +981,32 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
+@@ -981,6 +981,35 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
  		content_p += up_align_four(ta->msg_arr[i].size);
  	}
  
@@ -78,14 +81,17 @@ index a94c508..ae65400 100644
 +skip_hook:
 +	sprintf(ta->images_dir, "%.127s", images_dir);
 +
++	pr_info("Start to pre-restore RDMA\n");
 +	if(restore_rdma(pid, images_dir)) {
 +		pr_err("restore_rdma failed. errno: %d\n", errno);
 +		return -1;
 +	}
++	pr_info("Pre-restore RDMA finish\n");
++
  	if (prepare_fds(current))
  		return -1;
  
-@@ -1319,6 +1345,7 @@ static int restore_one_helper(void)
+@@ -1319,6 +1348,7 @@ static int restore_one_helper(void)
  	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
  		close_service_fd(i);
  
@@ -93,7 +99,7 @@ index a94c508..ae65400 100644
  	{
  		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
  		struct sockaddr_un sock_un;
-@@ -1341,6 +1368,7 @@ static int restore_one_helper(void)
+@@ -1341,6 +1371,7 @@ static int restore_one_helper(void)
  
  		close(sock);
  	}
@@ -101,7 +107,7 @@ index a94c508..ae65400 100644
  
  	return 0;
  }
-@@ -1868,6 +1896,7 @@ static int create_children_and_session(void)
+@@ -1868,6 +1899,7 @@ static int create_children_and_session(void)
  	return 0;
  }
  
@@ -109,7 +115,7 @@ index a94c508..ae65400 100644
  static int init_server_unix_socket(char **p_sockname) {
  	struct sockaddr_un sock_un;
  	char sockname[1024];
-@@ -1905,6 +1934,7 @@ static int init_server_unix_socket(char **p_sockname) {
+@@ -1905,6 +1937,7 @@ static int init_server_unix_socket(char **p_sockname) {
  
  	return sock;
  }
@@ -117,7 +123,7 @@ index a94c508..ae65400 100644
  
  static int __stop_and_copy_update_core(struct pstree_item *item,
  						struct cr_clone_arg *ca) {
-@@ -1967,13 +1997,6 @@ int stop_and_copy_update_core(void *clone_arg) {
+@@ -1967,13 +2000,6 @@ int stop_and_copy_update_core(void *clone_arg) {
  	return __stop_and_copy_update_core(current, clone_arg);
  }
  
@@ -131,7 +137,7 @@ index a94c508..ae65400 100644
  static int restore_task_with_children(void *_arg)
  {
  	struct cr_clone_arg *ca = _arg;
-@@ -2142,6 +2165,7 @@ static int restore_task_with_children(void *_arg)
+@@ -2142,6 +2168,7 @@ static int restore_task_with_children(void *_arg)
  			goto err;
  	}
  
@@ -139,7 +145,7 @@ index a94c508..ae65400 100644
  	if(add_rdma_vma_node(pid)) {
  		goto err;
  	}
-@@ -2149,6 +2173,7 @@ static int restore_task_with_children(void *_arg)
+@@ -2149,6 +2176,7 @@ static int restore_task_with_children(void *_arg)
  	if(only_prepare_rdma_mappings(current)) {
  		goto err;
  	}
@@ -147,7 +153,7 @@ index a94c508..ae65400 100644
  
  	if (setup_newborn_fds(current))
  		goto err;
-@@ -2156,7 +2181,7 @@ static int restore_task_with_children(void *_arg)
+@@ -2156,7 +2184,7 @@ static int restore_task_with_children(void *_arg)
  	if (restore_task_mnt_ns(current))
  		goto err;
  
@@ -156,7 +162,7 @@ index a94c508..ae65400 100644
  		goto err;
  
  	if (prepare_sigactions(ca->core) < 0)
-@@ -2177,6 +2202,7 @@ static int restore_task_with_children(void *_arg)
+@@ -2177,6 +2205,7 @@ static int restore_task_with_children(void *_arg)
  
  	timing_stop(TIME_FORK);
  
@@ -164,7 +170,19 @@ index a94c508..ae65400 100644
  	if(restore_rdma(pid, images_dir)) {
  		pr_err("restore_rdma failed. errno: %d\n", errno);
  		goto err;
-@@ -2288,6 +2314,7 @@ static int restore_task_with_children(void *_arg)
+@@ -2205,7 +2234,11 @@ static int restore_task_with_children(void *_arg)
+ 
+ 		close(sock);
+ 	}
++#endif
++
++	pr_info("Full restore starts.\n");
+ 
++#if 0
+ 	{
+ 		char *sockname;
+ 		char buf[32];
+@@ -2288,6 +2321,7 @@ static int restore_task_with_children(void *_arg)
  	}
  
  skip_rdma_mmap:
@@ -172,7 +190,7 @@ index a94c508..ae65400 100644
  	if (populate_pid_proc())
  		goto err;
  
-@@ -2965,6 +2992,7 @@ int prepare_dummy_task_state(struct pstree_item *pi)
+@@ -2965,6 +2999,7 @@ int prepare_dummy_task_state(struct pstree_item *pi)
  	return 0;
  }
  
@@ -180,7 +198,7 @@ index a94c508..ae65400 100644
  static pid_t get_parent_pid_from_proc(pid_t pid) {
  	FILE *fp;
  	char fname[128];
-@@ -3026,6 +3054,7 @@ static pid_t get_init_pid(void) {
+@@ -3026,6 +3061,7 @@ static pid_t get_init_pid(void) {
  
  	return parent_pid;
  }
@@ -188,7 +206,7 @@ index a94c508..ae65400 100644
  
  int cr_restore_tasks(void)
  {
-@@ -3120,6 +3149,7 @@ int cr_restore_tasks(void)
+@@ -3120,6 +3156,7 @@ int cr_restore_tasks(void)
  	if (prepare_lazy_pages_socket() < 0)
  		goto clean_cgroup;
  
@@ -196,7 +214,7 @@ index a94c508..ae65400 100644
  	{
  		int total_wait = 0;
  		struct pstree_item *it;
-@@ -3150,6 +3180,7 @@ int cr_restore_tasks(void)
+@@ -3150,6 +3187,7 @@ int cr_restore_tasks(void)
  
  		close(sock);
  	}
@@ -248,10 +266,10 @@ index ef9a14b..91be74b 100644
  	int n_unmapped;
  	struct update_mem_node			*update_arr;
 diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
-index 16f2d3f..aee4016 100644
+index 16f2d3f..b4e93b2 100644
 --- a/criu/pie/restorer.c
 +++ b/criu/pie/restorer.c
-@@ -2199,7 +2199,13 @@ long __export_restore_task(struct task_restore_args *args)
+@@ -2199,7 +2199,14 @@ long __export_restore_task(struct task_restore_args *args)
  	}
  	sys_close(sk);
  
@@ -263,10 +281,11 @@ index 16f2d3f..aee4016 100644
 +			return -1;
 +		}
 +	}
++	pr_info("Full restore RDMA finish\n");
  
  	sys_munmap(args->rst_mem, args->rst_mem_size);
  
-@@ -2208,6 +2214,7 @@ long __export_restore_task(struct task_restore_args *args)
+@@ -2208,6 +2215,7 @@ long __export_restore_task(struct task_restore_args *args)
  	 */
  	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
  
@@ -274,7 +293,7 @@ index 16f2d3f..aee4016 100644
  	{
  		int sock = sys_socket(AF_UNIX, SOCK_DGRAM, 0);
  		struct sockaddr_un sock_un;
-@@ -2230,6 +2237,7 @@ long __export_restore_task(struct task_restore_args *args)
+@@ -2230,6 +2238,7 @@ long __export_restore_task(struct task_restore_args *args)
  
  		sys_close(sock);
  	}
