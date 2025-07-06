@@ -89,20 +89,6 @@ runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.container
 					--log-format json restore --image-path /dev/shm/restorerdma/ \
 					${new_cont_id}
 
-checkpoint_time_raw=`cat /dev/shm/dump_*.log | tail -n 1 | awk -F '[()]+' '{print $2}'`
-checkpoint_time=`echo "scale=3; $checkpoint_time_raw * 1000.0" | bc`
-start_raw=`cat /dev/shm/restore*.log | grep "Full restore" | awk -F '[()]+' '{print $2}' | head -n 1`
-start=`echo "scale=3; $start_raw * 1000.0" | bc`
-end_raw=`cat /dev/shm/restore*.log | tail -n 1 | awk -F '[()]+' '{print $2}'`
-end=`echo "scale=3; $end_raw * 1000.0" | bc`
-restore_time_total=`echo "scale=3; $end - $start" | bc`
-start_raw=`cat /dev/shm/restore*.log | grep "metadata" | grep -v "pie: 1:" | awk -F '[()]+' '{print $2}'`
-start=`echo "scale=3; $start_raw * 1000.0" | bc`
-end_raw=`cat /dev/shm/restore*.log | grep "Restore RDMA communication" | grep -v "pie: 1:" | awk -F '[()]+' '{print $2}'`
-end=`echo "scale=3; $end_raw * 1000.0" | bc`
-restore_comm=`echo "scale=3; $end - $start" | bc`
-restore_time=`echo "scale=3; $restore_time_total - $restore_comm" | bc`
-echo "Checkpoint time: ${checkpoint_time} ms"
-echo "Restore time: ${restore_time} ms"
+stat_wait_before_copy/calculate
 echo "Wait-before-copy: ${wbc_time} ms"
 

@@ -118,7 +118,7 @@ static struct range_node *search_range_node(double start, double end,
 	return to_range_node(match);
 }
 
-static int *add_range_node(double start, double end) {
+static int add_range_node(double start, double end) {
 	struct range_node *ent;
 	struct rb_node *parent, **insert;
 
@@ -133,7 +133,7 @@ static int *add_range_node(double start, double end) {
 	}
 
 	ent->start = start;
-	end->end = end;
+	ent->end = end;
 	rbtree_add_node(&ent->node, parent, insert, &range_tree);
 	return 0;
 }
@@ -152,9 +152,10 @@ int main(int argc, char *argv[]) {
 	char restore_log[256];
 	char strln[32768];
 	double checkpoint_time;
-	double start, end, restore_total;
+	double start, end, restore_total, restore_time;
 	struct pid_to_range_node *node;
 	struct range_node *r_node;
+	double restore_comm = 0.0;
 
 	fd_dir = open("/dev/shm/", O_DIRECTORY);
 	if(fd_dir < 0) {
@@ -277,7 +278,7 @@ int main(int argc, char *argv[]) {
 	end = -1.0;
 	for_each_rbtree_entry(r_node, &range_tree, to_range_node, node) {
 		if(r_node->start > end && r_node->start - end > 1e-6) {
-			printf("(%lf ~ %lf)\n", start, end);
+			restore_comm += end - start;
 			start = r_node->start;
 			end = start;
 		}
@@ -287,8 +288,10 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	printf("(%lf ~ %lf)\n", start, end);
+	restore_comm += end - start;
+	restore_time = restore_total - restore_comm;
 
+	printf("Restore time: %lf ms\n", restore_time);
 	return 0;
 }
 
