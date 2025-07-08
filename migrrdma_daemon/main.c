@@ -570,6 +570,8 @@ static int process_msg(const struct sockaddr_in *addr, void *buf, int size) {
 	return 0;
 }
 
+static int pthread_close_sk(int socket);
+
 int main(int argc, char *argv[]) {
     int sk = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
@@ -611,7 +613,7 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-    while((acc_sk = accept(sk, NULL, NULL)) < 0) {
+    while((acc_sk = accept(sk, NULL, NULL)) >= 0) {
 		while(1) {
 			recv_size = recv(acc_sk, recvbuf, sizeof(recvbuf), 0);
 			if(recv_size < 0) {
@@ -696,7 +698,27 @@ int main(int argc, char *argv[]) {
 			cur_wait = 0;
 			clean_rbtree(&qpn_dict, free_qpn_dict_node);
         }
+
+		pthread_close_sk(acc_sk);
     }
 
+	return 0;
+}
+
+static void *__close_sk(void *arg) {
+	int *sk = (int *)arg;
+	sleep(5);
+	close(*sk);
+	free(sk);
+}
+
+static int pthread_close_sk(int socket) {
+	int *sk;
+	pthread_t thread_id;
+
+	sk = malloc(sizeof(int));
+	*sk = socket;
+
+	pthread_create(&thread_id, NULL, __close_sk, sk);
 	return 0;
 }

@@ -2186,19 +2186,19 @@ long __export_restore_task(struct task_restore_args *args)
 		sk = sys_socket(AF_INET, SOCK_STREAM, 0);
 
 		if(sk < 0) {
-			pr_perror("socket");
+			pr_err("Error when creating socket\n");
 			return -1;
 		}
 
 		memcpy(&remote_addr, &args->msg_arr[i].remote_addr, sizeof(remote_addr));
 		if(sys_connect(sk, (struct sockaddr *)&remote_addr, sizeof(remote_addr))) {
-			pr_perror("connect");
+			pr_err("Error when connecting\n");
 			return -1;
 		}
 
 		while(sent_size < size) {
-			this_size = sys_send(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
-									0);
+			this_size = sys_sendto(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
+									0, NULL, 0);
 			if(this_size < 0) {
 				return -1;
 			}
@@ -2206,7 +2206,7 @@ long __export_restore_task(struct task_restore_args *args)
 			sent_size += this_size;
 		}
 
-		sys_send(sk, NULL, 0, 0);
+		sys_sendto(sk, NULL, 0, 0, NULL, 0);
 		sys_close(sk);
 	}
 
