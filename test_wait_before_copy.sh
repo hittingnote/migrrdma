@@ -75,6 +75,8 @@ end=`date +"%s.%N"`
 echo "Notify finish"
 wbc_time=`echo "scale=3; ( $end - $start ) * 1000.0 / 1.0" | bc`
 
+sleep 2
+
 runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/log.json --log-format json checkpoint \
 					--image-path /dev/shm/dump_img `if [ $iters_precopy -gt 0 ]; then echo "--parent-path ./pre_${iters_precopy}"; fi` \
 					--work-path /var/lib/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/criu-work ${orig_cont_id}

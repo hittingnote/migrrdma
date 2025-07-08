@@ -546,6 +546,8 @@ static int process_msg(const struct sockaddr_in *addr, void *buf, int size) {
 
 			memcpy(buf, partner_buf, cur_size);
 
+			dprintf(1, "In %s(%d): We get RDMA_NOTIFY_PRE_PAUSE\n", __FILE__, __LINE__);
+
 			param = calloc(1, sizeof(*param));
 			param->pid = last_pid;
 			param->buf = buf;
