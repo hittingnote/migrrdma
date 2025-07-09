@@ -568,8 +568,10 @@ static int process_msg(const struct sockaddr_in *addr, void *buf, int size) {
 	return 0;
 }
 
+static int pthread_close_sk(int socket);
+
 int main(int argc, char *argv[]) {
-    int sk = socket(AF_INET, SOCK_DGRAM, 0);
+    int sk = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
     struct sockaddr_in remote_addr;
     socklen_t addrlen = sizeof(remote_addr);
@@ -581,6 +583,7 @@ int main(int argc, char *argv[]) {
 	int size;
 	int sent_size = 0;
 	int this_size;
+	int acc_sk;
 
     if(sk < 0) {
         perror("socket");
@@ -602,22 +605,32 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-    while(1) {
-        recv_size = recvfrom(sk, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&remote_addr, &addrlen);
-        if(recv_size < 0) {
-            perror("recvfrom");
-        }
+	if(listen(sk, 1024)) {
+		perror("listen");
+		close(sk);
+		return -1;
+	}
 
-		/* recv_size > 0 means the message does not terminate.
-		 * recv_size == 0 means a null message is received,
-		 * which indicates the end of the message.
-		 */
-        if(recv_size > 0) {
-            buf = expand_buf(buf, cur_size, cur_size + recv_size);
-            memcpy(buf + cur_size, recvbuf, recv_size);
-            cur_size += recv_size;
-            continue;
-        }
+    while((acc_sk = accept(sk,
+					(struct sockaddr *)&remote_addr, &addrlen)) >= 0) {
+		while(1) {
+			recv_size = recv(acc_sk, recvbuf, sizeof(recvbuf), 0);
+			if(recv_size < 0) {
+				perror("recv");
+			}
+
+			/* receive message.
+			 * The message termintes at string "that's all"
+			 */
+			buf = expand_buf(buf, cur_size, cur_size + recv_size);
+			memcpy(buf + cur_size, recvbuf, recv_size);
+			cur_size += recv_size;
+
+			if(!strcmp(buf + cur_size - sizeof("that's all"), "that's all")) {
+				cur_size -= sizeof("that's all");
+				break;
+			}
+		}
 
 		if(buf) {
 			int i;
@@ -663,9 +676,9 @@ int main(int argc, char *argv[]) {
 								total_cnt * sizeof(struct reply_item_fmt);
 
 				while(sent_size < size) {
-					this_size = sendto(sk, (void *)merged_reply_hdr + sent_size,
+					this_size = send(acc_sk, (void *)merged_reply_hdr + sent_size,
 									size - sent_size > 1024? 1024: size - sent_size,
-									0, (struct sockaddr *)&remote_addr, addrlen);
+									0);
 					if(this_size < 0) {
 						perror("sendto");
 						return -1;
@@ -675,7 +688,7 @@ int main(int argc, char *argv[]) {
 				}
 
 				/* Send a null message to mark the end */
-				sendto(sk, NULL, 0, 0, (struct sockaddr *)&remote_addr, addrlen);
+				send(acc_sk, "that's all", sizeof("that's all"), 0);
 				free(merged_reply_hdr);
 				sent_size = 0;
 			}
@@ -683,7 +696,28 @@ int main(int argc, char *argv[]) {
 			cur_wait = 0;
 			clean_rbtree(&qpn_dict, free_qpn_dict_node);
         }
+
+		pthread_close_sk(acc_sk);
     }
 
+	return 0;
+}
+
+static void *__close_sk(void *arg) {
+	int *sk = (int *)arg;
+	sleep(5);
+	close(*sk);
+	free(sk);
+	return NULL;
+}
+
+static int pthread_close_sk(int socket) {
+	int *sk;
+	pthread_t thread_id;
+
+	sk = malloc(sizeof(int));
+	*sk = socket;
+
+	pthread_create(&thread_id, NULL, __close_sk, sk);
 	return 0;
 }

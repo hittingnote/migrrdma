@@ -1,5 +1,8 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,14 +17,18 @@ int main(int argc, char *argv[]) {
 	void *start;
 	void *end;
 	off_t off = 0;
+	char *fname = NULL;
 
-	while((cur_opt = getopt(argc, argv, "n:p:")) != -1) {
+	while((cur_opt = getopt(argc, argv, "n:p:o:")) != -1) {
 		switch(cur_opt) {
 		case 'n':
 			n_partners = atoi(optarg);
 			break;
 		case 'p':
 			port_num = atoi(optarg);
+			break;
+		case 'o':
+			asprintf(&fname, "%s", optarg);
 			break;
 		default:
 			break;
@@ -67,6 +74,15 @@ int main(int argc, char *argv[]) {
 		}
 
 		if(child_pid == 0) {
+			char *c_fname;
+			int fd;
+
+			if(fname) {
+				asprintf(&c_fname, "%s_%d.txt", fname, getpid());
+				fd = open(c_fname, O_RDWR | O_CREAT, 00666);
+				dup2(fd, STDOUT_FILENO);
+				close(fd);
+			}
 			execvp(my_argv[0], &my_argv[0]);
 			return -1;
 		}

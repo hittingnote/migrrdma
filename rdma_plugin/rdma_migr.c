@@ -583,19 +583,19 @@ static void *wait_fn(void *arg) {
 	int recv_size;
 
 	while(1) {
-		recv_size = recvfrom(sk, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+		recv_size = recv(sk, recvbuf, sizeof(recvbuf), 0);
 		if(recv_size < 0) {
-			perror("recvfrom");
+			perror("recv");
 		}
 
-		if(recv_size > 0) {
-			buf = expand_buf(buf, cur_size, cur_size + recv_size);
-			memcpy(buf + cur_size, recvbuf, recv_size);
-			cur_size += recv_size;
-			continue;
-		}
+		buf = expand_buf(buf, cur_size, cur_size + recv_size);
+		memcpy(buf + cur_size, recvbuf, recv_size);
+		cur_size += recv_size;
 
-		break;
+		if(!strcmp(buf + cur_size - sizeof("that's all"), "that's all")) {
+			cur_size -= sizeof("that's all");
+			break;
+		}
 	}
 
 	if(buf) {
@@ -606,7 +606,7 @@ static void *wait_fn(void *arg) {
 }
 
 static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait) {
-	int sk = socket(AF_INET, SOCK_DGRAM, 0);
+	int sk = socket(AF_INET, SOCK_STREAM, 0);
 	struct sockaddr_in remote_addr;
 	int sent_size = 0;
 	int this_size;
@@ -620,11 +620,16 @@ static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait)
 	remote_addr.sin_port = htons(50505);
 	memcpy(&remote_addr.sin_addr.s_addr, &dest_gid->raw[12], sizeof(uint32_t));
 
+	if(connect(sk, (struct sockaddr *)&remote_addr, sizeof(remote_addr))) {
+		perror("connect");
+		return -1;
+	}
+
 	while(sent_size < size) {
-		this_size = sendto(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
-								0, &remote_addr, sizeof(remote_addr));
+		this_size = send(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
+								0);
 		if(this_size < 0) {
-			perror("sendto");
+			perror("send");
 			return -1;
 		}
 
@@ -632,7 +637,7 @@ static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait)
 	}
 
 	/* Send a null message to mark the end */
-	sendto(sk, NULL, 0, 0, &remote_addr, sizeof(remote_addr));
+	send(sk, "that's all", sizeof("that's all"), 0);
 
 	if(!need_wait) {
 		close(sk);

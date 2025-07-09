@@ -2177,27 +2177,39 @@ long __export_restore_task(struct task_restore_args *args)
 	}
 
 	pr_info("Notify partners to restore\n");
-	sk = sys_socket(AF_INET, SOCK_DGRAM, 0);
 	for(int i = 0; i < args->n_msg; i++) {
 		int sent_size = 0;
 		int this_size;
 		size_t size = args->msg_arr[i].size;
 		void *buf = args->msg_arr[i].buf;
 		struct sockaddr_in remote_addr;
+		sk = sys_socket(AF_INET, SOCK_STREAM, 0);
+
+		if(sk < 0) {
+			pr_err("Error when creating socket\n");
+			return -1;
+		}
 
 		memcpy(&remote_addr, &args->msg_arr[i].remote_addr, sizeof(remote_addr));
+		if(sys_connect(sk, (struct sockaddr *)&remote_addr, sizeof(remote_addr))) {
+			pr_err("Error when connecting\n");
+			return -1;
+		}
+
 		while(sent_size < size) {
 			this_size = sys_sendto(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
-									0, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
+									0, NULL, 0);
 			if(this_size < 0) {
-		return -1;
-	}
+				return -1;
+			}
 
 			sent_size += this_size;
 		}
-		sys_sendto(sk, NULL, 0, 0, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
+
+		sys_sendto(sk, "that's all", sizeof("that's all"), 0,
+							NULL, 0);
+		sys_close(sk);
 	}
-	sys_close(sk);
 
 	pr_info("Restore RDMA communication finish\n");
 
