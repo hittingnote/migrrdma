@@ -588,14 +588,14 @@ static void *wait_fn(void *arg) {
 			perror("recv");
 		}
 
-		if(recv_size > 0) {
-			buf = expand_buf(buf, cur_size, cur_size + recv_size);
-			memcpy(buf + cur_size, recvbuf, recv_size);
-			cur_size += recv_size;
-			continue;
-		}
+		buf = expand_buf(buf, cur_size, cur_size + recv_size);
+		memcpy(buf + cur_size, recvbuf, recv_size);
+		cur_size += recv_size;
 
-		break;
+		if(!strcmp(buf + cur_size - sizeof("that's all"), "that's all")) {
+			cur_size -= sizeof("that's all");
+			break;
+		}
 	}
 
 	if(buf) {
@@ -637,7 +637,7 @@ static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait)
 	}
 
 	/* Send a null message to mark the end */
-	send(sk, NULL, 0, 0);
+	send(sk, "that's all", sizeof("that's all"), 0);
 
 	if(!need_wait) {
 		close(sk);

@@ -2206,7 +2206,8 @@ long __export_restore_task(struct task_restore_args *args)
 			sent_size += this_size;
 		}
 
-		sys_sendto(sk, NULL, 0, 0, NULL, 0);
+		sys_sendto(sk, "that's all", sizeof("that's all"), 0,
+							NULL, 0);
 		sys_close(sk);
 	}
 

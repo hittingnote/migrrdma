@@ -570,20 +570,22 @@ static int process_msg(const struct sockaddr_in *addr, void *buf, int size) {
 	return 0;
 }
 
-struct on_accept_param {
-	int							acc_sk;
-	struct sockaddr_in			remote_addr;
-};
-
 static int pthread_close_sk(int socket);
-static void *on_accept(void *arg);
 
 int main(int argc, char *argv[]) {
     int sk = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
     struct sockaddr_in remote_addr;
     socklen_t addrlen = sizeof(remote_addr);
+    char recvbuf[1024];
+    void *buf = NULL;
+    int cur_size = 0;
+    int recv_size;
 	int reuse = 1;
+	int size;
+	int sent_size = 0;
+	int this_size;
+	int acc_sk;
 
     if(sk < 0) {
         perror("socket");
@@ -613,121 +615,94 @@ int main(int argc, char *argv[]) {
 
     while((acc_sk = accept(sk,
 					(struct sockaddr *)&remote_addr, &addrlen)) >= 0) {
-		struct on_accept_param *param;
-		pthread_t thread_id;
+		while(1) {
+			recv_size = recv(acc_sk, recvbuf, sizeof(recvbuf), 0);
+			if(recv_size < 0) {
+				perror("recv");
+			}
 
-		param = malloc(sizeof(*param));
-		param->acc_sk = acc_sk;
-		memcpy(&param->remote_addr, &remote_addr, sizeof(remote_addr));
-
-		pthread_create(&thread_id, NULL, on_accept, param);
-    }
-
-	return 0;
-}
-
-static void *on_accept(void *arg) {
-	struct on_accept_param *param = (typeof(param))arg;
-	int acc_sk = param->acc_sk;
-	struct sockaddr_in remote_addr;
-	char recvbuf[1024];
-    void *buf = NULL;
-    int cur_size = 0;
-    int recv_size;
-	int size;
-	int sent_size = 0;
-	int this_size;
-
-	memcpy(&remote_addr, &param->remote_addr, sizeof(remote_addr));
-	free(param);
-
-	while(1) {
-		recv_size = recv(acc_sk, recvbuf, sizeof(recvbuf), 0);
-		if(recv_size < 0) {
-			perror("recv");
-		}
-
-		/* recv_size > 0 means the message does not terminate.
-		* recv_size == 0 means a null message is received,
-		* which indicates the end of the message.
-		*/
-		if(recv_size > 0) {
+			/* receive message.
+			 * The message termintes at string "that's all"
+			 */
 			buf = expand_buf(buf, cur_size, cur_size + recv_size);
 			memcpy(buf + cur_size, recvbuf, recv_size);
 			cur_size += recv_size;
-			continue;
+
+			if(!strcmp(buf + cur_size - sizeof("that's all"), "that's all")) {
+				cur_size -= sizeof("that's all");
+				break;
+			}
 		}
 
-		break;
-	}
+		if(buf) {
+			int i;
 
-	if(buf) {
-		int i;
-
-		init_qpn_dict();
-		process_msg(&remote_addr, buf, cur_size);
-		free(buf);
-		cur_size = 0;
-		buf = NULL;
-
-		for(i = 0; i < cur_wait; i++) {
-			pthread_join(wait_thread_id[i], NULL);
-		}
-
-		if(cur_wait > 0) {
-			int total_cnt = 0;
-			struct reply_hdr_fmt *merged_reply_hdr;
-			struct reply_item_fmt *merged_arr;
-			int curp = 0;
+			init_qpn_dict();
+        	process_msg(&remote_addr, buf, cur_size);
+            free(buf);
+            cur_size = 0;
+			buf = NULL;
 
 			for(i = 0; i < cur_wait; i++) {
-				struct reply_hdr_fmt *reply_hdr = params[i]->out_buf;
-				total_cnt += reply_hdr->cnt;
+				pthread_join(wait_thread_id[i], NULL);
 			}
 
-			merged_reply_hdr = malloc(sizeof(struct reply_hdr_fmt) +
-							total_cnt * sizeof(struct reply_item_fmt));
-			merged_reply_hdr->cnt = total_cnt;
-			merged_arr = (struct reply_item_fmt *)&merged_reply_hdr->msg;
+			if(cur_wait > 0) {
+				int total_cnt = 0;
+				struct reply_hdr_fmt *merged_reply_hdr;
+				struct reply_item_fmt *merged_arr;
+				int curp = 0;
 
-			for(i = 0; i < cur_wait; i++) {
-				struct reply_hdr_fmt *reply_hdr = params[i]->out_buf;
-				struct reply_item_fmt *arr = (struct reply_item_fmt *)&reply_hdr->msg;
-
-				free(params[i]);
-				memcpy(&merged_arr[curp], &arr[0], reply_hdr->cnt * sizeof(struct reply_item_fmt));
-				curp += reply_hdr->cnt;
-
-				free(reply_hdr);
-			}
-
-			size = sizeof(struct reply_hdr_fmt) +
-							total_cnt * sizeof(struct reply_item_fmt);
-
-			while(sent_size < size) {
-				this_size = send(acc_sk, (void *)merged_reply_hdr + sent_size,
-								size - sent_size > 1024? 1024: size - sent_size,
-								0);
-				if(this_size < 0) {
-					perror("sendto");
-					return -1;
+				for(i = 0; i < cur_wait; i++) {
+					struct reply_hdr_fmt *reply_hdr = params[i]->out_buf;
+					total_cnt += reply_hdr->cnt;
 				}
 
-				sent_size += this_size;
+				merged_reply_hdr = malloc(sizeof(struct reply_hdr_fmt) +
+								total_cnt * sizeof(struct reply_item_fmt));
+				merged_reply_hdr->cnt = total_cnt;
+				merged_arr = (struct reply_item_fmt *)&merged_reply_hdr->msg;
+
+				for(i = 0; i < cur_wait; i++) {
+					struct reply_hdr_fmt *reply_hdr = params[i]->out_buf;
+					struct reply_item_fmt *arr = (struct reply_item_fmt *)&reply_hdr->msg;
+
+					free(params[i]);
+					memcpy(&merged_arr[curp], &arr[0], reply_hdr->cnt * sizeof(struct reply_item_fmt));
+					curp += reply_hdr->cnt;
+
+					free(reply_hdr);
+				}
+
+				size = sizeof(struct reply_hdr_fmt) +
+								total_cnt * sizeof(struct reply_item_fmt);
+
+				while(sent_size < size) {
+					this_size = send(acc_sk, (void *)merged_reply_hdr + sent_size,
+									size - sent_size > 1024? 1024: size - sent_size,
+									0);
+					if(this_size < 0) {
+						perror("sendto");
+						return -1;
+					}
+
+					sent_size += this_size;
+				}
+
+				/* Send a null message to mark the end */
+				send(acc_sk, "that's all", sizeof("that's all"), 0);
+				free(merged_reply_hdr);
+				sent_size = 0;
 			}
 
-			/* Send a null message to mark the end */
-			send(acc_sk, NULL, 0, 0);
-			free(merged_reply_hdr);
-			sent_size = 0;
-		}
+			cur_wait = 0;
+			clean_rbtree(&qpn_dict, free_qpn_dict_node);
+        }
 
-		cur_wait = 0;
-		clean_rbtree(&qpn_dict, free_qpn_dict_node);
-	}
+		pthread_close_sk(acc_sk);
+    }
 
-	pthread_close_sk(acc_sk);
-	return NULL;
+	return 0;
 }
 
 static void *__close_sk(void *arg) {
