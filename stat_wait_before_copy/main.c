@@ -124,7 +124,7 @@ static int add_range_node(double start, double end) {
 
 	ent = search_range_node(start, end, &parent, &insert);
 	if(ent) {
-		return -1;
+		return 0;
 	}
 
 	ent = malloc(sizeof(*ent));
