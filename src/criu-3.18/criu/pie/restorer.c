@@ -2221,7 +2221,7 @@ long __export_restore_task(struct task_restore_args *args)
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
 
 	{
-		int sock = sys_socket(AF_UNIX, SOCK_STREAM, 0);
+		int sock = sys_socket(AF_UNIX, SOCK_DGRAM, 0);
 		struct sockaddr_un sock_un;
 		char buf[32];
 		int err;

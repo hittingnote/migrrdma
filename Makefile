@@ -3,6 +3,9 @@ utils:=init_proc migrrdma_daemon prerestore rdma_plugin fork stat_wait_before_co
 all:
 	@for i in $(utils); do \
 		make -C $$i; \
+		if [ $$? -ne 0 ]; then \
+			exit $$?; \
+		fi \
 	done
 
 .PHONY: clean

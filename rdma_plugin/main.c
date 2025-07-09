@@ -314,7 +314,6 @@ int main(int argc, char *argv[]) {
 
 			notify_partners_suspend(atoi(argv[1]));
 
-#if 0
 			sprintf(fname, "/proc/rdma/%d/to_proc", atoi(argv[1]));
 			fd_to_proc = open(fname, O_RDWR);
 			if(fd_to_proc >= 0) {
@@ -336,7 +335,6 @@ int main(int argc, char *argv[]) {
 				wait_for_proc_complete(atoi(argv[1]), argv[2]);
 				dump_rdma_mmap(atoi(argv[1]), argv[2]);
 			}
-#endif
 
 			exit(0);
 		}
@@ -362,7 +360,6 @@ int main(int argc, char *argv[]) {
 
 				notify_partners_suspend(pid_list[i]);
 
-#if 0
 				sprintf(fname, "/proc/rdma/%d/to_proc", pid_list[i]);
 				fd_to_proc = open(fname, O_RDWR);
 				if(fd_to_proc >= 0) {
@@ -384,7 +381,6 @@ int main(int argc, char *argv[]) {
 					wait_for_proc_complete(pid_list[i], argv[2]);
 					dump_rdma_mmap(pid_list[i], argv[2]);
 				}
-#endif
 
 				exit(0);
 			}
