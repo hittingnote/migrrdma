@@ -10,6 +10,9 @@
 
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
+	int nr_to_wait;
+	futex_t futex_n_wait;
+	futex_t futex_n_wait_2;
 	futex_t nr_in_progress;
 	futex_t start;
 	atomic_t cr_err;

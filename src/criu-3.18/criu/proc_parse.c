@@ -186,8 +186,8 @@ static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
 	 * only exception is VVAR area that mapped by the kernel as
 	 * VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP
 	 */
-	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED))
-		vma_area->e->status |= VMA_UNSUPP;
+//	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED))
+//		vma_area->e->status |= VMA_UNSUPP;
 
 	if (vma_area->e->madv)
 		vma_area->e->has_madv = true;
@@ -768,6 +768,8 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 
 	DIR *map_files_dir = NULL;
 	struct bfd f;
+	int flag;
+	int cond;
 
 	vm_area_list_init(vma_area_list);
 
@@ -807,16 +809,62 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		if (eof)
 			break;
 
-		vma_area = alloc_vma_area();
-		if (!vma_area)
-			goto err;
-
+parse_vma_file:
 		num = sscanf(str, "%lx-%lx %c%c%c%c %lx %x:%x %lu %n", &start, &end, &r, &w, &x, &s, &pgoff,
 			     &vfi.dev_maj, &vfi.dev_min, &vfi.ino, &path_off);
 		if (num < 10) {
 			pr_err("Can't parse: %s\n", str);
 			goto err;
 		}
+
+		if(!enable_pre_setup) {
+			pid_t pid;
+			int cmd_fd;
+			off_t off;
+			if(sscanf(str + path_off, "/proc/rdma_uwrite/%d/%d/%ln", &pid, &cmd_fd, &off) < 2) {
+				flag = 0;
+			}
+			else {
+				if(*(str + path_off + off) == '<')
+					flag = 1;
+				else
+					flag = 0;
+			}
+		}
+
+		if(enable_pre_setup) {
+			cond = !strncmp(str + path_off, "/dev/infiniband/", 16);
+		}
+		else {
+			cond = (!strncmp(str + path_off, "/dev/infiniband/", 16) || flag);
+		}
+
+		if(cond) {
+			pr_info("Skip mapping of file %s\n", str + path_off);
+read_line:
+			str = breadline(&f);
+			if (IS_ERR(str))
+				goto err;
+			eof = (str == NULL);
+
+			if (!eof && !__is_vma_range_fmt(str)) {
+				if (!strncmp(str, "VmFlags: ", 9)) {
+					BUG_ON(!vma_area);
+					parse_vma_vmflags(&str[9], vma_area);
+					goto read_line;
+				} else
+					goto read_line;
+			}
+
+			if (eof)
+				break;
+
+			goto parse_vma_file;
+		}
+
+		vma_area = alloc_vma_area();
+		if (!vma_area)
+			goto err;
 
 		vma_area->e->start = start;
 		vma_area->e->end = end;

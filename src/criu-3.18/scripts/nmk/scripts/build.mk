@@ -67,7 +67,7 @@ endef
 define gen-cc-rules
 $(1).o: $(2).c $(__nmk-makefile-deps)
 	$$(call msg-cc, $$@)
-	$$(Q) $$(CC) -c $$(strip $$(nmk-ccflags)) $$< -o $$@
+	$$(Q) $$(CC) -c $$(strip $$(nmk-ccflags)) -I ../rdma-core-54mlnx1/build/include/ $$< -o $$@
 $(1).i: $(2).c $(__nmk-makefile-deps)
 	$$(call msg-cc, $$@)
 	$$(Q) $$(CC) -E $$(strip $$(nmk-ccflags)) $$< -o $$@
@@ -76,7 +76,7 @@ $(1).s: $(2).c $(__nmk-makefile-deps)
 	$$(Q) $$(CC) -S -fverbose-asm $$(strip $$(nmk-ccflags)) $$< -o $$@
 $(1).d: $(2).c $(__nmk-makefile-deps)
 	$$(call msg-dep, $$@)
-	$$(Q) $$(CC) -M -MT $$@ -MT $$(patsubst %.d,%.o,$$@) $$(strip $$(nmk-ccflags)) $$< -o $$@
+	$$(Q) $$(CC) -M -MT $$@ -MT $$(patsubst %.d,%.o,$$@) $$(strip $$(nmk-ccflags)) -I ../rdma-core-54mlnx1/build/include/ $$< -o $$@
 $(1).o: $(2).S $(__nmk-makefile-deps)
 	$$(call msg-cc, $$@)
 	$$(Q) $$(CC) -c $$(strip $$(nmk-asflags)) $$< -o $$@
