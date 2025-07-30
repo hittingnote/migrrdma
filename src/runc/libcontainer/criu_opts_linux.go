@@ -31,4 +31,6 @@ type CriuOpts struct {
 	StatusFd                int                // fd for feedback when lazy server is ready
 	LsmProfile              string             // LSM profile used to restore the container
 	LsmMountContext         string             // LSM mount context value to use during restore
+	MigrDst					string
+	RDMAPreSetup			bool
 }

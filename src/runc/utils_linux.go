@@ -268,7 +268,7 @@ func (r *runner) run(config *specs.Process) (int, error) {
 	case CT_ACT_CREATE:
 		err = r.container.Start(process)
 	case CT_ACT_RESTORE:
-		err = r.container.Restore(process, r.criuOpts)
+		err = r.container.Restore(process, r.criuOpts, r.init)
 	case CT_ACT_RUN:
 		err = r.container.Run(process)
 	default:
@@ -375,6 +375,13 @@ func startContainer(context *cli.Context, action CtAct, criuOpts *libcontainer.C
 	container, err := createContainer(context, id, spec)
 	if err != nil {
 		return -1, err
+	}
+
+	if container == nil {
+		container, err = getContainer(context)
+		if err != nil {
+			return -1, err
+		}
 	}
 
 	if notifySocket != nil {
