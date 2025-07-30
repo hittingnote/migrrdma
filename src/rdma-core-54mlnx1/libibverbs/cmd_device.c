@@ -106,6 +106,182 @@ int ibv_cmd_query_port(struct ibv_context *context, uint8_t port_num,
 	return 0;
 }
 
+int ibv_cmd_install_footprint(struct ibv_context *context) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_FOOTPRINT, 1);
+
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_FOOTPRINT_IN_FD,
+					&context->cmd_fd);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_qpndict(struct ibv_context *context,
+				uint32_t real_qpn, uint32_t vqpn) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_QPN_DICT, 2);
+	fill_attr_in_ptr(cmdb, 0, &real_qpn);
+	fill_attr_in_ptr(cmdb, 1, &vqpn);
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_ctx_resp(struct ibv_context *context, void *resp, size_t size) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_CTX_RESP, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_RESP_PTR, &resp);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_RESP_SZ, &size);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_register_async_fd(struct ibv_context *context, int async_fd) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_REGISTER_ASYNC_FD, 1);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_FOOTPRINT_IN_FD,
+					&async_fd);
+	
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_pd_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vhandle);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &handle);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_mr_handle_mapping(struct ibv_context *context,
+					int vhandle, int handle) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vhandle);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &handle);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_qp_handle_mapping(struct ibv_context *context,
+					int vhandle, int handle) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vhandle);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &handle);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_srq_handle_mapping(struct ibv_context *context,
+					int vhandle, int handle) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vhandle);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &handle);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_cq_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vhandle);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &handle);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
+							uint32_t vlkey, uint32_t lkey) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_LKEY_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vlkey);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &lkey);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_install_local_rkey_mapping(struct ibv_context *context,
+							uint32_t vrkey, uint32_t rkey) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING, 2);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vrkey);
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &rkey);
+
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_delete_local_rkey_mapping(struct ibv_context *context, uint32_t vrkey) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING, 1);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vrkey);
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_delete_lkey_mapping(struct ibv_context *context, uint32_t vlkey) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_DELETE_LKEY_MAPPING, 1);
+	
+	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vlkey);
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_register_remote_gid_pid(struct ibv_context *context,
+					const union ibv_gid *gid, pid_t pid) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_REGISTER_REMOTE_GID_PID, 2);
+	
+	fill_attr_in_ptr(cmdb, 0, gid);
+	fill_attr_in_ptr(cmdb, 1, &pid);
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_update_comp_channel_fd(struct ibv_context *context,
+					struct ibv_comp_channel *channel) {
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD, 1);
+
+	fill_attr_in_fd(cmdb, 0, channel->fd);
+	return execute_ioctl(context, cmdb);
+}
+
+int ibv_cmd_get_rdma_pid(struct ibv_context *context) {
+	pid_t rdma_pid;
+
+	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
+					UVERBS_METHOD_GET_LOCAL_RDMA_PID, 1);
+	
+	fill_attr_out_ptr(cmdb, 0, &rdma_pid);
+	if(execute_ioctl(context, cmdb)) {
+		return -1;
+	}
+
+	return rdma_pid;
+}
+
+#include "rdwr_flag.h"
+
+static inline int uint32_t_compare(uint32_t key1, uint32_t key2) {
+	if(key1 < key2)
+		return -1;
+	else if(key1 > key2)
+		return 1;
+	else
+		return 0;
+}
+
 int ibv_cmd_alloc_async_fd(struct ibv_context *context)
 {
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_ASYNC_EVENT,
