@@ -222,6 +222,7 @@ const (
 	CriuReqType_WAIT_PID         CriuReqType = 11
 	CriuReqType_PAGE_SERVER_CHLD CriuReqType = 12
 	CriuReqType_SINGLE_PRE_DUMP  CriuReqType = 13
+	CriuReqType_SINGLE_PRE_DUMP_RDMA		CriuReqType = 14
 )
 
 // Enum value maps for CriuReqType.
@@ -241,6 +242,7 @@ var (
 		11: "WAIT_PID",
 		12: "PAGE_SERVER_CHLD",
 		13: "SINGLE_PRE_DUMP",
+		14: "SINGLE_PRE_DUMP_RDMA",
 	}
 	CriuReqType_value = map[string]int32{
 		"EMPTY":            0,
@@ -257,6 +259,7 @@ var (
 		"WAIT_PID":         11,
 		"PAGE_SERVER_CHLD": 12,
 		"SINGLE_PRE_DUMP":  13,
+		"SINGLE_PRE_DUMP_RDMA": 14,
 	}
 )
 
