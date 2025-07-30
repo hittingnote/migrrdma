@@ -626,6 +626,7 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
 
 	task_entries->nr_threads += e->n_threads;
 	task_entries->nr_tasks++;
+	task_entries->nr_to_wait++;
 
 	/* note: we don't fail if we have empty ids */
 	if (read_pstree_ids(pi) < 0)
