@@ -13,6 +13,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"strconv"
+	"sync"
 
 	"github.com/checkpoint-restore/go-criu/v6"
 	criurpc "github.com/checkpoint-restore/go-criu/v6/rpc"
@@ -430,6 +432,284 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 		}
 	}
 
+	pid_dir, err := os.ReadDir(criuOpts.ImagesDirectory)
+	if err != nil {
+		return err
+	}
+
+	req := &criurpc.CriuReq{
+		Type: &t,
+		Opts: &rpcOpts,
+	}
+
+	// no need to dump all this in pre-dump
+	if !criuOpts.PreDump {
+		hasCgroupns := c.config.Namespaces.Contains(configs.NEWCGROUP)
+		for _, m := range c.config.Mounts {
+			switch m.Device {
+			case "bind":
+				c.addCriuDumpMount(req, m)
+			case "cgroup":
+				if cgroups.IsCgroup2UnifiedMode() || hasCgroupns {
+					// real mount(s)
+					continue
+				}
+				// a set of "external" bind mounts
+				binds, err := getCgroupMounts(m)
+				if err != nil {
+					return err
+				}
+				for _, b := range binds {
+					c.addCriuDumpMount(req, b)
+				}
+			}
+		}
+
+		if err := c.addMaskPaths(req); err != nil {
+			return err
+		}
+
+		for _, node := range c.config.Devices {
+			m := &configs.Mount{Destination: node.Path, Source: node.Path}
+			c.addCriuDumpMount(req, m)
+		}
+
+		// Write the FD info to a file in the image directory
+		fdsJSON, err := json.Marshal(c.initProcess.externalDescriptors())
+		if err != nil {
+			return err
+		}
+
+		err = os.WriteFile(filepath.Join(criuOpts.ImagesDirectory, descriptorsFilename), fdsJSON, 0o600)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, e := range pid_dir {
+		v, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+
+		this_pid := int32(v)
+
+		this_fds, err := getPipeFds(v)
+		if err != nil {
+			return err
+		}
+
+		this_fds_json, err := json.Marshal(this_fds)
+		if err != nil {
+			return err
+		}
+
+		os.WriteFile(fmt.Sprintf("%s/%s/%s", criuOpts.ImagesDirectory, e.Name(), descriptorsFilename), this_fds_json, 0o600)
+
+		tmp_rpcOpts := criurpc.CriuOpts(rpcOpts)
+
+		imageDir, _ := os.Open(fmt.Sprintf("%s/%s", criuOpts.ImagesDirectory, e.Name()))
+		tmp_rpcOpts.ImagesDirFd = proto.Int32(int32(imageDir.Fd()))
+		tmp_rpcOpts.Pid = proto.Int32(this_pid)
+
+		// Checkpointing PID namespace for container's "exec" process
+		{
+			cmd := exec.Command("readlink", fmt.Sprintf("/proc/%s/ns/pid", e.Name()))
+			out, _ := cmd.Output()
+			raw_str := string(out)
+			external := fmt.Sprintf("pid%s:extRootPidNS", raw_str[4:(len(raw_str)-1)])
+			tmp_rpcOpts.External = append(tmp_rpcOpts.External, external)
+		}
+
+		cmd := exec.Command("cp", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/procspec_%d", c.ID(), this_pid),
+									fmt.Sprintf("%s/", criuOpts.ImagesDirectory))
+		cmd.Run()
+
+		func(pid string, imgpath string, criuOpts CriuOpts,
+					tmp_rpcOpts criurpc.CriuOpts) error {
+			my_criuOpts := CriuOpts(criuOpts)
+			my_rpcOpts := criurpc.CriuOpts(tmp_rpcOpts)
+
+			req := &criurpc.CriuReq{
+				Type: &t,
+				Opts: &my_rpcOpts,
+			}
+
+			err = c.criuSwrk(nil, req, &my_criuOpts, nil)
+			if err != nil {
+				logCriuErrors(logDir, logFile)
+			}
+			return err
+		}(e.Name(), fmt.Sprintf("%s/%s", criuOpts.ImagesDirectory, e.Name()),
+						*criuOpts, tmp_rpcOpts)
+	}
+
+	err = c.criuSwrk(nil, req, criuOpts, nil)
+	if err != nil {
+		logCriuErrors(logDir, logFile)
+		return err
+	}
+
+	return nil
+}
+
+func (c *Container) PreDump(criuOpts *CriuOpts) error {
+	const logFile = "predump.log"
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	// Checkpoint is unlikely to work if os.Geteuid() != 0 || system.RunningInUserNS().
+	// (CLI prints a warning)
+	// TODO(avagin): Figure out how to make this work nicely. CRIU 2.0 has
+	//               support for doing unprivileged dumps, but the setup of
+	//               rootless containers might make this complicated.
+
+	// We are relying on the CRIU version RPC which was introduced with CRIU 3.0.0
+	if err := c.checkCriuVersion(30000); err != nil {
+		return err
+	}
+
+	if criuOpts.ImagesDirectory == "" {
+		return errors.New("invalid directory to save checkpoint")
+	}
+
+	// Since a container can be C/R'ed multiple times,
+	// the checkpoint directory may already exist.
+	if err := os.Mkdir(criuOpts.ImagesDirectory, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	logDir := criuOpts.ImagesDirectory
+	imageDir, err := os.Open(criuOpts.ImagesDirectory)
+	if err != nil {
+		return err
+	}
+	defer imageDir.Close()
+
+	rpcOpts := criurpc.CriuOpts{
+		ImagesDirFd:     proto.Int32(int32(imageDir.Fd())),
+		LogLevel:        proto.Int32(4),
+		LogFile:         proto.String(logFile),
+		Root:            proto.String(c.config.Rootfs),
+		ManageCgroups:   proto.Bool(true),
+		NotifyScripts:   proto.Bool(true),
+		Pid:             proto.Int32(int32(c.initProcess.pid())),
+		ShellJob:        proto.Bool(criuOpts.ShellJob),
+		LeaveRunning:    proto.Bool(criuOpts.LeaveRunning),
+		TcpEstablished:  proto.Bool(criuOpts.TcpEstablished),
+		ExtUnixSk:       proto.Bool(criuOpts.ExternalUnixConnections),
+		FileLocks:       proto.Bool(criuOpts.FileLocks),
+		EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
+		OrphanPtsMaster: proto.Bool(true),
+		AutoDedup:       proto.Bool(criuOpts.AutoDedup),
+		LazyPages:       proto.Bool(criuOpts.LazyPages),
+	}
+
+	// if criuOpts.WorkDirectory is not set, criu default is used.
+	if criuOpts.WorkDirectory != "" {
+		if err := os.Mkdir(criuOpts.WorkDirectory, 0o700); err != nil && !os.IsExist(err) {
+			return err
+		}
+		workDir, err := os.Open(criuOpts.WorkDirectory)
+		if err != nil {
+			return err
+		}
+		defer workDir.Close()
+		rpcOpts.WorkDirFd = proto.Int32(int32(workDir.Fd()))
+		logDir = criuOpts.WorkDirectory
+	}
+
+	c.handleCriuConfigurationFile(&rpcOpts)
+
+	// If the container is running in a network namespace and has
+	// a path to the network namespace configured, we will dump
+	// that network namespace as an external namespace and we
+	// will expect that the namespace exists during restore.
+	// This basically means that CRIU will ignore the namespace
+	// and expect to be setup correctly.
+	if err := c.handleCheckpointingExternalNamespaces(&rpcOpts, configs.NEWNET); err != nil {
+		return err
+	}
+
+	// Same for possible external PID namespaces
+	if err := c.handleCheckpointingExternalNamespaces(&rpcOpts, configs.NEWPID); err != nil {
+		return err
+	}
+
+	// CRIU can use cgroup freezer; when rpcOpts.FreezeCgroup
+	// is not set, CRIU uses ptrace() to pause the processes.
+	// Note cgroup v2 freezer is only supported since CRIU release 3.14.
+	if !cgroups.IsCgroup2UnifiedMode() || c.checkCriuVersion(31400) == nil {
+		if fcg := c.cgroupManager.Path("freezer"); fcg != "" {
+			rpcOpts.FreezeCgroup = proto.String(fcg)
+		}
+	}
+
+	// append optional criu opts, e.g., page-server and port
+	if criuOpts.PageServer.Address != "" && criuOpts.PageServer.Port != 0 {
+		rpcOpts.Ps = &criurpc.CriuPageServerInfo{
+			Address: proto.String(criuOpts.PageServer.Address),
+			Port:    proto.Int32(criuOpts.PageServer.Port),
+		}
+	}
+
+	// pre-dump may need parentImage param to complete iterative migration
+	if criuOpts.ParentImage != "" {
+		rpcOpts.ParentImg = proto.String(criuOpts.ParentImage)
+		rpcOpts.TrackMem = proto.Bool(true)
+	}
+
+	// append optional manage cgroups mode
+	if criuOpts.ManageCgroupsMode != 0 {
+		mode := criuOpts.ManageCgroupsMode
+		rpcOpts.ManageCgroupsMode = &mode
+	}
+
+	criuOpts.PreDump = true
+
+	var t criurpc.CriuReqType
+	if criuOpts.PreDump {
+		feat := criurpc.CriuFeatures{
+			MemTrack: proto.Bool(true),
+		}
+
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
+			return err
+		}
+
+		t = criurpc.CriuReqType_PRE_DUMP
+	} else {
+		t = criurpc.CriuReqType_DUMP
+	}
+
+	if criuOpts.LazyPages {
+		// lazy migration requested; check if criu supports it
+		feat := criurpc.CriuFeatures{
+			LazyPages: proto.Bool(true),
+		}
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
+			return err
+		}
+
+		if fd := criuOpts.StatusFd; fd != -1 {
+			// check that the FD is valid
+			flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+			if err != nil {
+				return fmt.Errorf("invalid --status-fd argument %d: %w", fd, err)
+			}
+			// and writable
+			if flags&unix.O_WRONLY == 0 {
+				return fmt.Errorf("invalid --status-fd argument %d: not writable", fd)
+			}
+
+			if c.checkCriuVersion(31500) != nil {
+				// For criu 3.15+, use notifications (see case "status-ready"
+				// in criuNotifications). Otherwise, rely on criu status fd.
+				rpcOpts.StatusFd = proto.Int32(int32(fd))
+			}
+		}
+	}
+
 	req := &criurpc.CriuReq{
 		Type: &t,
 		Opts: &rpcOpts,
@@ -484,6 +764,297 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 		logCriuErrors(logDir, logFile)
 		return err
 	}
+	return nil
+}
+
+func (c *Container) CheckpointRDMA(criuOpts *CriuOpts) error {
+	const logFile = "dump.log"
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	// Checkpoint is unlikely to work if os.Geteuid() != 0 || system.RunningInUserNS().
+	// (CLI prints a warning)
+	// TODO(avagin): Figure out how to make this work nicely. CRIU 2.0 has
+	//               support for doing unprivileged dumps, but the setup of
+	//               rootless containers might make this complicated.
+
+	// We are relying on the CRIU version RPC which was introduced with CRIU 3.0.0
+	if err := c.checkCriuVersion(30000); err != nil {
+		return err
+	}
+
+	if criuOpts.ImagesDirectory == "" {
+		return errors.New("invalid directory to save checkpoint")
+	}
+
+	// Since a container can be C/R'ed multiple times,
+	// the checkpoint directory may already exist.
+	if err := os.Mkdir(criuOpts.ImagesDirectory, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	logDir := criuOpts.ImagesDirectory
+	imageDir, err := os.Open(criuOpts.ImagesDirectory)
+	if err != nil {
+		return err
+	}
+	defer imageDir.Close()
+
+	rpcOpts := criurpc.CriuOpts{
+		ImagesDirFd:     proto.Int32(int32(imageDir.Fd())),
+		LogLevel:        proto.Int32(4),
+		LogFile:         proto.String(logFile),
+		Root:            proto.String(c.config.Rootfs),
+		ManageCgroups:   proto.Bool(true),
+		NotifyScripts:   proto.Bool(true),
+		Pid:             proto.Int32(int32(c.initProcess.pid())),
+		ShellJob:        proto.Bool(criuOpts.ShellJob),
+		LeaveRunning:    proto.Bool(criuOpts.LeaveRunning),
+		TcpEstablished:  proto.Bool(criuOpts.TcpEstablished),
+		ExtUnixSk:       proto.Bool(criuOpts.ExternalUnixConnections),
+		FileLocks:       proto.Bool(criuOpts.FileLocks),
+		EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
+		OrphanPtsMaster: proto.Bool(true),
+		AutoDedup:       proto.Bool(criuOpts.AutoDedup),
+		LazyPages:       proto.Bool(criuOpts.LazyPages),
+	}
+
+	// if criuOpts.WorkDirectory is not set, criu default is used.
+	if criuOpts.WorkDirectory != "" {
+		if err := os.Mkdir(criuOpts.WorkDirectory, 0o700); err != nil && !os.IsExist(err) {
+			return err
+		}
+		workDir, err := os.Open(criuOpts.WorkDirectory)
+		if err != nil {
+			return err
+		}
+		defer workDir.Close()
+		rpcOpts.WorkDirFd = proto.Int32(int32(workDir.Fd()))
+		logDir = criuOpts.WorkDirectory
+	}
+
+	c.handleCriuConfigurationFile(&rpcOpts)
+
+	// If the container is running in a network namespace and has
+	// a path to the network namespace configured, we will dump
+	// that network namespace as an external namespace and we
+	// will expect that the namespace exists during restore.
+	// This basically means that CRIU will ignore the namespace
+	// and expect to be setup correctly.
+	if err := c.handleCheckpointingExternalNamespaces(&rpcOpts, configs.NEWNET); err != nil {
+		return err
+	}
+
+	// Same for possible external PID namespaces
+	if err := c.handleCheckpointingExternalNamespaces(&rpcOpts, configs.NEWPID); err != nil {
+		return err
+	}
+
+	// CRIU can use cgroup freezer; when rpcOpts.FreezeCgroup
+	// is not set, CRIU uses ptrace() to pause the processes.
+	// Note cgroup v2 freezer is only supported since CRIU release 3.14.
+	if !cgroups.IsCgroup2UnifiedMode() || c.checkCriuVersion(31400) == nil {
+		if fcg := c.cgroupManager.Path("freezer"); fcg != "" {
+			rpcOpts.FreezeCgroup = proto.String(fcg)
+		}
+	}
+
+	// append optional criu opts, e.g., page-server and port
+	if criuOpts.PageServer.Address != "" && criuOpts.PageServer.Port != 0 {
+		rpcOpts.Ps = &criurpc.CriuPageServerInfo{
+			Address: proto.String(criuOpts.PageServer.Address),
+			Port:    proto.Int32(criuOpts.PageServer.Port),
+		}
+	}
+
+	// pre-dump may need parentImage param to complete iterative migration
+	if criuOpts.ParentImage != "" {
+		rpcOpts.ParentImg = proto.String(criuOpts.ParentImage)
+		rpcOpts.TrackMem = proto.Bool(true)
+	}
+
+	// append optional manage cgroups mode
+	if criuOpts.ManageCgroupsMode != 0 {
+		mode := criuOpts.ManageCgroupsMode
+		rpcOpts.ManageCgroupsMode = &mode
+	}
+
+	var t criurpc.CriuReqType
+	if criuOpts.PreDump {
+		feat := criurpc.CriuFeatures{
+			MemTrack: proto.Bool(true),
+		}
+
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
+			return err
+		}
+
+		t = criurpc.CriuReqType_PRE_DUMP
+	} else {
+		t = criurpc.CriuReqType_DUMP
+	}
+
+	if criuOpts.LazyPages {
+		// lazy migration requested; check if criu supports it
+		feat := criurpc.CriuFeatures{
+			LazyPages: proto.Bool(true),
+		}
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
+			return err
+		}
+
+		if fd := criuOpts.StatusFd; fd != -1 {
+			// check that the FD is valid
+			flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+			if err != nil {
+				return fmt.Errorf("invalid --status-fd argument %d: %w", fd, err)
+			}
+			// and writable
+			if flags&unix.O_WRONLY == 0 {
+				return fmt.Errorf("invalid --status-fd argument %d: not writable", fd)
+			}
+
+			if c.checkCriuVersion(31500) != nil {
+				// For criu 3.15+, use notifications (see case "status-ready"
+				// in criuNotifications). Otherwise, rely on criu status fd.
+				rpcOpts.StatusFd = proto.Int32(int32(fd))
+			}
+		}
+	}
+
+	pid_dir, err := os.ReadDir(criuOpts.ImagesDirectory)
+	if err != nil {
+		return err
+	}
+
+	t = criurpc.CriuReqType_SINGLE_PRE_DUMP_RDMA
+	req := &criurpc.CriuReq{
+		Type: &t,
+		Opts: &rpcOpts,
+	}
+
+	// no need to dump all this in pre-dump
+	hasCgroupns := c.config.Namespaces.Contains(configs.NEWCGROUP)
+	for _, m := range c.config.Mounts {
+		switch m.Device {
+		case "bind":
+			c.addCriuDumpMount(req, m)
+		case "cgroup":
+			if cgroups.IsCgroup2UnifiedMode() || hasCgroupns {
+				// real mount(s)
+				continue
+			}
+			// a set of "external" bind mounts
+			binds, err := getCgroupMounts(m)
+			if err != nil {
+				return err
+			}
+			for _, b := range binds {
+				c.addCriuDumpMount(req, b)
+			}
+		}
+	}
+
+	if err := c.addMaskPaths(req); err != nil {
+		return err
+	}
+
+	for _, node := range c.config.Devices {
+		m := &configs.Mount{Destination: node.Path, Source: node.Path}
+		c.addCriuDumpMount(req, m)
+	}
+
+	// Write the FD info to a file in the image directory
+	fdsJSON, err := json.Marshal(c.initProcess.externalDescriptors())
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(filepath.Join(criuOpts.ImagesDirectory, descriptorsFilename), fdsJSON, 0o600)
+	if err != nil {
+		return err
+	}
+
+	cnt := len(pid_dir)
+	var wg sync.WaitGroup
+	resChan := make(chan error, cnt)
+
+	for _, e := range pid_dir {
+		v, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+
+		this_pid := int32(v)
+
+		this_fds, err := getPipeFds(v)
+		if err != nil {
+			return err
+		}
+
+		this_fds_json, err := json.Marshal(this_fds)
+		if err != nil {
+			return err
+		}
+
+		os.WriteFile(fmt.Sprintf("%s/%s/%s", criuOpts.ImagesDirectory, e.Name(), descriptorsFilename), this_fds_json, 0o600)
+
+		tmp_rpcOpts := criurpc.CriuOpts(rpcOpts)
+
+		imageDir, _ := os.Open(fmt.Sprintf("%s/%s", criuOpts.ImagesDirectory, e.Name()))
+		tmp_rpcOpts.ImagesDirFd = proto.Int32(int32(imageDir.Fd()))
+		tmp_rpcOpts.Pid = proto.Int32(this_pid)
+
+		// Checkpointing PID namespace for container's "exec" process
+		{
+			cmd := exec.Command("readlink", fmt.Sprintf("/proc/%s/ns/pid", e.Name()))
+			out, _ := cmd.Output()
+			raw_str := string(out)
+			external := fmt.Sprintf("pid%s:extRootPidNS", raw_str[4:(len(raw_str)-1)])
+			tmp_rpcOpts.External = append(tmp_rpcOpts.External, external)
+		}
+
+		cmd := exec.Command("cp", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/procspec_%d", c.ID(), this_pid),
+									fmt.Sprintf("%s/", criuOpts.ImagesDirectory))
+		cmd.Run()
+
+		wg.Add(1)
+		go func(pid string, imgpath string, criuOpts CriuOpts,
+					tmp_rpcOpts criurpc.CriuOpts, resChan chan error) {
+			defer wg.Done()
+
+			my_criuOpts := CriuOpts(criuOpts)
+			my_rpcOpts := criurpc.CriuOpts(tmp_rpcOpts)
+
+			req := &criurpc.CriuReq{
+				Type: &t,
+				Opts: &my_rpcOpts,
+			}
+
+			err = c.criuSwrk(nil, req, &my_criuOpts, nil)
+			resChan <- err
+			if err != nil {
+				logCriuErrors(logDir, logFile)
+			}
+		}(e.Name(), fmt.Sprintf("%s/%s", criuOpts.ImagesDirectory, e.Name()),
+						*criuOpts, tmp_rpcOpts, resChan)
+	}
+
+	wg.Wait()
+	for cnt > 0 {
+		err := <- resChan
+		if err != nil {
+			return err
+		}
+		cnt = cnt - 1
+	}
+
+	err = c.criuSwrk(nil, req, criuOpts, nil)
+	if err != nil {
+		logCriuErrors(logDir, logFile)
+		return err
+	}
+
 	return nil
 }
 
@@ -636,7 +1207,7 @@ func (c *Container) prepareCriuRestoreMounts(mounts []*configs.Mount) error {
 
 // Restore restores the checkpointed container to a running state using the
 // criu(8) utility.
-func (c *Container) Restore(process *Process, criuOpts *CriuOpts) error {
+func (c *Container) Restore(process *Process, criuOpts *CriuOpts, is_init bool) error {
 	const logFile = "restore.log"
 	c.m.Lock()
 	defer c.m.Unlock()
@@ -661,16 +1232,24 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts) error {
 		return err
 	}
 	defer imageDir.Close()
+	
+	pid_dir, err := os.ReadDir(criuOpts.ImagesDirectory)
+	if err != nil {
+		return err
+	}
+
+	cnt := len(pid_dir) - 1
+
 	// CRIU has a few requirements for a root directory:
 	// * it must be a mount point
 	// * its parent must not be overmounted
 	// c.config.Rootfs is bind-mounted to a temporary directory
 	// to satisfy these requirements.
 	root := filepath.Join(c.stateDir, "criu-root")
-	if err := os.Mkdir(root, 0o755); err != nil {
-		return err
-	}
-	defer os.Remove(root)
+	err = os.Mkdir(root, 0o755)
+	if err == nil {
+		defer os.Remove(root)
+ 	}
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		return err
@@ -694,7 +1273,7 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts) error {
 			NotifyScripts:   proto.Bool(true),
 			ShellJob:        proto.Bool(criuOpts.ShellJob),
 			ExtUnixSk:       proto.Bool(criuOpts.ExternalUnixConnections),
-			TcpEstablished:  proto.Bool(criuOpts.TcpEstablished),
+			TcpEstablished:  proto.Bool(true),
 			FileLocks:       proto.Bool(criuOpts.FileLocks),
 			EmptyNs:         proto.Uint32(criuOpts.EmptyNs),
 			OrphanPtsMaster: proto.Bool(true),
@@ -737,6 +1316,25 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts) error {
 	if err := c.handleRestoringNamespaces(req.Opts, &extraFiles); err != nil {
 		return err
 	}
+
+	// Joining PID namespace of container's init_process
+	{
+		init_pid := c.initProcess.pid()
+		nsPath := fmt.Sprintf("/proc/%d/ns/pid", init_pid)
+		nsFd, err := os.Open(nsPath)
+		if err != nil {
+			return fmt.Errorf("Requested PID namespace %v does not exist", nsPath)
+		}
+
+		inheritFd := &criurpc.InheritFd{
+			Key:		proto.String("extRootPidNS"),
+			Fd:			proto.Int32(int32(4 + len(extraFiles))),
+		}
+
+		req.Opts.InheritFd = append(req.Opts.InheritFd, inheritFd)
+		extraFiles = append(extraFiles, nsFd)
+	}
+
 
 	// This will modify the rootfs of the container in the same way runc
 	// modifies the container during initial creation.
@@ -803,9 +1401,88 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts) error {
 			req.Opts.InheritFd = append(req.Opts.InheritFd, inheritFd)
 		}
 	}
-	err = c.criuSwrk(process, req, criuOpts, extraFiles)
-	if err != nil {
-		logCriuErrors(logDir, logFile)
+
+	if is_init == false {
+		err = c.criuSwrk(process, req, criuOpts, extraFiles)
+		if err != nil {
+			logCriuErrors(logDir, logFile)
+			return err
+		}
+		return nil
+	} else {
+		cnt = cnt+1
+		var wg sync.WaitGroup
+		resChan := make(chan error, cnt)
+
+		wg.Add(1)
+		go func(resChan chan error) {
+			defer wg.Done()
+			err := c.criuSwrk(process, req, criuOpts, extraFiles)
+			resChan <- err
+		}(resChan)
+
+		if(cnt-1 > 0) {
+			for _, e := range pid_dir {
+				fi, _ := os.Stat(fmt.Sprintf("%s/%s", criuOpts.ImagesDirectory, e.Name()))
+				if fi.Mode().IsRegular() {
+					continue
+				}
+	
+				v, err := strconv.Atoi(e.Name())
+				if err != nil {
+					continue
+				}
+
+				this_pid := int(v)
+	
+				os.Mkdir(fmt.Sprintf("/var/lib/containerd/io.containerd.runtime.v1.linux/moby/%064d", this_pid), 0o644)
+
+				wg.Add(1)
+				go func(c Container, criuOpts CriuOpts, this_pid int, entry string, resChan chan error) {
+					defer wg.Done()
+					my_container := Container(c)
+					my_criuOpts := CriuOpts(criuOpts)
+					my_pid := this_pid
+					my_entry := entry
+
+					var cmd *exec.Cmd
+					if(my_criuOpts.RDMAPreSetup == false) {
+						cmd = exec.Command("runc", "--root", "/var/run/docker/runtime-runc/moby", "--log",
+								fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/log.json", my_container.ID()),
+								"--log-format", "json", "execrestore",
+								"--image-path", fmt.Sprintf("%s/%d", my_criuOpts.ImagesDirectory, this_pid),
+								"--work-path", fmt.Sprintf("/var/lib/containerd/io.containerd.runtime.v1.linux/moby/%064d", my_pid),
+								"--process", fmt.Sprintf("%s/procspec_%s", my_criuOpts.ImagesDirectory, my_entry),
+								"--detach", "--pid-file", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/%064d.pid", c.ID(), my_pid),
+								my_container.ID())
+					} else {
+						cmd = exec.Command("runc", "--root", "/var/run/docker/runtime-runc/moby", "--log",
+								fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/log.json", my_container.ID()),
+								"--log-format", "json", "execrestore",
+								"--image-path", fmt.Sprintf("%s/%d", my_criuOpts.ImagesDirectory, this_pid),
+								"--work-path", fmt.Sprintf("/var/lib/containerd/io.containerd.runtime.v1.linux/moby/%064d", my_pid),
+								"--process", fmt.Sprintf("%s/procspec_%s", my_criuOpts.ImagesDirectory, my_entry),
+								"--detach", "--pid-file", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/%064d.pid", c.ID(), my_pid),
+								"--rdma-presetup", "--migr-dst", my_criuOpts.MigrDst, my_container.ID())
+					}
+
+					output, err := cmd.CombinedOutput()
+					fmt.Printf("%s", output)
+					resChan <- err
+				}(*c, *criuOpts, this_pid, e.Name(), resChan)
+			}
+		}
+
+		wg.Wait()
+		for cnt > 0 {
+			err := <-resChan
+
+			if err != nil {
+				logCriuErrors(logDir, logFile)
+				return err
+			}
+			cnt = cnt - 1
+		}
 	}
 
 	// Now that CRIU is done let's close all opened FDs CRIU needed.
@@ -873,9 +1550,9 @@ func (c *Container) criuApplyCgroups(pid int, req *criurpc.CriuReq) error {
 	}
 
 	// XXX: Do we need to deal with this case? AFAIK criu still requires root.
-	if err := c.cgroupManager.Apply(pid); err != nil {
-		return err
-	}
+//	if err := c.cgroupManager.Apply(pid); err != nil {
+//		return err
+//	}
 
 	if err := c.cgroupManager.Set(c.config.Cgroups.Resources); err != nil {
 		return err
@@ -995,6 +1672,23 @@ func (c *Container) criuSwrk(process *Process, req *criurpc.CriuReq, opts *CriuO
 		return err
 	}
 
+	if(*req.Type == criurpc.CriuReqType_SINGLE_PRE_DUMP_RDMA) {
+		_, err = criuClientCon.Write([]byte(opts.MigrDst))
+		if err != nil {
+			return err
+		}
+	} else if(*req.Type == criurpc.CriuReqType_DUMP || *req.Type == criurpc.CriuReqType_RESTORE) {
+		var buf bytes.Buffer
+		buf.Write(strconv.AppendBool([]byte{}, opts.RDMAPreSetup))
+		buf.Write([]byte(" "))
+		buf.Write([]byte(opts.MigrDst))
+
+		_, err = criuClientCon.Write(buf.Bytes())
+		if err != nil {
+			return err
+		}
+	}
+
 	buf := make([]byte, 10*4096)
 	oob := make([]byte, 4096)
 	for {
@@ -1052,6 +1746,8 @@ func (c *Container) criuSwrk(process *Process, req *criurpc.CriuReq, opts *CriuO
 		case criurpc.CriuReqType_RESTORE:
 		case criurpc.CriuReqType_DUMP:
 		case criurpc.CriuReqType_PRE_DUMP:
+		case criurpc.CriuReqType_SINGLE_PRE_DUMP:
+		case criurpc.CriuReqType_SINGLE_PRE_DUMP_RDMA:
 		default:
 			return fmt.Errorf("unable to parse the response %s", resp.String())
 		}
@@ -1158,12 +1854,15 @@ func (c *Container) criuNotifications(resp *criurpc.CriuResp, process *Process, 
 		if err != nil {
 			return err
 		}
+		c_status, _ := c.currentStatus()
 		process.ops = r
-		if err := c.state.transition(&restoredState{
-			imageDir: opts.ImagesDirectory,
-			c:        c,
-		}); err != nil {
-			return err
+		if c_status.String() != "running" {
+			if err := c.state.transition(&restoredState{
+				imageDir: opts.ImagesDirectory,
+				c:        c,
+			}); err != nil {
+				return err
+			}
 		}
 		// create a timestamp indicating when the restored checkpoint was started
 		c.created = time.Now().UTC()
