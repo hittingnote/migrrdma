@@ -1,0 +1,22 @@
+#!/bin/bash
+
+dist=`lsb_release -s -i | tr '[:upper:]' '[:lower:]'`
+dist_ver=`lsb_release -s -r`
+
+if [ "X$dist" != "Xubuntu" ]; then
+	/usr/sbin/update-rc.d -f openibd remove > /dev/null 2>&1
+fi
+
+if (systemctl 2>/dev/null | grep -qw "\\-\.mount" 2>/dev/null); then
+	systemctl disable openibd >/dev/null  2>&1 || true
+fi
+
+for old_udev in \
+	/etc/udev/rules.d/82-net-setup-link.rules \
+	/etc/udev/rules.d/83-net-setup-link.rules \
+	/etc/udev/rules.d/90-ib \
+; do
+	dpkg-maintscript-helper rm_conffile $old_udev 5.4-OFED.5.4.0.4.9 -- "$@"
+done
+
+exit 0

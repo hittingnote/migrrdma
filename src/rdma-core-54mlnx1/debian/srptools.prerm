@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# Error handler for init script errors
+srptools_error_handler() {
+	echo "$0: It seems the srp_daemon failed. But moving on anyway"
+}
+
+#DEBHELPER#
