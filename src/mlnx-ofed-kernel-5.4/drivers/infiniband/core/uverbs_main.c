@@ -285,6 +285,45 @@ static ssize_t ib_uverbs_comp_event_read(struct file *filp, char __user *buf,
 				    sizeof(struct ib_uverbs_comp_event_desc));
 }
 
+static ssize_t ib_uverbs_comp_event_write(struct file *filp, const char __user *buf,
+					size_t size, loff_t *off) {
+	struct ib_uverbs_completion_event_file *comp_ev_file =
+								filp->private_data;
+	struct ib_uverbs_event_queue *ev_queue = &comp_ev_file->ev_queue;
+	ssize_t write_size = 0;
+
+	spin_lock_irq(&ev_queue->lock);
+	while(write_size + sizeof(struct ib_uverbs_comp_event_desc) <= size) {
+		struct ib_uverbs_event *entry;
+
+		entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+		if(!entry) {
+			spin_unlock_irq(&ev_queue->lock);
+			return -ENOMEM;
+		}
+
+		if(copy_from_user(&entry->desc.comp, buf + write_size,
+					sizeof(struct ib_uverbs_comp_event_desc))) {
+			kfree(entry);
+			spin_unlock_irq(&ev_queue->lock);
+			return -EFAULT;
+		}
+
+		entry->desc.comp.flag = 0;
+		entry->counter = NULL;
+
+		list_add_tail(&entry->list, &ev_queue->event_list);
+		write_size += sizeof(struct ib_uverbs_comp_event_desc);
+	}
+
+	spin_unlock_irq(&ev_queue->lock);
+
+	wake_up_interruptible(&ev_queue->poll_wait);
+	kill_fasync(&ev_queue->async_queue, SIGIO, POLL_IN);
+
+	return write_size;
+}
+
 static __poll_t ib_uverbs_event_poll(struct ib_uverbs_event_queue *ev_queue,
 					 struct file *filp,
 					 struct poll_table_struct *wait)
@@ -338,6 +377,7 @@ static int ib_uverbs_comp_event_fasync(int fd, struct file *filp, int on)
 const struct file_operations uverbs_event_fops = {
 	.owner	 = THIS_MODULE,
 	.read	 = ib_uverbs_comp_event_read,
+	.write	 = ib_uverbs_comp_event_write,
 	.poll    = ib_uverbs_comp_event_poll,
 	.release = uverbs_uobject_fd_release,
 	.fasync  = ib_uverbs_comp_event_fasync,
@@ -378,6 +418,7 @@ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
 	uobj = cq->uobject;
 
 	entry->desc.comp.cq_handle = cq->uobject->uevent.uobject.user_handle;
+	entry->desc.comp.flag		= 1;
 	entry->counter		   = &uobj->comp_events_reported;
 
 	list_add_tail(&entry->list, &ev_queue->event_list);
@@ -930,6 +971,9 @@ static int ib_uverbs_open(struct inode *inode, struct file *filp)
 		goto err;
 	}
 
+	file->ufile_proc_ent = NULL;
+	file->task_node = NULL;
+
 	file->device	 = dev;
 	kref_init(&file->ref);
 	mutex_init(&file->ucontext_lock);
@@ -962,9 +1006,14 @@ err:
 	return ret;
 }
 
+#include "rdma_footprint.h"
+
 static int ib_uverbs_close(struct inode *inode, struct file *filp)
 {
 	struct ib_uverbs_file *file = filp->private_data;
+
+//	ufile_dealloc_mapping(file);
+	deregister_rdma_dev_fd_entry(file);
 
 	uverbs_destroy_ufile_hw(file, RDMA_REMOVE_CLOSE);
 
@@ -1105,6 +1154,9 @@ static int ib_uverbs_add_one(struct ib_device *device)
 	struct ib_uverbs_device *uverbs_dev;
 	int ret;
 
+	device->proc_ent = NULL;
+	device->uwrite_proc_ent = NULL;
+	device->qpn_dict = NULL;
 	if (!device->ops.alloc_ucontext)
 		return -EOPNOTSUPP;
 
@@ -1159,6 +1211,12 @@ static int ib_uverbs_add_one(struct ib_device *device)
 	ret = cdev_device_add(&uverbs_dev->cdev, &uverbs_dev->dev);
 	if (ret)
 		goto err_uapi;
+	
+	ret = mkdir_ibdev_sig_link(device);
+	if(ret) {
+		cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
+		goto err_uapi;
+	}
 
 	ib_set_client_data(device, &uverbs_client, uverbs_dev);
 	return 0;
@@ -1210,6 +1268,7 @@ static void ib_uverbs_remove_one(struct ib_device *device, void *client_data)
 	struct ib_uverbs_device *uverbs_dev = client_data;
 	int wait_clients = 1;
 
+	rmdir_ibdev_sig_link(device);
 	cdev_device_del(&uverbs_dev->cdev, &uverbs_dev->dev);
 	ida_free(&uverbs_ida, uverbs_dev->devnum);
 
@@ -1285,6 +1344,13 @@ static int __init ib_uverbs_init(void)
 		goto out_class;
 	}
 
+	ret = rdma_footprint_init();
+	if(ret) {
+		pr_err("user_verbs: couldn't init footprint\n");
+		ib_unregister_client(&uverbs_client);
+		goto out_class;
+	}
+
 	return 0;
 
 out_class:
@@ -1304,6 +1370,7 @@ out:
 
 static void __exit ib_uverbs_cleanup(void)
 {
+	rdma_footprint_exit();
 	ib_unregister_client(&uverbs_client);
 	class_destroy(uverbs_class);
 	unregister_chrdev_region(IB_UVERBS_BASE_DEV,

@@ -751,9 +751,13 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 		return err;
 	}
 
+	cq->ibcq.buf_addr = ucmd.buf_addr;
+
 	err = mlx5_ib_db_map_user(context, udata, ucmd.db_addr, &cq->db);
 	if (err)
 		goto err_umem;
+	
+	cq->ibcq.db_addr = ucmd.db_addr;
 
 	mlx5_ib_cont_pages(cq->buf.umem, ucmd.buf_addr, 0, &npages, &page_shift,
 			   &ncont, NULL);
@@ -1342,6 +1346,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
 		ib_umem_release(cq->buf.umem);
 		cq->buf.umem = cq->resize_umem;
 		cq->resize_umem = NULL;
+		cq->ibcq.buf_addr = cq->buf.umem->address;
 	} else {
 		struct mlx5_ib_cq_buf tbuf;
 		int resized = 0;
