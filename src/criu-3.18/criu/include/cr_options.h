@@ -37,6 +37,8 @@
 #define CPU_CAP_ALL	(CPU_CAP_FPU | CPU_CAP_CPU | CPU_CAP_INS)
 #define CPU_CAP_DEFAULT (CPU_CAP_FPU | CPU_CAP_INS)
 
+extern int timens_helper_pid;
+
 struct cg_root_opt {
 	struct list_head node;
 	char *controller;
@@ -109,6 +111,7 @@ enum criu_mode {
 	CR_UNSET = 0,
 	CR_DUMP,
 	CR_PRE_DUMP,
+	CR_PRE_DUMP_RDMA,
 	CR_RESTORE,
 	CR_LAZY_PAGES,
 	CR_CHECK,
@@ -238,8 +241,17 @@ struct cr_options {
 	int unprivileged;
 };
 
+#include <linux/limits.h>
+
+extern char check_buf[1024];
+extern char *ip_addr;
+extern int enable_pre_setup;
+
 extern struct cr_options opts;
+extern char images_dir[PATH_MAX];
+extern char images_dir_path[PATH_MAX];
 extern char *rpc_cfg_file;
+extern FILE *fp;
 
 extern int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, int state);
 extern int check_options(void);

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include "soccr.h"
+#include "external.h"
 
 #ifndef SIOCOUTQNSD
 /* MAO - Define SIOCOUTQNSD ioctl if we don't have it */
@@ -490,10 +491,13 @@ static int libsoccr_set_sk_data_noq(struct libsoccr_sk *sk, struct libsoccr_sk_d
 		return -1;
 	}
 
-	if (sk->src_addr->sa.sa_family == AF_INET)
+	if (sk->src_addr->sa.sa_family == AF_INET) {
 		addr_size = sizeof(sk->src_addr->v4);
-	else
+		inet_pton(sk->src_addr->sa.sa_family, ip_addr, &sk->src_addr->v4.sin_addr);
+	}
+	else {
 		addr_size = sizeof(sk->src_addr->v6);
+	}
 
 	if (bind(sk->fd, &sk->src_addr->sa, addr_size)) {
 		logerr("Can't bind inet socket back");

@@ -1197,6 +1197,12 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 	fe.id = rfe.id;
 	fe.reg = &rfe;
 
+	if(fp) {
+		fwrite(&fe, sizeof(fe), 1, fp);
+		fwrite(&rfe, sizeof(rfe), 1, fp);
+		fwrite(&fwn, sizeof(fwn), 1, fp);
+	}
+
 	return pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
 }
 
@@ -1855,6 +1861,12 @@ ext:
 	fe.id = rfe.id;
 	fe.reg = &rfe;
 
+	if(fp) {
+		fwrite(&fe, sizeof(fe), 1, fp);
+		fwrite(&rfe, sizeof(rfe), 1, fp);
+		fwrite(rfe.fown, sizeof(*rfe.fown), 1, fp);
+	}
+
 	rimg = img_from_set(glob_imgset, CR_FD_FILES);
 	ret = pb_write_one(rimg, &fe, PB_FILE);
 
@@ -2286,6 +2298,14 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 
 	mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
 ext:
+	{
+		pid_t pid;
+		char suffix[64];
+		if(sscanf(rfi->path, "proc/rdma_uwrite/%d/%s", &pid, suffix) >= 2) {
+			sprintf(rfi->path, "proc/rdma_uwrite/%d/%s", current->pid->real, suffix);
+			pr_info("rfi->path: %s\n", rfi->path);
+		}
+	}
 	tmp = open_cb(mntns_root, rfi, arg);
 	if (tmp < 0) {
 		pr_perror("Can't open file %s", rfi->path);
@@ -2314,12 +2334,24 @@ ext:
 				saved_mode &= ~(S_IRWXU | S_IRWXG | S_IRWXO);
 			}
 
+			if(curr_mode != saved_mode) {
+				char fname[1024];
+
+				sprintf(fname, "/%s", rfi->path);
+				if(chmod(fname, saved_mode) < 0) {
+					pr_err("Failed to change mode");
+					goto err;
+				}
+			}
+
+#if 0
 			if (curr_mode != saved_mode) {
 				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
 				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
 				       rfi->path, (int)curr_mode, saved_mode);
 				goto err;
 			}
+#endif
 		}
 
 		/*
