@@ -101,6 +101,21 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.dealloc_mw    = mlx5_dealloc_mw,
 	.bind_mw       = mlx5_bind_mw,
 	.create_cq     = mlx5_create_cq,
+	.resume_cq	   = mlx5_resume_cq,
+	.resume_cq_v2	   = mlx5_resume_cq_v2,
+	.uwrite_cq	   = mlx5_uwrite_cq,
+	.uwrite_qp	   = mlx5_uwrite_qp,
+	.uwrite_srq	   = mlx5_uwrite_srq,
+	.get_cons_index		= mlx5_get_cons_index,
+	.set_cons_index		= mlx5_set_cons_index,
+	.copy_cqe_to_shaded		= mlx5_copy_cqe_to_shaded,
+	.resume_srq				= mlx5_resume_srq,
+	.resume_srq_v2				= mlx5_resume_srq_v2,
+	.migrrdma_start_poll	= migrrdma_start_poll,
+	.migrrdma_end_poll		= migrrdma_end_poll,
+	.migrrdma_poll_cq		= migrrdma_poll_cq,
+	.migrrdma_start_inspect_qp = migrrdma_start_inspect_qp,
+	.migrrdma_start_inspect_qp_v2 = migrrdma_start_inspect_qp_v2,
 	.poll_cq       = mlx5_poll_cq,
 	.req_notify_cq = mlx5_arm_cq,
 	.cq_event      = mlx5_cq_event,
@@ -112,6 +127,22 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.destroy_srq   = mlx5_destroy_srq,
 	.post_srq_recv = mlx5_post_srq_recv,
 	.create_qp     = mlx5_create_qp,
+	.resume_qp	   = mlx5_resume_qp,
+	.free_qp	   = mlx5_free_qp,
+	.is_q_empty    = mlx5_is_q_empty,
+	.migrrdma_is_q_empty    = mlx5_migrrdma_is_q_empty,
+	.qp_get_n_posted		= mlx5_qp_get_n_posted,
+	.qp_get_n_acked			= mlx5_qp_get_n_acked,
+	.srq_get_n_acked		= mlx5_srq_get_n_acked,
+	.copy_qp	   = mlx5_copy_qp,
+	.calloc_qp	   = mlx5_calloc_qp,
+	.replay_recv_wr = mlx5_replay_recv_wr,
+	.prepare_qp_recv_replay = mlx5_prepare_qp_recv_replay,
+	.prepare_qp_recv_replay_v2 = mlx5_prepare_qp_recv_replay_v2,
+	.replay_srq_recv_wr = mlx5_replay_srq_recv_wr,
+	.prepare_srq_replay = mlx5_prepare_srq_replay,
+	.copy_uar_list = mlx5_copy_uar_list,
+	.record_qp_index = mlx5_record_qp_index,
 	.query_qp      = mlx5_query_qp,
 	.modify_qp     = mlx5_modify_qp,
 	.destroy_qp    = mlx5_destroy_qp,
@@ -216,6 +247,17 @@ static int32_t get_free_uidx(struct mlx5_context *ctx)
 	}
 
 	return (tind << MLX5_UIDX_TABLE_SHIFT) | i;
+}
+
+void change_uidx(struct mlx5_context *ctx,
+				struct mlx5_qp *tgt, struct mlx5_qp *src) {
+	int32_t tind;
+	int32_t uidx = src->rsc.rsn;
+
+	pthread_mutex_lock(&ctx->uidx_table_mutex);
+	tind = uidx >> MLX5_UIDX_TABLE_SHIFT;
+	ctx->uidx_table[tind].table[uidx & MLX5_UIDX_TABLE_MASK] = tgt;
+	pthread_mutex_unlock(&ctx->uidx_table_mutex);
 }
 
 int32_t mlx5_store_uidx(struct mlx5_context *ctx, void *rsc)
@@ -2257,6 +2299,10 @@ err_free:
 	return -1;
 }
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 						int cmd_fd,
 						void *private_data)
@@ -2267,6 +2313,8 @@ static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 	struct mlx5dv_context_attr      *ctx_attr = private_data;
 	bool				always_devx = false;
 	int ret;
+	char fname[128];
+	int info_fd;
 
 	context = mlx5_init_context(ibdev, cmd_fd);
 	if (!context)
@@ -2282,7 +2330,6 @@ static struct verbs_context *mlx5_alloc_context(struct ibv_device *ibdev,
 	req.max_cqe_version = MLX5_CQE_VERSION_V1;
 	req.lib_caps |= (MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR);
 	if (ctx_attr && ctx_attr->flags) {
-
 		if (!check_comp_mask(ctx_attr->flags,
 				     MLX5DV_CONTEXT_FLAGS_DEVX)) {
 			errno = EINVAL;
@@ -2312,11 +2359,476 @@ retry_open:
 	if (ret)
 		goto err;
 
+	context->ibv_ctx.context.lkey_fd = -1;
+	context->ibv_ctx.context.lkey_mapping = MAP_FAILED;
+	context->ibv_ctx.context.rkey_fd = -1;
+	context->ibv_ctx.context.rkey_mapping = MAP_FAILED;
+	
+	ret = ibv_cmd_install_footprint(&context->ibv_ctx.context);
+	if(ret) {
+		ibv_close_device(&context->ibv_ctx.context);
+		return NULL;
+	}
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/nc_uar",
+					rdma_getpid(&context->ibv_ctx.context),
+					context->ibv_ctx.context.cmd_fd);
+	info_fd = open(fname, O_WRONLY);
+	if(info_fd < 0) {
+		ibv_close_device(&context->ibv_ctx.context);
+		return NULL;
+	}
+
+	if(write(info_fd, &context->nc_uar, sizeof(context->nc_uar)) < 0) {
+		close(info_fd);
+		ibv_close_device(&context->ibv_ctx.context);
+		return NULL;
+	}
+
+	close(info_fd);
+
 	return &context->ibv_ctx;
 
 err:
 	mlx5_uninit_context(context);
 	return NULL;
+}
+
+static struct verbs_context *mlx5_pre_resume_context(struct ibv_device *ibdev,
+								int cmd_fd) {
+	struct mlx5_context *mlx5_ctx;
+	struct mlx5_alloc_ucontext	req = {};
+	struct mlx5_alloc_ucontext_resp resp = {};
+	int err;
+
+	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
+	if(!mlx5_ctx)
+		return NULL;
+	
+	req.total_num_bfregs = mlx5_ctx->tot_uuars;
+	req.num_low_latency_bfregs = mlx5_ctx->low_lat_uuars;
+	req.max_cqe_version = MLX5_CQE_VERSION_V1;
+	req.lib_caps |= (MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR);
+	req.flags = MLX5_IB_ALLOC_UCTX_DEVX;
+
+	err = mlx5_cmd_get_context(mlx5_ctx, &req, sizeof(req),
+							&resp, sizeof(resp));
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(ibv_cmd_install_footprint(&mlx5_ctx->ibv_ctx.context)) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(ibv_cmd_install_ctx_resp(&mlx5_ctx->ibv_ctx.context, &resp, sizeof(resp))) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	return &mlx5_ctx->ibv_ctx;
+}
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
+					int cmd_fd, int *async_fd, struct verbs_context *orig_ctx) {
+	struct mlx5_context *mlx5_ctx;
+	struct mlx5_alloc_ucontext	req = {};
+	struct mlx5_alloc_ucontext_resp resp = {};
+	char fname[128];
+	int ctx_resp_fd;
+	int err;
+	int info_fd;
+
+	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
+	if(!mlx5_ctx)
+		return NULL;
+	
+	req.total_num_bfregs = mlx5_ctx->tot_uuars;
+	req.num_low_latency_bfregs = mlx5_ctx->low_lat_uuars;
+	req.max_cqe_version = MLX5_CQE_VERSION_V1;
+	req.lib_caps |= (MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR);
+	req.flags = MLX5_IB_ALLOC_UCTX_DEVX;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/ctx_resp", rdma_getpid(&mlx5_ctx->ibv_ctx.context), cmd_fd);
+	ctx_resp_fd = open(fname, O_RDONLY);
+	if(ctx_resp_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(read(ctx_resp_fd, &resp, sizeof(resp)) < 0) {
+		close(ctx_resp_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(ctx_resp_fd);
+
+	err = mlx5_set_context(mlx5_ctx, &resp.drv_payload, false);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR); i++) {
+		typeof(mlx5_ctx->uar[i].reg) *content_p;
+
+		to_mctx(&orig_ctx->context)->uar[i].reg = mlx5_ctx->uar[i].reg;
+		content_p = malloc(sizeof(*content_p));
+		if(!content_p) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		*content_p = mlx5_ctx->uar[i].reg;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->uar[i].reg,
+						sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		if(mlx5_ctx->uar[i].reg &&
+					register_keep_mmap_region(mlx5_ctx->uar[i].reg,
+						to_mdev(mlx5_ctx->ibv_ctx.context.device)->page_size)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR) &&
+							to_mctx(&orig_ctx->context)->bfs; i++) {
+		for(int j = 0; j < mlx5_ctx->num_uars_per_page; j++) {
+			for(int k = 0; k < NUM_BFREGS_PER_UAR; k++) {
+				int bfi = (i * mlx5_ctx->num_uars_per_page + j) * NUM_BFREGS_PER_UAR + k;
+				typeof(mlx5_ctx->bfs[bfi].reg) *content_p;
+
+				to_mctx(&orig_ctx->context)->bfs[bfi].reg = mlx5_ctx->bfs[bfi].reg;
+				content_p = malloc(sizeof(*content_p));
+				*content_p = mlx5_ctx->bfs[bfi].reg;
+				if(register_update_mem(&to_mctx(&orig_ctx->context)->bfs[bfi].reg,
+								sizeof(*content_p), content_p)) {
+					ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+					free(mlx5_ctx);
+					return NULL;
+				}
+			}
+		}
+	}
+
+	{
+		typeof(mlx5_ctx->hca_core_clock) *content_p;
+
+		to_mctx(&orig_ctx->context)->hca_core_clock = mlx5_ctx->hca_core_clock;
+		content_p = malloc(sizeof(*content_p));
+		*content_p = mlx5_ctx->hca_core_clock;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->hca_core_clock,
+								sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		if(register_keep_mmap_region(mlx5_ctx->hca_core_clock -
+						(mlx5_ctx->core_clock.offset &
+						(to_mdev(mlx5_ctx->ibv_ctx.context.device)->page_size - 1)),
+						to_mdev(mlx5_ctx->ibv_ctx.context.device)->page_size)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	{
+		typeof(mlx5_ctx->clock_info_page) *content_p;
+
+		to_mctx(&orig_ctx->context)->clock_info_page = mlx5_ctx->clock_info_page;
+		content_p = malloc(sizeof(*content_p));
+		*content_p = mlx5_ctx->clock_info_page;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->clock_info_page,
+								sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		if(register_keep_mmap_region(mlx5_ctx->clock_info_page,
+						to_mdev(mlx5_ctx->ibv_ctx.context.device)->page_size)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	{
+		typeof(mlx5_ctx->nc_uar->uar) *content_p;
+
+		to_mctx(&orig_ctx->context)->nc_uar->uar = mlx5_ctx->nc_uar->uar;
+		content_p = malloc(sizeof(*content_p));
+		*content_p = mlx5_ctx->nc_uar->uar;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->uar,
+								sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		if(register_keep_mmap_region(mlx5_ctx->nc_uar->uar,
+							mlx5_ctx->nc_uar->length)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	{
+		typeof(mlx5_ctx->nc_uar->reg) *content_p;
+
+		to_mctx(&orig_ctx->context)->nc_uar->reg = mlx5_ctx->nc_uar->reg;
+		content_p = malloc(sizeof(*content_p));
+		*content_p = mlx5_ctx->nc_uar->reg;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->reg,
+								sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	{
+		typeof(mlx5_ctx->nc_uar->page_id) *content_p;
+
+		to_mctx(&orig_ctx->context)->nc_uar->page_id = mlx5_ctx->nc_uar->page_id;
+		content_p = malloc(sizeof(*content_p));
+		*content_p = mlx5_ctx->nc_uar->page_id;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->page_id,
+								sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	err = ibv_cmd_alloc_async_fd(&mlx5_ctx->ibv_ctx.context);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(async_fd)
+		*async_fd = mlx5_ctx->ibv_ctx.context.async_fd;
+
+	err = ibv_cmd_register_async_fd(&mlx5_ctx->ibv_ctx.context, *async_fd);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	to_mctx(&orig_ctx->context)->cq_uar_reg = mlx5_ctx->cq_uar_reg;
+
+	{
+		typeof(mlx5_ctx->cq_uar_reg) *content_p;
+
+		content_p = malloc(sizeof(*content_p));
+		if(!content_p) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+
+		*content_p = mlx5_ctx->cq_uar_reg;
+		if(register_update_mem(&to_mctx(&orig_ctx->context)->cq_uar_reg,
+						sizeof(*content_p), content_p)) {
+			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+			free(mlx5_ctx);
+			return NULL;
+		}
+	}
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/nc_uar",
+					rdma_getpid(&mlx5_ctx->ibv_ctx.context),
+					mlx5_ctx->ibv_ctx.context.cmd_fd);
+	info_fd = open(fname, O_WRONLY);
+	if(info_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(write(info_fd, &to_mctx(&orig_ctx->context)->nc_uar,
+					sizeof(to_mctx(&orig_ctx->context)->nc_uar)) < 0) {
+		close(info_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(info_fd);
+
+	return &mlx5_ctx->ibv_ctx;
+}
+
+static struct verbs_context *mlx5_resume_context_v2(struct ibv_device *ibdev,
+					int cmd_fd, int *async_fd, struct verbs_context *orig_ctx) {
+	struct mlx5_context *mlx5_ctx;
+	struct mlx5_alloc_ucontext	req = {};
+	struct mlx5_alloc_ucontext_resp resp = {};
+	char fname[128];
+	int ctx_resp_fd;
+	int err;
+	int info_fd;
+
+	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
+	if(!mlx5_ctx)
+		return NULL;
+	
+	req.total_num_bfregs = mlx5_ctx->tot_uuars;
+	req.num_low_latency_bfregs = mlx5_ctx->low_lat_uuars;
+	req.max_cqe_version = MLX5_CQE_VERSION_V1;
+	req.lib_caps |= (MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR);
+	req.flags = MLX5_IB_ALLOC_UCTX_DEVX;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/ctx_resp", rdma_getpid(&mlx5_ctx->ibv_ctx.context), cmd_fd);
+	ctx_resp_fd = open(fname, O_RDONLY);
+	if(ctx_resp_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(read(ctx_resp_fd, &resp, sizeof(resp)) < 0) {
+		close(ctx_resp_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(ctx_resp_fd);
+
+	err = mlx5_set_context(mlx5_ctx, &resp.drv_payload, false);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR); i++) {
+		to_mctx(&orig_ctx->context)->uar[i].reg = mlx5_ctx->uar[i].reg;
+		}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR) &&
+							to_mctx(&orig_ctx->context)->bfs; i++) {
+		for(int j = 0; j < mlx5_ctx->num_uars_per_page; j++) {
+			for(int k = 0; k < NUM_BFREGS_PER_UAR; k++) {
+				int bfi = (i * mlx5_ctx->num_uars_per_page + j) * NUM_BFREGS_PER_UAR + k;
+				to_mctx(&orig_ctx->context)->bfs[bfi].reg = mlx5_ctx->bfs[bfi].reg;
+				}
+			}
+		}
+
+		to_mctx(&orig_ctx->context)->hca_core_clock = mlx5_ctx->hca_core_clock;
+		to_mctx(&orig_ctx->context)->clock_info_page = mlx5_ctx->clock_info_page;
+		to_mctx(&orig_ctx->context)->nc_uar->uar = mlx5_ctx->nc_uar->uar;
+		to_mctx(&orig_ctx->context)->nc_uar->reg = mlx5_ctx->nc_uar->reg;
+		to_mctx(&orig_ctx->context)->nc_uar->page_id = mlx5_ctx->nc_uar->page_id;
+
+	err = ibv_cmd_alloc_async_fd(&mlx5_ctx->ibv_ctx.context);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(async_fd)
+		*async_fd = mlx5_ctx->ibv_ctx.context.async_fd;
+
+	err = ibv_cmd_register_async_fd(&mlx5_ctx->ibv_ctx.context, *async_fd);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	to_mctx(&orig_ctx->context)->cq_uar_reg = mlx5_ctx->cq_uar_reg;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/nc_uar",
+					rdma_getpid(&mlx5_ctx->ibv_ctx.context),
+					mlx5_ctx->ibv_ctx.context.cmd_fd);
+	info_fd = open(fname, O_WRONLY);
+	if(info_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(write(info_fd, &to_mctx(&orig_ctx->context)->nc_uar,
+					sizeof(to_mctx(&orig_ctx->context)->nc_uar)) < 0) {
+		close(info_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(info_fd);
+
+	return &mlx5_ctx->ibv_ctx;
+}
+
+static void mlx5_free_tmp_context(struct ibv_context *context) {
+	struct verbs_context *vctx = container_of(context, struct verbs_context, context);
+	struct mlx5_context *mlx5_ctx = container_of(vctx, struct mlx5_context, ibv_ctx);
+	free(vctx->priv);
+	free(mlx5_ctx);
+}
+
+static struct ibv_context *mlx5_dup_context(struct ibv_context *context, struct ibv_qp *qp) {
+	struct mlx5_context *mlx5_ctx = to_mctx(context);
+	struct mlx5_context *dup_mlx5_ctx;
+	int usr_idx = 0;
+
+	dup_mlx5_ctx = calloc(1, sizeof(*dup_mlx5_ctx));
+	if(!dup_mlx5_ctx)
+		return NULL;
+	
+	memcpy(dup_mlx5_ctx, mlx5_ctx, sizeof(*mlx5_ctx));
+
+	dup_mlx5_ctx->uidx_table[usr_idx >> MLX5_UIDX_TABLE_SHIFT]
+				.table[usr_idx & MLX5_UIDX_TABLE_MASK] = to_mqp(qp);
+
+	list_head_init(&dup_mlx5_ctx->dyn_uar_bf_list);
+	list_head_init(&dup_mlx5_ctx->dyn_uar_qp_shared_list);
+	list_head_init(&dup_mlx5_ctx->dyn_uar_qp_dedicated_list);
+//	list_head_init(&dup_mlx5_ctx->hugetlb_list);
+//	list_head_init(&dup_mlx5_ctx->reserved_qpns.blk_list);
+
+	return &dup_mlx5_ctx->ibv_ctx.context;
+}
+
+static struct verbs_context *mlx5_get_ops_context(struct ibv_device *ibdev, int cmd_fd) {
+	struct mlx5_context *mlx5_ctx;
+
+	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
+	if(!mlx5_ctx)
+		return NULL;
+	
+	verbs_set_ops(&mlx5_ctx->ibv_ctx, &mlx5_ctx_common_ops);
+	return &mlx5_ctx->ibv_ctx;
 }
 
 static struct verbs_context *mlx5_import_context(struct ibv_device *ibdev,
@@ -2369,6 +2881,7 @@ static void mlx5_free_context(struct ibv_context *ibctx)
 		       page_size);
 	if (context->clock_info_page)
 		munmap((void *)context->clock_info_page, page_size);
+
 	close_debug_file(context);
 	clean_dyn_uars(ibctx);
 	reserved_qpn_blks_free(context);
@@ -2387,14 +2900,35 @@ static void mlx5_uninit_device(struct verbs_device *verbs_device)
 static struct verbs_device *mlx5_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 {
 	struct mlx5_device *dev;
+	struct ibv_device *ibdev;
+	char fname[128];
+	int fd;
 
 	dev = calloc(1, sizeof *dev);
 	if (!dev)
 		return NULL;
+	ibdev = &dev->verbs_dev.device;
 
 	dev->page_size   = sysconf(_SC_PAGESIZE);
 	dev->driver_abi_ver = sysfs_dev->abi_ver;
 
+	sprintf(fname, "/proc/rdma_uwrite/%s/qpn_dict",
+						sysfs_dev->ibdev_name);
+	fd = open(fname, O_RDONLY);
+	if(fd < 0) {
+		free(dev);
+		return NULL;
+	}
+
+	ibdev->qpn_dict = mmap(NULL, 4096 * 4096 * sizeof(uint32_t),
+					PROT_READ, MAP_SHARED, fd, 0);
+	if(ibdev->qpn_dict == MAP_FAILED) {
+		close(fd);
+		free(dev);
+		return NULL;
+	}
+
+	close(fd);
 	return &dev->verbs_dev;
 }
 
@@ -2406,6 +2940,12 @@ static const struct verbs_device_ops mlx5_dev_ops = {
 	.alloc_device = mlx5_device_alloc,
 	.uninit_device = mlx5_uninit_device,
 	.alloc_context = mlx5_alloc_context,
+	.resume_context = mlx5_resume_context,
+	.resume_context_v2 = mlx5_resume_context_v2,
+	.pre_resume_context = mlx5_pre_resume_context,
+	.free_tmp_context = mlx5_free_tmp_context,
+	.dup_context = mlx5_dup_context,
+	.get_ops_context = mlx5_get_ops_context,
 	.import_context = mlx5_import_context,
 };
 
