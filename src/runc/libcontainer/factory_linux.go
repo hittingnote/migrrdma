@@ -48,9 +48,7 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(stateDir); err == nil {
-		return nil, ErrExist
-	} else if !os.IsNotExist(err) {
+	if _, err := os.Stat(stateDir); err == nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 

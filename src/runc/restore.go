@@ -2,6 +2,10 @@ package main
 
 import (
 	"os"
+	"fmt"
+	"io/ioutil"
+	"strings"
+	"net"
 
 	"github.com/opencontainers/runc/libcontainer/userns"
 	"github.com/sirupsen/logrus"
@@ -10,6 +14,86 @@ import (
 
 var restoreCommand = cli.Command{
 	Name:  "restore",
+	Usage: "restore a container from a previous checkpoint",
+	ArgsUsage: `<container-id>
+
+Where "<container-id>" is the name for the instance of the container to be
+restored.`,
+	Description: `Restores the saved state of the container instance that was previously saved
+using the runc checkpoint command.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "image-path",
+			Value: "",
+			Usage: "path to criu image files for restoring",
+		},
+	},
+	Action: func(context *cli.Context) error {
+		n_proc := 0
+
+		laddr, err := net.ResolveUnixAddr("unixgram", "/dev/shm/fullrestore.sock")
+		if err != nil {
+			return err
+		}
+
+		conn, err := net.ListenUnixgram("unixgram", laddr)
+
+		files, err := ioutil.ReadDir("/dev/shm/")
+		if err != nil {
+			return err
+		}
+
+		err = os.Chdir("/dev/shm/")
+		if err != nil {
+			return err
+		}
+
+		for _, f := range files {
+			if !strings.HasPrefix(f.Name(), "pid") {
+				continue
+			}
+
+			n_proc = n_proc + 1
+		}
+
+		for _, f := range files {
+			if !strings.HasPrefix(f.Name(), "pid_leader") {
+				continue
+			}
+
+			c, err := net.Dial("unixgram",
+						fmt.Sprintf("%s", f.Name()))
+			if err != nil {
+				return err
+			}
+
+			_, err = c.Write([]byte("hi"))
+			if err != nil {
+				return err
+			}
+
+			c.Close()
+		}
+
+		for n_proc > 0 {
+			var buf [32]byte
+
+			_, _, err := conn.ReadFromUnix(buf[0:])
+			if(err != nil) {
+				return err
+			}
+
+			n_proc = n_proc - 1
+		}
+
+		conn.Close()
+
+		return nil
+	},
+}
+
+var RDMArestoreCommand = cli.Command{
+	Name:  "rdmarestore",
 	Usage: "restore a container from a previous checkpoint",
 	ArgsUsage: `<container-id>
 
@@ -112,6 +196,9 @@ using the runc checkpoint command.`,
 		if err != nil {
 			return err
 		}
+
+		options.ShellJob = true
+		options.TcpEstablished = true
 		status, err := startContainer(context, CT_ACT_RESTORE, options)
 		if err != nil {
 			return err
