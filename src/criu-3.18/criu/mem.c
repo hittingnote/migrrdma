@@ -651,6 +651,88 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	return ret;
 }
 
+int get_vm_area_list(struct pstree_item *i,
+			struct vm_area_list *vmas, MmEntry **p_mm) {
+	pid_t pid = vpid(i);
+	struct cr_img *img;
+	MmEntry *mm;
+	int ret = -1, vn = 0;
+
+	vm_area_list_init(vmas);
+
+	img = open_image(CR_FD_MM, O_RSTR, pid);
+	if(!img) {
+		return -1;
+	}
+
+	ret = pb_read_one_eof(img, &mm, PB_MM);
+	close_image(img);
+	if(ret <= 0) {
+		return ret;
+	}
+
+	if(p_mm)
+		*p_mm = mm;
+
+	if(collect_special_file(mm->exe_file_id) == NULL) {
+		return -1;
+	}
+
+	pr_debug("Found %zd VMAs in image\n", mm->n_vmas);
+	img = NULL;
+	if(mm->n_vmas == 0) {
+		img = open_image(CR_FD_VMAS, O_RSTR, pid);
+		if(!img) {
+			return -1;
+		}
+	}
+
+	while(vn < mm->n_vmas || img != NULL) {
+		struct vma_area *vma;
+
+		ret = -1;
+		vma = alloc_vma_area();
+		if(!vma)
+			break;
+
+		vmas->nr++;
+		if(!img)
+			vma->e = mm->vmas[vn++];
+		else {
+			ret = pb_read_one_eof(img, &vma->e, PB_VMA);
+			if(ret <= 0) {
+				xfree(vma);
+				close_image(img);
+				img = NULL;
+				break;
+			}
+		}
+
+		list_add_tail(&vma->list, &vmas->h);
+
+		if(vma_area_is_private(vma, kdat.task_size)) {
+			vmas->rst_priv_size += vma_area_len(vma);
+			if(vma_has_guard_gap_hidden(vma))
+				vmas->rst_priv_size += PAGE_SIZE;
+		}
+
+		if(vma_area_is(vma, VMA_ANON_SHARED))
+			ret = collect_shmem(pid, vma);
+		else if(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED))
+			ret = collect_filemap(vma);
+		else if (vma_area_is(vma, VMA_AREA_SOCKET))
+			ret = collect_socket_map(vma);
+		else
+			ret = 0;
+		if (ret)
+			break;
+	}
+
+	if(img)
+		close_image(img);
+	return ret;
+}
+
 int prepare_mm_pid(struct pstree_item *i)
 {
 	pid_t pid = vpid(i);
@@ -1012,10 +1094,15 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 			continue;
 		}
 
-		ret = premap_private_vma(t, vma, at);
+		if(!vma_area_is(vma, VMA_PREMMAPED)) {
+			ret = premap_private_vma(t, vma, at);
 
-		if (ret < 0)
-			break;
+			if (ret < 0)
+				break;
+		}
+		else {
+			*at += vma_entry_len(vma->e);
+		}
 	}
 
 	filemap_ctx_fini();
@@ -1023,9 +1110,12 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 	return ret;
 }
 
-static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
+#include "rdma_migr.h"
+
+static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr, bool enqueue_page)
 {
 	struct vma_area *vma;
+	struct vma_area *last_vma = NULL;
 	int ret = 0;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
@@ -1064,7 +1154,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			continue;
 		}
 
-		for (i = 0; i < nr_pages; i++) {
+		for (i = 0; i < nr_pages; i++, last_vma = vma) {
 			unsigned char buf[PAGE_SIZE];
 			void *p;
 
@@ -1100,8 +1190,11 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 					BUG();
 				}
 
+				if(enqueue_page) {
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
+					pr_debug("Enqueue page-read\n");
+				}
 
 				pr->skip_pages(pr, len);
 
@@ -1109,7 +1202,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				len >>= PAGE_SHIFT;
 				nr_restored += len;
 				i += len - 1;
-				pr_debug("Enqueue page-read\n");
+
 				continue;
 			}
 
@@ -1122,6 +1215,23 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 			set_bit(off, vma->page_bitmap);
 			if (vma_inherited(vma)) {
+				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
+					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
+
+					if (vma->e->status & VMA_NO_PROT_WRITE) {
+						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
+							vma->e->end, va, nr_pages);
+						BUG();
+					}
+
+					if(enqueue_page) {
+					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
+						return -1;
+					
+					pr_debug("Enqueue page-read\n");
+				}
+				}
+
 				clear_bit(off, vma->pvma->page_bitmap);
 
 				ret = pr->read_pages(pr, va, 1, buf, 0);
@@ -1140,6 +1250,23 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				memcpy(p, buf, PAGE_SIZE);
 			} else {
 				int nr;
+
+				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
+					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
+
+					if (vma->e->status & VMA_NO_PROT_WRITE) {
+						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
+							vma->e->end, va, nr_pages);
+						BUG();
+					}
+
+					if(enqueue_page) {
+					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
+						return -1;
+					
+					pr_debug("Enqueue page-read\n");
+				}
+				}
 
 				/*
 				 * Try to read as many pages as possible at once.
@@ -1247,7 +1374,153 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	return 0;
 }
 
-int prepare_mappings(struct pstree_item *t)
+static int only_premap_rdma_private_vma(struct pstree_item *t, struct vma_area *vma)
+{
+	int ret;
+	void *addr;
+	unsigned long nr_pages, size;
+
+	nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
+	vma->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
+	if (vma->page_bitmap == NULL)
+		return -1;
+
+	/*
+	 * A grow-down VMA has a guard page, which protect a VMA below it.
+	 * So one more page is mapped here to restore content of the first page
+	 */
+	if (vma_has_guard_gap_hidden(vma))
+		vma->e->start -= PAGE_SIZE;
+
+	size = vma_entry_len(vma->e);
+	if (!vma_inherited(vma)) {
+		int flag = 0;
+		/*
+		 * The respective memory area was NOT found in the parent.
+		 * Map a new one.
+		 */
+
+		/*
+		 * Restore AIO ring buffer content to temporary anonymous area.
+		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
+		 */
+		if (vma_entry_is(vma->e, VMA_AREA_AIORING))
+			flag |= MAP_ANONYMOUS;
+		else if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
+			ret = vma->vm_open(vpid(t), vma);
+			if (ret < 0) {
+				pr_err("Can't fixup VMA's fd\n");
+				return -1;
+			}
+		}
+
+		/*
+		 * All mappings here get PROT_WRITE regardless of whether we
+		 * put any data into it or not, because this area will get
+		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
+		 * bits there. Ideally we'd check for the whole COW-chain
+		 * having any data in.
+		 */
+		pr_info("Detect RDMA mem mapping %lx-%lx. Now map in.\n", vma->e->start, vma->e->end);
+		addr = mmap((void *)vma->e->start, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
+			    vma->e->pgoff);
+
+		if (addr == MAP_FAILED) {
+			pr_perror("Unable to map ANON_VMA");
+			return -1;
+		}
+	} else {
+		void *paddr;
+
+		/*
+		 * The area in question can be COWed with the parent. Remap the
+		 * parent area. Note, that it has already being passed through
+		 * the restore_priv_vma_content() call and thus may have some
+		 * pages in it.
+		 */
+
+		paddr = decode_pointer(vma->pvma->premmaped_addr);
+		if (vma_has_guard_gap_hidden(vma))
+			paddr -= PAGE_SIZE;
+
+		addr = mremap(paddr, size, size, MREMAP_FIXED | MREMAP_MAYMOVE, (void *)vma->e->start);
+		if (addr != (void *)vma->e->start) {
+			pr_perror("Unable to remap a private vma");
+			return -1;
+		}
+	}
+
+	vma->e->status |= VMA_PREMMAPED;
+	vma->premmaped_addr = (unsigned long)addr;
+	pr_debug("\tpremap %#016" PRIx64 "-%#016" PRIx64 " -> %016lx\n", vma->e->start, vma->e->end,
+		 (unsigned long)addr);
+
+	if (vma_has_guard_gap_hidden(vma)) { /* Skip guard page */
+		vma->e->start += PAGE_SIZE;
+		vma->premmaped_addr += PAGE_SIZE;
+	}
+
+	if (vma_area_is(vma, VMA_FILE_PRIVATE))
+		vma->vm_open = NULL; /* prevent from 2nd open in prepare_vmas */
+
+	return 0;
+}
+
+static int only_premap_rdma_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas)
+{
+	struct vma_area *vma;
+	int ret = 0;
+	LIST_HEAD(empty);
+
+	filemap_ctx_init(true);
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		if (task_size_check(vpid(t), vma->e)) {
+			ret = -1;
+			break;
+		}
+		
+		if(!check_rdma_vma(vma->e->start, vma->e->end))
+			continue;
+
+		if (!vma_area_is_private(vma, kdat.task_size))
+			continue;
+
+		if (vma->e->flags & MAP_HUGETLB)
+			continue;
+
+		/* VMA offset may change due to plugin so we cannot premap */
+		if (vma->e->status & VMA_EXT_PLUGIN)
+			continue;
+
+		ret = only_premap_rdma_private_vma(t, vma);
+
+		if (ret < 0)
+			break;
+	}
+
+	filemap_ctx_fini();
+
+	return ret;
+}
+
+int only_prepare_rdma_mappings(struct pstree_item *t) {
+	int ret = 0;
+	struct vm_area_list *vmas;
+
+	vmas = &rsti(t)->vmas;
+	if (vmas->nr == 0) /* Zombie */
+		goto out;
+
+	ret = only_premap_rdma_priv_vmas(t, vmas);
+	if (ret < 0)
+		goto out;
+
+out:
+	return ret;
+}
+
+int prepare_mappings(struct pstree_item *t, bool enqueue_page)
 {
 	int ret = 0;
 	void *addr;
@@ -1269,8 +1542,10 @@ int prepare_mappings(struct pstree_item *t)
 		goto out;
 	}
 
-	old_premmapped_addr = rsti(t)->premmapped_addr;
-	old_premmapped_len = rsti(t)->premmapped_len;
+//	old_premmapped_addr = rsti(t)->premmapped_addr;
+//	old_premmapped_len = rsti(t)->premmapped_len;
+	old_premmapped_addr = NULL;
+	old_premmapped_len = 0;
 	rsti(t)->premmapped_addr = addr;
 	rsti(t)->premmapped_len = vmas->rst_priv_size;
 
@@ -1289,7 +1564,7 @@ int prepare_mappings(struct pstree_item *t)
 
 	pr.reset(&pr);
 
-	ret = restore_priv_vma_content(t, &pr);
+	ret = restore_priv_vma_content(t, &pr, enqueue_page);
 	if (ret < 0)
 		goto out;
 

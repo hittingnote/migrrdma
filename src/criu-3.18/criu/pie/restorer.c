@@ -785,7 +785,9 @@ unsigned long arch_shmat(int shmid, void *shmaddr, int shmflg, unsigned long siz
 }
 #endif
 
-static unsigned long restore_mapping(VmaEntry *vma_entry)
+static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry);
+
+static unsigned long restore_mapping(struct task_restore_args *args, VmaEntry *vma_entry)
 {
 	int prot = vma_entry->prot;
 	int flags = vma_entry->flags | MAP_FIXED;
@@ -844,8 +846,12 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	 * writable since we're going to restore page
 	 * contents.
 	 */
+	if(!check_is_rdma_mmap(args, vma_entry))
 	addr = sys_mmap(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), prot, flags, vma_entry->fd,
 			vma_entry->pgoff);
+	else {
+		addr = vma_entry->start;
+	}
 
 	if ((vma_entry->fd != -1) && (vma_entry->status & VMA_CLOSE))
 		sys_close(vma_entry->fd);
@@ -1242,6 +1248,39 @@ static void unregister_libc_rseq(struct rst_rseq_param *rseq)
 	sys_rseq(decode_pointer(rseq->rseq_abi_pointer), rseq->rseq_abi_size, 1, rseq->signature);
 }
 
+static int my_munmap_without_unmapping_rdma(struct unmapped_node *unmapped, int n_unmapped,
+						void *addr, size_t length, int *index) {
+	void *unmap_start = addr;
+	int i;
+	int ret;
+
+	for(i = *index; i < n_unmapped && unmapped[i].end <= (unsigned long long)addr + length; i++) {
+		if((unsigned long long)unmap_start == unmapped[i].start) {
+			unmap_start = (void*)unmapped[i].end;
+			continue;
+		}
+
+		ret = sys_munmap(unmap_start, unmapped[i].start - (unsigned long long)unmap_start);
+		if(ret) {
+			pr_err("Failed to unmap %llx-%llx\n", (unsigned long long)unmap_start, unmapped[i].start);
+			return ret;
+		}
+
+		unmap_start = (void*)unmapped[i].end;
+	}
+
+	if(unmap_start == addr + length)
+		return 0;
+
+	ret = sys_munmap(unmap_start, addr + length - unmap_start);
+	if(ret) {
+		pr_err("Failed to unmap %llx-%llx\n", (unsigned long long)unmap_start, (unsigned long long)addr + length);
+	}
+
+	*index = i;
+	return ret;
+}
+
 /*
  * This function unmaps all VMAs, which don't belong to
  * the restored process or the restorer.
@@ -1259,11 +1298,12 @@ static void unregister_libc_rseq(struct rst_rseq_param *rseq)
  * [ 2nd start -- task_size ]
  */
 static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, void *bootstrap_start,
-			  unsigned long bootstrap_len, unsigned long task_size)
+			  unsigned long bootstrap_len, unsigned long task_size, struct unmapped_node *unmapped, int n_unmapped)
 {
 	unsigned long s1, s2;
 	void *p1, *p2;
 	int ret;
+	int i = 0;
 
 	if (premmapped_addr < bootstrap_start) {
 		p1 = premmapped_addr;
@@ -1277,19 +1317,19 @@ static int unmap_old_vmas(void *premmapped_addr, unsigned long premmapped_len, v
 		s1 = bootstrap_len;
 	}
 
-	ret = sys_munmap(NULL, p1 - NULL);
+	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, NULL, p1 - NULL, &i);
 	if (ret) {
 		pr_err("Unable to unmap (%p-%p): %d\n", NULL, p1, ret);
 		return -1;
 	}
 
-	ret = sys_munmap(p1 + s1, p2 - (p1 + s1));
+	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, p1 + s1, p2 - (p1 + s1), &i);
 	if (ret) {
 		pr_err("Unable to unmap (%p-%p): %d\n", p1 + s1, p2, ret);
 		return -1;
 	}
 
-	ret = sys_munmap(p2 + s2, task_size - (unsigned long)(p2 + s2));
+	ret = my_munmap_without_unmapping_rdma(unmapped, n_unmapped, p2 + s2, task_size - (unsigned long)(p2 + s2), &i);
 	if (ret) {
 		pr_err("Unable to unmap (%p-%p): %d\n", p2 + s2, (void *)task_size, ret);
 		return -1;
@@ -1495,6 +1535,27 @@ int cleanup_current_inotify_events(struct task_restore_args *task_args)
 	return 0;
 }
 
+static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry) {
+	int start = 0, end = args->n_unmapped - 1;
+
+	while(start <= end) {
+		int mid = (start + end) / 2;
+		if(vma_entry->start == args->unmapped[mid].start) {
+			return 1;
+		}
+		else if(vma_entry->start < args->unmapped[mid].start) {
+			end = mid - 1;
+		}
+		else {
+			start = mid + 1;
+		}
+	}
+
+	return 0;
+}
+
+#include <linux/un.h>
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -1516,6 +1577,8 @@ long __export_restore_task(struct task_restore_args *args)
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
 	bool has_vdso_proxy;
+	int sk;
+	int enable_pre_setup;
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
@@ -1591,7 +1654,7 @@ long __export_restore_task(struct task_restore_args *args)
 	unregister_libc_rseq(&args->libc_rseq);
 
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len, bootstrap_start, bootstrap_len,
-			   args->task_size))
+			   args->task_size, args->unmapped, args->n_unmapped))
 		goto core_restore_end;
 
 	/* Map vdso that wasn't parked */
@@ -1663,10 +1726,19 @@ long __export_restore_task(struct task_restore_args *args)
 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
 			continue;
 
-		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
+		/* If the vma is for rdma, it has been pre-mapped to the exact location,
+		 * so we just skip it (only valid for non mem pre-copy mode).
+		 * We need to re-think it when supporting mem pre-copy.
+		 */
+		if (!check_is_rdma_mmap(args, vma_entry) &&
+					vma_entry_is(vma_entry, VMA_PREMMAPED))
 			continue;
 
-		va = restore_mapping(vma_entry);
+		if(check_is_rdma_mmap(args, vma_entry)) {
+			continue;
+		}
+
+		va = restore_mapping(args, vma_entry);
 
 		if (va != vma_entry->start) {
 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
@@ -1775,6 +1847,7 @@ long __export_restore_task(struct task_restore_args *args)
 			if (vma_entry->madv & (1ul << m)) {
 				ret = sys_madvise(vma_entry->start, vma_entry_len(vma_entry), m);
 				if (ret) {
+					pr_err("vma madvise failed at %d. %lx-%lx\n", i, vma_entry->start, vma_entry->end);
 					pr_err("madvise(%" PRIx64 ", %" PRIu64 ", %ld) "
 					       "failed with %ld\n",
 					       vma_entry->start, vma_entry_len(vma_entry), m, ret);
@@ -2061,7 +2134,6 @@ long __export_restore_task(struct task_restore_args *args)
 	futex_wait_while_gt(&thread_inprogress, 1);
 
 	sys_close(args->proc_fd);
-	std_log_set_fd(-1);
 
 	/*
 	 * The code that prepared the itimers makes sure that the
@@ -2079,12 +2151,114 @@ long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
+	pr_info("Update RDMA metadata\n");
+	for(int i = 0; i < args->n_update; i++) {
+		memcpy(args->update_arr[i].ptr, args->update_arr[i].content_p,
+										args->update_arr[i].size);
+	}
+
+	pr_info("Replay recv wr on QP\n");
+	for(int i = 0; i < args->n_qp_replay; i++) {
+		int (*qp_replay_cb)(void *qp);
+		qp_replay_cb = args->qp_replay_arr[i].cb;
+		if(qp_replay_cb(args->qp_replay_arr[i].qp)) {
+			return -1;
+		}
+	}
+
+	pr_info("Replay recv wr on SRQ\n");
+	for(int i = 0; i < args->n_srq_replay; i++) {
+		int (*srq_replay_cb)(void *srq, int head, int tail);
+		srq_replay_cb = args->srq_replay_arr[i].cb;
+		if(srq_replay_cb(args->srq_replay_arr[i].srq,
+					args->srq_replay_arr[i].head,
+					args->srq_replay_arr[i].tail)) {
+			return -1;
+		}
+	}
+
+	pr_info("Notify partners to restore\n");
+	for(int i = 0; i < args->n_msg; i++) {
+		int sent_size = 0;
+		int this_size;
+		size_t size = args->msg_arr[i].size;
+		void *buf = args->msg_arr[i].buf;
+		struct sockaddr_in remote_addr;
+
+		sk = sys_socket(AF_INET, SOCK_STREAM, 0);
+
+		if(sk < 0) {
+			pr_err("Error when creating socket\n");
+			return -1;
+		}
+
+		memcpy(&remote_addr, &args->msg_arr[i].remote_addr, sizeof(remote_addr));
+		if(sys_connect(sk, (struct sockaddr *)&remote_addr, sizeof(remote_addr))) {
+			pr_err("Error when connecting\n");
+			return -1;
+		}
+
+		while(sent_size < size) {
+			this_size = sys_sendto(sk, buf + sent_size, size - sent_size > 1024? 1024: size - sent_size,
+									0, NULL, 0);
+			if(this_size < 0) {
+				return -1;
+			}
+
+			sent_size += this_size;
+		}
+
+		sys_sendto(sk, "that's all", sizeof("that's all"), 0,
+							NULL, 0);
+		sys_close(sk);
+	}
+
+	if(!args->enable_pre_setup) {
+		if(args->restore_hook) {
+			int (*restore_rdma)(pid_t pid, char *img_dir_path);
+			restore_rdma = args->restore_hook;
+			if(restore_rdma(sys_getpid(), args->images_dir)) {
+				return -1;
+			}
+		}
+		pr_info("Full restore RDMA finish\n");
+	}
+	else {
+		pr_info("Restore RDMA communication finish\n");
+	}
+
+	enable_pre_setup = args->enable_pre_setup;
 	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*
 	 * Sigframe stack.
 	 */
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
+
+	if(enable_pre_setup) {
+		int sock = sys_socket(AF_UNIX, SOCK_DGRAM, 0);
+		struct sockaddr_un sock_un;
+		char buf[32];
+		int err;
+
+		if(sock < 0) {
+			pr_err("Unable to create unix socket to notify CRIU\n");
+			return -1;
+		}
+
+		memset(&sock_un, 0, sizeof(sock_un));
+		sock_un.sun_family = AF_UNIX;
+		std_sprintf(sock_un.sun_path, "/dev/shm/fullrestore.sock");
+		err = sys_sendto(sock, buf, 32, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
+		if(err < 0) {
+			pr_err("Unable to notify CRIU\n");
+			return -1;
+		}
+
+		sys_close(sock);
+	}
+
+	std_log_set_fd(-1);
 
 	/*
 	 * Prepare the stack and call for sigreturn,
