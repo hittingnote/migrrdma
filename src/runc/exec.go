@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"io"
 
 	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/utils"
@@ -107,7 +108,179 @@ following will output a list of processes running in the container:
 		if err := revisePidFile(context); err != nil {
 			return err
 		}
-		status, err := execProcess(context)
+		status, err := execProcess(context, CT_ACT_RUN, nil)
+		if err == nil {
+			os.Exit(status)
+		}
+		fatalWithCode(fmt.Errorf("exec failed: %w", err), 255)
+		return nil // to satisfy the linter
+	},
+	SkipArgReorder: true,
+}
+
+var execrestoreCommand = cli.Command{
+	Name:  "execrestore",
+	Usage: "execute and restore process of the container",
+	ArgsUsage: `<container-id> <command> [command options]  || -p process.json <container-id>
+
+Where "<container-id>" is the name for the instance of the container and
+"<command>" is the command to be executed in the container.
+"<command>" can't be empty unless a "-p" flag provided.
+
+EXAMPLE:
+For example, if the container is configured to run the linux ps command the
+following will output a list of processes running in the container:
+
+       # runc execrestore <container-id> ps`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "console-socket",
+			Usage: "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal",
+		},
+		cli.StringFlag{
+			Name:  "cwd",
+			Usage: "current working directory in the container",
+		},
+		cli.StringSliceFlag{
+			Name:  "env, e",
+			Usage: "set environment variables",
+		},
+		cli.BoolFlag{
+			Name:  "tty, t",
+			Usage: "allocate a pseudo-TTY",
+		},
+		cli.StringFlag{
+			Name:  "user, u",
+			Usage: "UID (format: <uid>[:<gid>])",
+		},
+		cli.Int64SliceFlag{
+			Name:  "additional-gids, g",
+			Usage: "additional gids",
+		},
+		cli.StringFlag{
+			Name:  "process, p",
+			Usage: "path to the process.json",
+		},
+		cli.BoolFlag{
+			Name:  "detach,d",
+			Usage: "detach from the container's process",
+		},
+		cli.StringFlag{
+			Name:  "pid-file",
+			Value: "",
+			Usage: "specify the file to write the process id to",
+		},
+		cli.StringFlag{
+			Name:  "process-label",
+			Usage: "set the asm process label for the process commonly used with selinux",
+		},
+		cli.StringFlag{
+			Name:  "apparmor",
+			Usage: "set the apparmor profile for the process",
+		},
+		cli.BoolFlag{
+			Name:  "no-new-privs",
+			Usage: "set the no new privileges value for the process",
+		},
+		cli.StringSliceFlag{
+			Name:  "cap, c",
+			Value: &cli.StringSlice{},
+			Usage: "add a capability to the bounding set for the process",
+		},
+		cli.IntFlag{
+			Name:  "preserve-fds",
+			Usage: "Pass N additional file descriptors to the container (stdio + $LISTEN_FDS + N in total)",
+		},
+		cli.StringSliceFlag{
+			Name:  "cgroup",
+			Usage: "run the process in an (existing) sub-cgroup(s). Format is [<controller>:]<cgroup>.",
+		},
+		cli.BoolFlag{
+			Name:  "ignore-paused",
+			Usage: "allow exec in a paused container",
+		},
+		cli.StringFlag{
+			Name:  "image-path",
+			Value: "",
+			Usage: "path to criu image files for restoring",
+		},
+		cli.StringFlag{
+			Name:  "work-path",
+			Value: "",
+			Usage: "path for saving work files and logs",
+		},
+		cli.BoolFlag{
+			Name:  "tcp-established",
+			Usage: "allow open tcp connections",
+		},
+		cli.BoolFlag{
+			Name:  "ext-unix-sk",
+			Usage: "allow external unix sockets",
+		},
+		cli.BoolFlag{
+			Name:  "shell-job",
+			Usage: "allow shell jobs",
+		},
+		cli.BoolFlag{
+			Name:  "file-locks",
+			Usage: "handle file locks, for safety",
+		},
+		cli.StringFlag{
+			Name:  "manage-cgroups-mode",
+			Value: "",
+			Usage: "cgroups mode: soft|full|strict|ignore (default: soft)",
+		},
+		cli.BoolFlag{
+			Name:  "no-subreaper",
+			Usage: "disable the use of the subreaper used to reap reparented processes",
+		},
+		cli.StringSliceFlag{
+			Name:  "empty-ns",
+			Usage: "create a namespace, but don't restore its properties",
+		},
+		cli.BoolFlag{
+			Name:  "auto-dedup",
+			Usage: "enable auto deduplication of memory images",
+		},
+		cli.BoolFlag{
+			Name:  "lazy-pages",
+			Usage: "use userfaultfd to lazily restore memory pages",
+		},
+		cli.StringFlag{
+			Name:  "lsm-profile",
+			Value: "",
+			Usage: "Specify an LSM profile to be used during restore in the form of TYPE:NAME.",
+		},
+		cli.StringFlag{
+			Name:  "lsm-mount-context",
+			Value: "",
+			Usage: "Specify an LSM mount context to be used during restore.",
+		},
+		cli.BoolFlag{
+			Name: "rdma-presetup",
+			Usage: "enable RDMA pre-setup feature",
+		},
+		cli.StringFlag{
+			Name: "migr-dst",
+			Value: "",
+			Usage: "Hostname of migration destination",
+		},
+	},
+	Action: func(context *cli.Context) error {
+		if err := checkArgs(context, 1, minArgs); err != nil {
+			return err
+		}
+		if err := revisePidFile(context); err != nil {
+			return err
+		}
+
+		options, err := criuOptions(context)
+		if err != nil {
+			return err
+		}
+
+		options.RDMAPreSetup = context.Bool("rdma-presetup")
+		status, err := execProcess(context, CT_ACT_RESTORE, options)
 		if err == nil {
 			os.Exit(status)
 		}
@@ -143,7 +316,7 @@ func getSubCgroupPaths(args []string) (map[string]string, error) {
 	return paths, nil
 }
 
-func execProcess(context *cli.Context) (int, error) {
+func execProcess(context *cli.Context, action CtAct, criuOpts *libcontainer.CriuOpts) (int, error) {
 	container, err := getContainer(context)
 	if err != nil {
 		return -1, err
@@ -188,12 +361,49 @@ func execProcess(context *cli.Context) (int, error) {
 		pidfdSocket:     context.String("pidfd-socket"),
 		detach:          context.Bool("detach"),
 		pidFile:         context.String("pid-file"),
-		action:          CT_ACT_RUN,
+		action:          action,
+		criuOpts:		 criuOpts,
 		init:            false,
 		preserveFDs:     context.Int("preserve-fds"),
 		subCgroupPaths:  cgPaths,
 	}
-	return r.run(p)
+
+	c_state, err := r.run(p)
+	if err != nil {
+		return -1, err
+	}
+
+	file, err := os.Open(context.String("pid-file"))
+	if err != nil {
+		return -1, err
+	}
+	pid_str := make([]byte, 16)
+	nread, err := file.Read(pid_str)
+	if err != nil {
+		return -1, err
+	}
+	file.Close()
+
+	srcFile, err := os.Open(context.String("process"))
+	if err != nil {
+		return -1, err
+	}
+
+	dstFile, err := os.Create(fmt.Sprintf("%s/procspec_%s", bundle, pid_str[:nread]))
+	if err != nil {
+		return -1, err
+	}
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return -1, err
+	}
+
+	err = dstFile.Sync()
+	if err != nil {
+		return -1, err
+	}
+
+	return c_state, err
 }
 
 func getProcess(context *cli.Context, bundle string) (*specs.Process, error) {

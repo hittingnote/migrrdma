@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
+	"unsafe"
 
 	criu "github.com/checkpoint-restore/go-criu/v6/rpc"
 	"github.com/opencontainers/runc/libcontainer"
@@ -20,6 +22,90 @@ import (
 var checkpointCommand = cli.Command{
 	Name:  "checkpoint",
 	Usage: "checkpoint a running container",
+	ArgsUsage: `<container-id>
+
+Where "<container-id>" is the name for the instance of the container to be
+checkpointed.`,
+	Description: `The checkpoint command saves the state of the container instance.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "image-path", Value: "", Usage: "path for saving criu image files"},
+		cli.StringFlag{Name: "work-path", Value: "", Usage: "path for saving work files and logs"},
+		cli.StringFlag{Name: "parent-path", Value: "", Usage: "path for previous criu image files in pre-dump"},
+		cli.BoolFlag{Name: "leave-running", Usage: "leave the process running after checkpointing"},
+		cli.BoolFlag{Name: "tcp-established", Usage: "allow open tcp connections"},
+		cli.BoolFlag{Name: "ext-unix-sk", Usage: "allow external unix sockets"},
+		cli.BoolFlag{Name: "shell-job", Usage: "allow shell jobs"},
+		cli.BoolFlag{Name: "lazy-pages", Usage: "use userfaultfd to lazily restore memory pages"},
+		cli.IntFlag{Name: "status-fd", Value: -1, Usage: "criu writes \\0 to this FD once lazy-pages is ready"},
+		cli.StringFlag{Name: "page-server", Value: "", Usage: "ADDRESS:PORT of the page server"},
+		cli.BoolFlag{Name: "file-locks", Usage: "handle file locks, for safety"},
+		cli.BoolFlag{Name: "pre-dump", Usage: "dump container's memory information only, leave the container running after this"},
+		cli.StringFlag{Name: "manage-cgroups-mode", Value: "", Usage: "cgroups mode: soft|full|strict|ignore (default: soft)"},
+		cli.StringSliceFlag{Name: "empty-ns", Usage: "create a namespace, but don't restore its properties"},
+		cli.BoolFlag{Name: "auto-dedup", Usage: "enable auto deduplication of memory images"},
+		cli.BoolFlag{Name: "rdma-presetup", Usage: "enable RDMA pre-setup feature"},
+		cli.StringFlag{Name: "migr-dst", Value: "", Usage: "Hostname of migration destination"},
+	},
+	Action: func(context *cli.Context) error {
+		var tv_start syscall.Timeval
+		var tv_end syscall.Timeval
+
+		_, _, err_i := syscall.Syscall(syscall.SYS_GETTIMEOFDAY, uintptr(unsafe.Pointer(&tv_start)), 0, 0)
+		if err_i != 0 {
+			return fmt.Errorf("Gettimeofday failed")
+		}
+
+		if err := checkArgs(context, 1, exactArgs); err != nil {
+			return err
+		}
+		// XXX: Currently this is untested with rootless containers.
+		if os.Geteuid() != 0 || userns.RunningInUserNS() {
+			logrus.Warn("runc checkpoint is untested with rootless containers")
+		}
+
+		container, err := getContainer(context)
+		if err != nil {
+			return err
+		}
+		status, err := container.Status()
+		if err != nil {
+			return err
+		}
+		if status == libcontainer.Created || status == libcontainer.Stopped {
+			return fmt.Errorf("Container cannot be checkpointed in %s state", status.String())
+		}
+		options, err := criuOptions(context)
+		if err != nil {
+			return err
+		}
+
+		options.ShellJob = true
+		options.TcpEstablished = true
+		options.RDMAPreSetup = context.Bool("rdma-presetup")
+		options.MigrDst = context.String("migr-dst")
+		err = container.Checkpoint(options)
+		if err == nil && !(options.LeaveRunning || options.PreDump) {
+			// Destroy the container unless we tell CRIU to keep it.
+			if err := container.Destroy(); err != nil {
+				logrus.Warn(err)
+			}
+		}
+
+		_, _, err_i = syscall.Syscall(syscall.SYS_GETTIMEOFDAY, uintptr(unsafe.Pointer(&tv_end)), 0, 0)
+		if err_i != 0 {
+			return fmt.Errorf("Gettimeofday failed")
+		}
+
+		file, _ := os.Create("/dev/shm/checkpoint_time")
+		file.WriteString(fmt.Sprintf("%d\n", (tv_end.Sec - tv_start.Sec) * 1000000 + (tv_end.Usec - tv_start.Usec)))
+
+		return err
+	},
+}
+
+var predumpCommand = cli.Command{
+	Name:  "predump",
+	Usage: "predump a running container",
 	ArgsUsage: `<container-id>
 
 Where "<container-id>" is the name for the instance of the container to be
@@ -67,14 +153,67 @@ checkpointed.`,
 			return err
 		}
 
-		err = container.Checkpoint(options)
-		if err == nil && !(options.LeaveRunning || options.PreDump) {
-			// Destroy the container unless we tell CRIU to keep it.
-			if err := container.Destroy(); err != nil {
-				logrus.Warn(err)
-			}
+		options.ShellJob = true
+		options.TcpEstablished = true
+		return container.PreDump(options)
+	},
+}
+
+var checkpointRDMA = cli.Command{
+	Name:  "checkpointrdma",
+	Usage: "checkpoint RDMA of a running container",
+	ArgsUsage: `<container-id>
+
+Where "<container-id>" is the name for the instance of the container to be
+checkpointed.`,
+	Description: `The checkpoint command saves the state of the container instance.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "image-path", Value: "", Usage: "path for saving criu image files"},
+		cli.StringFlag{Name: "work-path", Value: "", Usage: "path for saving work files and logs"},
+		cli.StringFlag{Name: "parent-path", Value: "", Usage: "path for previous criu image files in pre-dump"},
+		cli.BoolFlag{Name: "leave-running", Usage: "leave the process running after checkpointing"},
+		cli.BoolFlag{Name: "tcp-established", Usage: "allow open tcp connections"},
+		cli.BoolFlag{Name: "ext-unix-sk", Usage: "allow external unix sockets"},
+		cli.BoolFlag{Name: "shell-job", Usage: "allow shell jobs"},
+		cli.BoolFlag{Name: "lazy-pages", Usage: "use userfaultfd to lazily restore memory pages"},
+		cli.IntFlag{Name: "status-fd", Value: -1, Usage: "criu writes \\0 to this FD once lazy-pages is ready"},
+		cli.StringFlag{Name: "page-server", Value: "", Usage: "ADDRESS:PORT of the page server"},
+		cli.BoolFlag{Name: "file-locks", Usage: "handle file locks, for safety"},
+		cli.BoolFlag{Name: "pre-dump", Usage: "dump container's memory information only, leave the container running after this"},
+		cli.StringFlag{Name: "manage-cgroups-mode", Value: "", Usage: "cgroups mode: soft|full|strict|ignore (default: soft)"},
+		cli.StringSliceFlag{Name: "empty-ns", Usage: "create a namespace, but don't restore its properties"},
+		cli.BoolFlag{Name: "auto-dedup", Usage: "enable auto deduplication of memory images"},
+		cli.StringFlag{Name: "migr-dst", Value: "", Usage: "Hostname of migration destination"},
+	},
+	Action: func(context *cli.Context) error {
+		if err := checkArgs(context, 1, exactArgs); err != nil {
+			return err
 		}
-		return err
+		// XXX: Currently this is untested with rootless containers.
+		if os.Geteuid() != 0 || userns.RunningInUserNS() {
+			logrus.Warn("runc checkpoint is untested with rootless containers")
+		}
+
+		container, err := getContainer(context)
+		if err != nil {
+			return err
+		}
+		status, err := container.Status()
+		if err != nil {
+			return err
+		}
+		if status == libcontainer.Created || status == libcontainer.Stopped {
+			return fmt.Errorf("Container cannot be checkpointed in %s state", status.String())
+		}
+		options, err := criuOptions(context)
+		if err != nil {
+			return err
+		}
+		options.MigrDst = context.String("migr-dst")
+
+		options.ShellJob = true
+		options.TcpEstablished = true
+		return container.CheckpointRDMA(options)
 	},
 }
 

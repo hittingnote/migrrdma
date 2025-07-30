@@ -118,6 +118,8 @@ func main() {
 	}
 	app.Commands = []cli.Command{
 		checkpointCommand,
+		predumpCommand,
+		checkpointRDMA,
 		createCommand,
 		deleteCommand,
 		eventsCommand,
@@ -127,6 +129,8 @@ func main() {
 		pauseCommand,
 		psCommand,
 		restoreCommand,
+		RDMArestoreCommand,
+		execrestoreCommand,
 		resumeCommand,
 		runCommand,
 		specCommand,

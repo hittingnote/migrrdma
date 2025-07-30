@@ -175,6 +175,7 @@ enum criu_req_type {
 	PAGE_SERVER_CHLD = 12;
 
 	SINGLE_PRE_DUMP = 13;
+	SINGLE_PRE_DUMP_RDMA = 14;
 }
 
 /*
