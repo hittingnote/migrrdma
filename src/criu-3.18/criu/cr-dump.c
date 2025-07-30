@@ -2098,6 +2098,10 @@ static int cr_dump_finish(int ret)
 	return post_dump_ret ?: (ret != 0);
 }
 
+FILE *fp;
+
+#include "rdma_migr.h"
+
 int cr_dump_tasks(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
@@ -2105,6 +2109,13 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int pre_dump_ret = 0;
 	int ret = -1;
+
+	fp = NULL;
+	if(opts.mode == CR_DUMP) {
+		char fname[128];
+		sprintf(fname, "%.110s/update_files.raw", images_dir);
+		fp = fopen(fname, "w");
+	}
 
 	pr_info("========================================\n");
 	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
@@ -2174,6 +2185,13 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree())
 		goto err;
 
+	{
+		struct pstree_item *pi;
+		for_each_pstree_item(pi) {
+			pi->pid->max_fd = -1;
+		}
+	}
+
 	if (collect_pstree_ids())
 		goto err;
 
@@ -2199,9 +2217,58 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_and_suspend_lsm() < 0)
 		goto err;
 
+	if(opts.mode == CR_PRE_DUMP_RDMA) {
+		char args[4][256];
+		char *argvs[4];
+
+		sprintf(args[1], "%d", root_item->pid->real);
+		sprintf(args[2], "%.110s", images_dir);
+		sprintf(args[3], "%.250s", check_buf);
+		argvs[0] = args[0];
+		argvs[1] = args[1];
+		argvs[2] = args[2];
+		argvs[3] = args[3];
+		if(rdma_plugin_main(4, argvs)) {
+			goto err;
+		}
+	}
+
 	for_each_pstree_item(item) {
+		int fd;
+		char fname[128];
+		int virt_pid;
+
 		if (dump_one_task(item, parent_ie))
 			goto err;
+
+		sprintf(fname, "/proc/rdma/%d/user_pid", item->pid->real);
+		fd = open(fname, O_RDONLY);
+		if(fd < 0) {
+			continue;
+		}
+
+		if(read(fd, &virt_pid, sizeof(pid)) < 0) {
+			close(fd);
+			pr_perror("read");
+			return -1;
+		}
+
+		close(fd);
+
+		sprintf(fname, "%.108s/max_fd_%d.raw", images_dir, virt_pid);
+		fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 00666);
+		if(fd < 0) {
+			pr_err("Failed to open %s\n", fname);
+			return -1;
+		}
+
+		if(write(fd, &item->pid->max_fd, sizeof(int)) < 0) {
+			close(fd);
+			pr_perror("write");
+			return -1;
+		}
+
+		close(fd);
 	}
 
 	if (parent_ie) {

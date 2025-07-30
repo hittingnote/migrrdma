@@ -99,6 +99,11 @@
 
 #include "cr-errno.h"
 
+#include "rdma_migr.h"
+
+static pid_t prerestore_parent_pid;
+int timens_helper_pid = -1;
+
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread __export_restore_thread
 #endif
@@ -111,6 +116,9 @@
 #define arch_export_unmap	 __export_unmap
 #define arch_export_unmap_compat __export_unmap_compat
 #endif
+
+int num_devices;
+struct ibv_device **ibv_device_list;
 
 struct pstree_item *current;
 
@@ -882,20 +890,96 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
 static int prepare_itimers(int pid, struct task_restore_args *args, CoreEntry *core);
 static int prepare_mm(pid_t pid, struct task_restore_args *args);
 
+#define up_align_four(n) ({								\
+	typeof(n) __tmp__ = ~0x11;							\
+	(((n)-1) & __tmp__) + 4;							\
+})
+
 static int restore_one_alive_task(int pid, CoreEntry *core)
 {
 	unsigned args_len;
 	struct task_restore_args *ta;
+	struct unmapped_node *unmapped;
+	struct unmapped_node *ta_unmapped;
+	int n_unmapped;
+	int n_update;
+	size_t update_size;
+	int n_qp_replay;
+	size_t qp_replay_size;
+	int n_srq_replay;
+	size_t srq_replay_size;
+	int n_msg;
+	size_t msg_meta_size;
+	int err;
+	void *content_p;
+
 	pr_info("Restoring resources\n");
+	if(prepare_for_partners_restore(current->pid->real)) {
+		return -1;
+	}
 
 	rst_mem_switch_to_private();
 
-	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads, page_size());
+	/* Transfer the data structure of RDMA vma from non-linear to array */
+	unmapped = get_rdma_unmapped_node(&n_unmapped, &err);
+	if(err) {
+		pr_err("Error occurs when get_unmapped_node\n");
+		return -1;
+	}
+
+	update_size = get_update_node_size(&n_update);
+	qp_replay_size = get_qp_replay_size(&n_qp_replay);
+	srq_replay_size = get_srq_replay_size(&n_srq_replay);
+	msg_meta_size = get_send_msg_meta_size(&n_msg);
+	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads
+						+ n_unmapped * sizeof(*unmapped)
+						+ update_size + qp_replay_size + srq_replay_size + msg_meta_size
+						+ get_total_content_size()
+						+ get_send_msg_size(), page_size());
 	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
 	if (!ta)
 		return -1;
 
 	memzero(ta, args_len);
+
+	ta->base = ta;
+	ta_unmapped = (struct unmapped_node *)((void*)(ta + 1)
+					+ sizeof(struct thread_restore_args) * current->nr_threads);
+	memcpy(ta_unmapped, unmapped, n_unmapped * sizeof(*unmapped));
+	ta->unmapped = ta_unmapped;
+	ta->n_unmapped = n_unmapped;
+
+	free(unmapped);
+
+	ta->n_update = n_update;
+	ta->update_arr = (void *)(ta->unmapped + n_unmapped);
+	copy_update_nodes(ta->update_arr);
+
+	ta->n_qp_replay = n_qp_replay;
+	ta->qp_replay_arr = (void *)(ta->update_arr + n_update);
+	copy_qp_replay_nodes(ta->qp_replay_arr);
+
+	ta->n_srq_replay = n_srq_replay;
+	ta->srq_replay_arr = (void *)(ta->qp_replay_arr + n_qp_replay);
+	copy_srq_replay_nodes(ta->srq_replay_arr);
+
+	ta->n_msg = n_msg;
+	ta->msg_arr = (void *)(ta->srq_replay_arr + n_srq_replay);
+	copy_send_msg_meta(ta->msg_arr);
+
+	content_p = (void *)(ta->msg_arr + n_msg);
+	for(int i = 0; i < n_update; i++) {
+		memcpy(content_p, ta->update_arr[i].content_p,
+						ta->update_arr[i].size);
+		ta->update_arr[i].content_p = content_p;
+		content_p += up_align_four(ta->update_arr[i].size);
+	}
+
+	for(int i = 0; i < n_msg; i++) {
+		memcpy(content_p, ta->msg_arr[i].buf, ta->msg_arr[i].size);
+		ta->msg_arr[i].buf = content_p;
+		content_p += up_align_four(ta->msg_arr[i].size);
+	}
 
 	if (prepare_fds(current))
 		return -1;
@@ -1235,6 +1319,29 @@ static int restore_one_helper(void)
 	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
 		close_service_fd(i);
 
+	{
+		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+		struct sockaddr_un sock_un;
+		char buf[32];
+		int err;
+
+		if(sock < 0) {
+			pr_err("Unable to create unix socket to notify CRIU\n");
+			return -1;
+		}
+
+		memset(&sock_un, 0, sizeof(sock_un));
+		sock_un.sun_family = AF_UNIX;
+		sprintf(sock_un.sun_path, "/dev/shm/fullrestore.sock");
+		err = sendto(sock, buf, 32, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
+		if(err < 0) {
+			pr_err("Unable to notify CRIU\n");
+			return -1;
+		}
+
+		close(sock);
+	}
+
 	return 0;
 }
 
@@ -1506,6 +1613,9 @@ static int sigchld_process(int status, pid_t pid)
 {
 	int sig;
 
+	if(pid == timens_helper_pid)
+		return 0;
+
 	if (WIFEXITED(status)) {
 		pr_err("%d exited, status=%d\n", pid, WEXITSTATUS(status));
 		return -1;
@@ -1758,6 +1868,112 @@ static int create_children_and_session(void)
 	return 0;
 }
 
+static int init_server_unix_socket(char **p_sockname) {
+	struct sockaddr_un sock_un;
+	char sockname[1024];
+	int sock;
+	int err;
+
+	sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if(sock < 0) {
+		pr_perror("socket");
+		return -1;
+	}
+
+	memset(&sock_un, 0, sizeof(sock_un));
+	sock_un.sun_family = AF_UNIX;
+	if(current == root_item) {
+		sprintf(sockname, "/dev/shm/pid_leader_%d.sock", getpid());
+	}
+	else {
+		sprintf(sockname, "/dev/shm/pid_%d.sock", getpid());
+	}
+	strcpy(sock_un.sun_path, sockname);
+	unlink(sockname);
+	err = bind(sock, (struct sockaddr*)&sock_un, sizeof(sock_un));
+	if(err) {
+		close(sock);
+		pr_perror("bind");
+		return -1;
+	}
+
+	if(p_sockname && asprintf(p_sockname, "%s", sockname) < 0) {
+		close(sock);
+		pr_perror("asprintf");
+		return -1;
+	}
+
+	return sock;
+}
+
+static int __stop_and_copy_update_core(struct pstree_item *item,
+						struct cr_clone_arg *ca) {
+	pid_t pid = vpid(item);
+
+	if (item->pid->state != TASK_HELPER) {
+		if (open_core(pid, &ca->core))
+			return -1;
+
+		if (check_core(ca->core, item))
+			return -1;
+
+		item->pid->state = ca->core->tc->task_state;
+
+		/*
+		 * Zombie tasks' cgroup is not dumped/restored.
+		 * cg_set == 0 is skipped in prepare_task_cgroup()
+		 */
+		if (item->pid->state == TASK_DEAD) {
+			rsti(item)->cg_set = 0;
+		} else {
+			if (ca->core->thread_core->has_cg_set)
+				rsti(item)->cg_set = ca->core->thread_core->cg_set;
+			else
+				rsti(item)->cg_set = ca->core->tc->cg_set;
+		}
+
+		if (ca->core->tc->has_stop_signo)
+			item->pid->stop_signo = ca->core->tc->stop_signo;
+
+		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
+			pr_err("Unknown task state %d\n", item->pid->state);
+			return -1;
+		}
+
+		/*
+		 * By default we assume that seccomp is not
+		 * used at all (especially on dead task). Later
+		 * we will walk over all threads and check in
+		 * details if filter is present setting up
+		 * this flag as appropriate.
+		 */
+		rsti(item)->has_seccomp = false;
+
+		if (unlikely(item == root_item))
+			maybe_clone_parent(item, ca);
+	} else {
+		/*
+		 * Helper entry will not get moved around and thus
+		 * will live in the parent's cgset.
+		 */
+		rsti(item)->cg_set = rsti(item->parent)->cg_set;
+		ca->core = NULL;
+	}
+
+	return 0;
+}
+
+int stop_and_copy_update_core(void *clone_arg) {
+	return __stop_and_copy_update_core(current, clone_arg);
+}
+
+struct rdma_mmap_item {
+	unsigned long					start;
+	unsigned long					end;
+	int								prot;
+	int								flag;
+};
+
 static int restore_task_with_children(void *_arg)
 {
 	struct cr_clone_arg *ca = _arg;
@@ -1765,6 +1981,53 @@ static int restore_task_with_children(void *_arg)
 	int ret;
 
 	current = ca->item;
+
+#if 0
+	if(current == root_item) {
+		timens_helper_pid = fork();
+		if(timens_helper_pid < 0) {
+			goto err;
+		}
+		if(timens_helper_pid == 0) {
+			int sock;
+			struct sockaddr_un sock_un;
+			int err;
+
+			if (unshare(CLONE_NEWTIME)) {
+				pr_perror("Unable to create a new time namespace");
+				goto err;
+			}
+
+			sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+			if(sock < 0) {
+				pr_perror("socket");
+				return -1;
+			}
+
+			memset(&sock_un, 0, sizeof(sock_un));
+			sock_un.sun_family = AF_UNIX;
+			sprintf(sock_un.sun_path, "/dev/shm/timens.sock");
+			unlink(sock_un.sun_path);
+			err = bind(sock, (struct sockaddr*)&sock_un, sizeof(sock_un));
+			if(err) {
+				close(sock);
+				pr_perror("bind");
+				return -1;
+			}
+
+			if(recvfrom(sock, NULL, 0, 0, NULL, NULL) < 0) {
+				close(sock);
+				pr_perror("recvfrom");
+				return -1;
+			}
+
+			pr_info("Now timens helper exits\n");
+			close(sock);
+			unlink(sock_un.sun_path);
+			while(1);
+		}
+	}
+#endif
 
 	if (current != root_item) {
 		char buf[12];
@@ -1813,6 +2076,7 @@ static int restore_task_with_children(void *_arg)
 			}
 		}
 
+#if 0
 		if (root_ns_mask & CLONE_NEWTIME) {
 			if (prepare_timens(current->ids->time_ns_id))
 				goto err;
@@ -1820,6 +2084,7 @@ static int restore_task_with_children(void *_arg)
 			if (prepare_timens(0))
 				goto err;
 		}
+#endif
 
 		if (set_opts_cap_eff())
 			goto err;
@@ -1877,13 +2142,21 @@ static int restore_task_with_children(void *_arg)
 			goto err;
 	}
 
+	if(add_rdma_vma_node(pid)) {
+		goto err;
+	}
+
+	if(only_prepare_rdma_mappings(current)) {
+		goto err;
+	}
+
 	if (setup_newborn_fds(current))
 		goto err;
 
 	if (restore_task_mnt_ns(current))
 		goto err;
 
-	if (prepare_mappings(current))
+	if (prepare_mappings(current, false))
 		goto err;
 
 	if (prepare_sigactions(ca->core) < 0)
@@ -1904,6 +2177,117 @@ static int restore_task_with_children(void *_arg)
 
 	timing_stop(TIME_FORK);
 
+	if(restore_rdma(pid, images_dir)) {
+		pr_err("restore_rdma failed. errno: %d\n", errno);
+		goto err;
+	}
+
+	{
+		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+		struct sockaddr_un sock_un;
+		char buf[32];
+		int err;
+
+		if(sock < 0) {
+			pr_perror("socket");
+			return -1;
+		}
+
+		memset(&sock_un, 0, sizeof(sock_un));
+		sock_un.sun_family = AF_UNIX;
+		sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
+		sprintf(buf, "FINISH");
+		err = sendto(sock, buf, strlen(buf)+1, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
+		if(err < 0) {
+			pr_perror("sendto");
+			return -1;
+		}
+
+		close(sock);
+	}
+
+	{
+		char *sockname;
+		char buf[32];
+		int sock = init_server_unix_socket(&sockname);
+
+		pr_info("Partial restore finished. Now wait for the rest states ready.\n");
+
+		if(recvfrom(sock, buf, 32, 0, NULL, NULL) < 0) {
+			close(sock);
+			pr_perror("recvfrom");
+			return -1;
+		}
+
+		close(sock);
+		unlink(sockname);
+		free(sockname);
+
+		pr_info("Full restore starts.\n");
+	}
+
+	if(stop_and_copy_update_state(current, ca))
+		goto err;
+
+	if(prepare_mappings(current, true))
+		goto err;
+
+	if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback)) {
+		goto err;
+	}
+
+	if(ibv_update_mem(add_update_node, add_one_rdma_vma_node)) {
+		goto err;
+	}
+
+	if(current->pid->state != TASK_HELPER) {
+		struct rdma_mmap_item item;
+		int fd;
+		char fname[128];
+		int err;
+
+		sprintf(fname, "%.110s/rdma_mmap_%d.raw",
+					images_dir, vpid(current));
+		fd = open(fname, O_RDONLY);
+		if(fd < 0) {
+			pr_info("No RDMA. Skip RDMA mmap\n");
+			goto skip_rdma_mmap;
+		}
+
+		do {
+			void *addr;
+
+			err = read(fd, &item, sizeof(item));
+			if(err != 0 && err != sizeof(item)) {
+				pr_perror("read");
+				goto err;
+			}
+
+			if(err == 0) {
+				continue;
+			}
+
+			addr = mmap((void *)item.start, item.end - item.start,
+					PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if(addr != (void *)item.start) {
+				perror("mmap");
+				goto err;
+			}
+
+			add_one_rdma_vma_node(item.start, item.end);
+
+			pr_info("mmap null RDMA register: %lx-%lx, %c%c%c%c\n",
+							item.start, item.end,
+							(item.prot & PROT_READ)? 'r': '-',
+							(item.prot & PROT_WRITE)? 'w': '-',
+							(item.prot & PROT_EXEC)? 'x': '-',
+							(item.flag == MAP_SHARED)? 's': 'p');
+		} while(err != 0);
+
+		close(fd);
+	}
+
+skip_rdma_mmap:
 	if (populate_pid_proc())
 		goto err;
 
@@ -2559,6 +2943,7 @@ int prepare_task_entries(void)
 
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
+	task_entries->nr_to_wait = 0;
 	task_entries->nr_helpers = 0;
 	futex_set(&task_entries->start, CR_STATE_FAIL);
 	mutex_init(&task_entries->userns_sync_lock);
@@ -2580,9 +2965,77 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 	return 0;
 }
 
+static pid_t get_parent_pid_from_proc(pid_t pid) {
+	FILE *fp;
+	char fname[128];
+	pid_t parent_pid;
+	char strln[1024];
+
+	sprintf(fname, "/proc/%d/status", pid);
+	fp = fopen(fname, "r");
+	if(!fp) {
+		return -1;
+	}
+
+	while(fgets(strln, 1024, fp) != NULL) {
+		char header[16];
+		off_t off;
+		sscanf(strln, "%s%ln", header, &off);
+		if(strcmp(header, "PPid:"))
+			continue;
+
+		sscanf(strln + off, "%d", &parent_pid);
+		fclose(fp);
+		return parent_pid;
+	}
+
+	fclose(fp);
+	return -1;
+}
+
+static int get_cmdline_from_pid(pid_t pid, char *cmdline) {
+	FILE *fp;
+	char fname[128];
+	char strln[1024];
+
+	sprintf(fname, "/proc/%d/cmdline", pid);
+	fp = fopen(fname, "r");
+	if(fgets(strln, 1024, fp) == NULL)
+		return -1;
+
+	strcpy(cmdline, strln);
+	return 0;
+}
+
+static pid_t get_init_pid(void) {
+	pid_t cur_pid = getpid();
+	pid_t parent_pid = get_parent_pid_from_proc(cur_pid);
+	char cmdline[1024];
+
+	if(get_cmdline_from_pid(parent_pid, cmdline)) {
+		return -1;
+	}
+
+	while(!strcmp(cmdline, "runc")) {
+		cur_pid = parent_pid;
+		parent_pid = get_parent_pid_from_proc(cur_pid);
+		if(get_cmdline_from_pid(parent_pid, cmdline)) {
+			return -1;
+		}
+	}
+
+	return parent_pid;
+}
+
 int cr_restore_tasks(void)
 {
 	int ret = -1;
+	int i;
+
+	ibv_device_list = ibv_get_device_list(&num_devices);
+	for(i = 0; i < num_devices; i++) {
+		munmap(ibv_device_list[i]->qpn_dict, 4096 * 4096 * sizeof(uint32_t));
+	}
 
 	if (init_service_fd())
 		return 1;
@@ -2621,6 +3074,34 @@ int cr_restore_tasks(void)
 	if (prepare_pstree() < 0)
 		goto err;
 
+	futex_set(&task_entries->futex_n_wait,
+				task_entries->nr_to_wait);
+	futex_set(&task_entries->futex_n_wait_2,
+				task_entries->nr_to_wait);
+
+	{
+		struct pstree_item *pi;
+		for_each_pstree_item(pi) {
+			int fd;
+			char fname[128];
+
+			pi->pid->max_fd = -1;
+			sprintf(fname, "%.108s/max_fd_%d.raw", images_dir, vpid(pi));
+			fd = open(fname, O_RDONLY);
+			if(fd < 0) {
+				continue;
+			}
+
+			if(read(fd, &pi->pid->max_fd, sizeof(int)) < 0) {
+				close(fd);
+				pr_perror("read");
+				return -1;
+			}
+
+			close(fd);
+		}
+	}
+
 	if (fdstore_init())
 		goto err;
 
@@ -2638,6 +3119,37 @@ int cr_restore_tasks(void)
 
 	if (prepare_lazy_pages_socket() < 0)
 		goto clean_cgroup;
+
+	{
+		int total_wait = 0;
+		struct pstree_item *it;
+		int sock;
+		struct sockaddr_un sock_un;
+		int err;
+
+		prerestore_parent_pid = get_init_pid();
+
+		for_each_pstree_item(it) {
+			total_wait++;
+		}
+
+		sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if(sock < 0) {
+			pr_perror("socket");
+			return -1;
+		}
+
+		memset(&sock_un, 0, sizeof(sock_un));
+		sock_un.sun_family = AF_UNIX;
+		sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
+		err = sendto(sock, &total_wait, sizeof(int), 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
+		if(err < 0) {
+			pr_perror("socket");
+			return -1;
+		}
+
+		close(sock);
+	}
 
 	ret = restore_root_task(root_item);
 clean_cgroup:
@@ -3582,8 +4094,11 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	unsigned long creds_pos_next;
 
 	sigset_t blockmask;
+	struct unmapped_node *ta_unmapped;
 
 	pr_info("Restore via sigreturn\n");
+
+	task_args->prerestore_parent_pid = prerestore_parent_pid;
 
 	/* pr_info_vma_list(&self_vma_list); */
 
@@ -3690,6 +4205,30 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->rst_mem = mem;
 	task_args->rst_mem_size = rst_mem_size + alen;
 	thread_args = (struct thread_restore_args *)(task_args + 1);
+
+	ta_unmapped = (struct unmapped_node *)((void*)(task_args + 1)
+					+ sizeof(struct thread_restore_args) * current->nr_threads);
+	task_args->unmapped = ta_unmapped;
+
+	task_args->update_arr = (void *)task_args->update_arr - task_args->base +
+										(void *)task_args;
+	task_args->qp_replay_arr = (void *)task_args->qp_replay_arr - task_args->base +
+										(void *)task_args;
+	task_args->srq_replay_arr = (void *)task_args->srq_replay_arr - task_args->base +
+										(void *)task_args;
+	task_args->msg_arr = (void *)task_args->msg_arr - task_args->base +
+										(void *)task_args;
+	for(int i = 0; i < task_args->n_update; i++) {
+		void *content_p = (void *)task_args->update_arr[i].content_p -
+							task_args->base + (void *)task_args;
+		task_args->update_arr[i].content_p = content_p;
+	}
+
+	for(int i = 0; i < task_args->n_msg; i++) {
+		void *content_p = (void *)task_args->msg_arr[i].buf -
+							task_args->base + (void *)task_args;
+		task_args->msg_arr[i].buf = content_p;
+	}
 
 	/*
 	 * And finally -- the rest arguments referenced by task_ and
