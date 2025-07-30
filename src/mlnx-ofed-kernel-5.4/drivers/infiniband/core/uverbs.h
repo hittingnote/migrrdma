@@ -126,12 +126,24 @@ struct ib_uverbs_async_event_file {
 	struct ib_uobject			uobj;
 	struct ib_uverbs_event_queue		ev_queue;
 	struct ib_event_handler			event_handler;
+	int								async_fd;
 };
 
 struct ib_uverbs_completion_event_file {
 	struct ib_uobject			uobj;
 	struct ib_uverbs_event_queue		ev_queue;
+	struct proc_dir_entry				*uverbs_completion_event_file_proc_ent;
+	int									comp_fd;
 };
+
+#include "rdma_footprint.h"
+
+#define declare_ufile_member(map_field)													\
+	void								*map_field##_mapping;							\
+	__aligned_u64						map_field##_mmap_addr;							\
+	int									map_field##_fd;									\
+	wait_queue_head_t					map_field##_fd_wait_queue;						\
+	int									map_field##_fd_wait_flag
 
 struct ib_uverbs_file {
 	struct kref				ref;
@@ -158,6 +170,32 @@ struct ib_uverbs_file {
 	struct mutex umap_lock;
 	struct list_head umaps;
 	struct page *disassociate_page;
+
+	char						ctx_resp[256];
+	wait_queue_head_t			ctx_resp_wait_queue;
+	int							ctx_resp_wait_flag;
+
+	struct proc_dir_entry		*ufile_proc_ent;
+	struct proc_dir_entry		*ufile_proc_uwrite_ent;
+	struct proc_task_node		*task_node;
+	struct footprint_gid_entry	gid_table[256];
+	wait_queue_head_t			gid_table_wait_queue;
+	int							gid_table_wait_flag;
+
+	__aligned_u64				ctx_uaddr;
+	wait_queue_head_t			ctx_uaddr_wait_queue;
+	int							ctx_uaddr_wait_flag;
+
+	__aligned_u64				nc_uar;
+	wait_queue_head_t			nc_uar_wait_queue;
+	int							nc_uar_wait_flag;
+
+	declare_ufile_member(lkey);
+	declare_ufile_member(rkey);
+
+	struct list_head	remote_rkey_trans_list;
+	rwlock_t			trans_list_lock;
+	int					cmd_fd;
 
 	struct xarray		idr;
 };

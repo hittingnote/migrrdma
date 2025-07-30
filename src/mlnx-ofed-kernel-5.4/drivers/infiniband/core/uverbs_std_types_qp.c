@@ -7,6 +7,7 @@
 #include "rdma_core.h"
 #include "uverbs.h"
 #include "core_priv.h"
+#include "rdma_footprint.h"
 
 static int uverbs_free_qp(struct ib_uobject *uobject,
 			  enum rdma_remove_reason why,
@@ -16,6 +17,10 @@ static int uverbs_free_qp(struct ib_uobject *uobject,
 	struct ib_uqp_object *uqp =
 		container_of(uobject, struct ib_uqp_object, uevent.uobject);
 	int ret;
+
+	unregister_qp_handle_mapping(attrs->ufile, qp);
+	deregister_qp_from_footprint(qp);
+	deregister_qp_from_uwrite_footprint(qp);
 
 	/*
 	 * If this is a user triggered destroy then do not allow destruction

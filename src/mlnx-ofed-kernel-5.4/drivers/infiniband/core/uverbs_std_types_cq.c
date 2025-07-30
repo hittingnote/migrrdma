@@ -33,6 +33,7 @@
 #include <rdma/uverbs_std_types.h>
 #include "rdma_core.h"
 #include "uverbs.h"
+#include "rdma_footprint.h"
 
 static int uverbs_free_cq(struct ib_uobject *uobject,
 			  enum rdma_remove_reason why,
@@ -43,6 +44,10 @@ static int uverbs_free_cq(struct ib_uobject *uobject,
 	struct ib_ucq_object *ucq =
 		container_of(uobject, struct ib_ucq_object, uevent.uobject);
 	int ret;
+
+	unregister_cq_handle_mapping(attrs->ufile, cq);
+	deregister_cq_from_footprint(cq);
+	deregister_cq_from_uwrite_footprint(cq);
 
 	ret = ib_destroy_cq_user(cq, &attrs->driver_udata);
 	if (ib_is_destroy_retryable(ret, why, uobject))
