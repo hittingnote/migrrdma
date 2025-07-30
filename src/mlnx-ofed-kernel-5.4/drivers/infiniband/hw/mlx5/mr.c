@@ -1138,6 +1138,7 @@ static void set_mr_fields(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr,
 	mr->ibmr.rkey = mr->mmkey.key;
 	mr->ibmr.length = length;
 	mr->access_flags = access_flags;
+	mr->ibmr.access_flags = access_flags;
 	mr->dev = dev;
 }
 

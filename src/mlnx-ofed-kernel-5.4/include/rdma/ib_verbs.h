@@ -1559,6 +1559,9 @@ struct ib_pd {
 
 	u32			unsafe_global_rkey;
 
+	struct proc_dir_entry			*pd_proc_ent;
+	void							*pd_map_ent;
+
 	/*
 	 * Implementation details of the RDMA core, don't use in drivers:
 	 */
@@ -1593,6 +1596,11 @@ enum ib_poll_context {
 	IB_POLL_DIRECT,		   /* caller context, no hw completions */
 };
 
+#define declare_uwrite_info_member(info_type, info_name)									\
+	info_type				info_name;														\
+	wait_queue_head_t		info_name##_wait_queue;											\
+	int						info_name##_wait_flag
+
 struct ib_cq {
 	struct ib_device       *device;
 	struct ib_ucq_object   *uobject;
@@ -1618,11 +1626,22 @@ struct ib_cq {
 	u8 shared:1;
 	unsigned int comp_vector;
 
+	struct proc_dir_entry		*cq_proc_ent;
+	struct proc_dir_entry		*cq_proc_uwrite_ent;
+	void						*cq_map_ent;
+	int							comp_fd;
+
+	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
+	declare_uwrite_info_member(__aligned_u64, buf_addr);
+	declare_uwrite_info_member(__aligned_u64, db_addr);
+
 	/*
 	 * Implementation details of the RDMA core, don't use in drivers:
 	 */
 	struct rdma_restrack_entry res;
 };
+
+typedef char char_24[24];
 
 struct ib_srq {
 	struct ib_device       *device;
@@ -1642,6 +1661,16 @@ struct ib_srq {
 			} xrc;
 		};
 	} ext;
+
+	int vhandle;
+	struct proc_dir_entry			*srq_proc_ent;
+	struct proc_dir_entry			*srq_proc_uwrite_ent;
+	void							*srq_map_ent;
+
+	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
+	declare_uwrite_info_member(__aligned_u64, buf_addr);
+	declare_uwrite_info_member(__aligned_u64, db_addr);
+	declare_uwrite_info_member(char_24, srq_init_attr);
 };
 
 enum ib_raw_packet_caps {
@@ -1768,6 +1797,9 @@ struct ib_qp_security {
 	int			error_comps_pending;
 };
 
+typedef char char_64[64];
+typedef char char_144[144];
+
 /*
  * @max_write_sge: Maximum SGE elements per RDMA WRITE request.
  * @max_read_sge:  Maximum SGE elements per RDMA READ request.
@@ -1803,6 +1835,41 @@ struct ib_qp {
 	struct ib_qp_security  *qp_sec;
 	u32			port;
 
+	struct proc_dir_entry			*qp_proc_ent;
+	struct proc_dir_entry			*qp_proc_uwrite_ent;
+	void							*qp_map_ent;
+
+	declare_uwrite_info_member(enum ib_qp_state, cur_qp_state);
+	int32_t							usr_idx;
+	union ib_gid					rc_dest_gid;
+
+	declare_uwrite_info_member(__aligned_u64, meta_uaddr);
+	declare_uwrite_info_member(__aligned_u64, buf_addr);
+	declare_uwrite_info_member(__aligned_u64, db_addr);
+	declare_uwrite_info_member(u32, send_cur_post);
+	declare_uwrite_info_member(u32, recv_head);
+	declare_uwrite_info_member(u32, recv_tail);
+	declare_uwrite_info_member(__u32, send_cq_handle);
+	declare_uwrite_info_member(__u32, recv_cq_handle);
+	declare_uwrite_info_member(char_64, init_attr);
+	declare_uwrite_info_member(char_144, attr_0);
+	declare_uwrite_info_member(char_144, attr_1);
+	declare_uwrite_info_member(char_144, attr_2);
+	declare_uwrite_info_member(__u32, mask_0);
+	declare_uwrite_info_member(__u32, mask_1);
+	declare_uwrite_info_member(__u32, mask_2);
+	declare_uwrite_info_member(__aligned_u64, bf_uar_addr);
+	declare_uwrite_info_member(u32, vqpn);
+	declare_uwrite_info_member(u32, signal_fd);
+	declare_uwrite_info_member(union ib_gid, rc_dest_pgid);
+	declare_uwrite_info_member(u32, dest_pqpn);
+
+	wait_queue_head_t				signal_pause_wait_queue;
+	int								signal_pause_wait_flag;
+
+	int				vhandle;
+	int				cmd_fd;
+
 	bool			integrity_en;
 	/*
 	 * Implementation details of the RDMA core, don't use in drivers:
@@ -1829,12 +1896,20 @@ struct ib_mr {
 	u64		   iova;
 	u64		   length;
 	unsigned int	   page_size;
+	int			access_flags;
 	enum ib_mr_type	   type;
 	bool		   need_inval;
 	union {
 		struct ib_uobject	*uobject;	/* user */
 		struct list_head	qp_entry;	/* FR */
 	};
+
+	struct proc_dir_entry	*mr_proc_ent;
+	struct proc_dir_entry	*mr_proc_uwrite_ent;
+	void					*mr_map_ent;
+
+	declare_uwrite_info_member(u32, vlkey);
+	declare_uwrite_info_member(u32, vrkey);
 
 	struct ib_dm      *dm;
 	struct ib_sig_attrs *sig_attrs; /* only for IB_MR_TYPE_INTEGRITY MRs */
@@ -2689,6 +2764,8 @@ struct ib_core_device {
 	struct ib_device *owner; /* reach back to owner ib_device */
 };
 
+#include <linux/proc_fs.h>
+
 struct rdma_restrack_root;
 struct ib_device {
 	/* Do not access @dma_device directly from ULP nor from HW drivers. */
@@ -2696,6 +2773,10 @@ struct ib_device {
 	struct ib_device_ops	     ops;
 	char                          name[IB_DEVICE_NAME_MAX];
 	struct rcu_head rcu_head;
+
+	struct proc_dir_entry			*proc_ent;
+	struct proc_dir_entry			*uwrite_proc_ent;
+	void							*qpn_dict;
 
 	struct list_head              event_handler_list;
 	/* Protects event_handler_list */

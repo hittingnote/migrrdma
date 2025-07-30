@@ -207,6 +207,413 @@ static int UVERBS_HANDLER(UVERBS_METHOD_QUERY_PORT)(
 					     &resp, sizeof(resp));
 }
 
+#include "rdma_footprint.h"
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_QPN_DICT)(
+				struct uverbs_attr_bundle *attrs) {
+	int real_qpn, vqpn;
+	int ret;
+	uint32_t *qpn_dict;
+
+	ret = uverbs_copy_from(&real_qpn, attrs, 0);
+	ret = uverbs_copy_from(&vqpn, attrs, 1);
+	if(ret)
+		return ret;
+
+	qpn_dict = attrs->ufile->device->ib_dev->qpn_dict;
+	qpn_dict[real_qpn] = vqpn;
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_FOOTPRINT)(
+				struct uverbs_attr_bundle *attrs) {
+	int cmd_fd;
+	int ret;
+
+	ret = uverbs_copy_from(&cmd_fd, attrs, UVERBS_ATTR_FOOTPRINT_IN_FD);
+	if(ret)
+		return ret;
+	
+	ret = register_rdma_dev_fd_entry(cmd_fd, attrs->ufile);
+	if(ret)
+		return ret;
+
+	return ufile_alloc_mapping(attrs->ufile);
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_CTX_RESP)(
+				struct uverbs_attr_bundle *attrs) {
+	char __user *buf;
+	size_t size;
+	int ret;
+
+	ret = uverbs_copy_from(&buf, attrs, UVERBS_ATTR_RESP_PTR);
+	if(ret)
+		return ret;
+	
+	ret = uverbs_copy_from(&size, attrs, UVERBS_ATTR_RESP_SZ);
+	if(ret)
+		return ret;
+
+	return install_ctx_resp(attrs->ufile, buf, size);
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	struct ib_mr *mr;
+	struct ib_uobject *uobj;
+	int vhandle, handle;
+	int ret;
+
+	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+
+	uobj = uobj_get_write(UVERBS_OBJECT_MR, handle, attrs);
+	if(IS_ERR(uobj))
+		return PTR_ERR(uobj);
+	mr = uobj->object;
+
+	ret = register_mr_to_footprint(mr, mr->pd, vhandle);
+	if(ret) {
+		uobj_put_write(uobj);
+		return ret;
+	}
+
+	ret = register_mr_to_uwrite_footprint(mr, attrs->ufile, vhandle);
+	if(ret) {
+		uobj_put_write(uobj);
+		return ret;
+	}
+
+	ret = register_mr_handle_mapping(attrs->ufile, mr, vhandle, handle);
+	if(ret) {
+		uobj_put_write(uobj);
+		return ret;
+	}
+
+	uobj_put_write(uobj);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING)(
+					struct uverbs_attr_bundle *attrs) {
+	struct ib_srq *srq;
+	int vhandle, handle;
+	int ret;
+
+	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+
+	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, handle, attrs);
+	if(!srq || srq->srq_type == IB_SRQT_XRC) {
+		if(srq) {
+			rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
+									UVERBS_LOOKUP_READ);
+		}
+		return -EINVAL;
+	}
+
+	ret = register_srq_to_footprint(srq, srq->pd, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
+									UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	ret = register_srq_handle_mapping(attrs->ufile, srq, vhandle, handle);
+	if(ret) {
+		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
+									UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	srq->vhandle = vhandle;
+
+	ret = register_srq_to_uwrite_footprint(srq, attrs->ufile, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
+									UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	rdma_lookup_put_uobject(&srq->uobject->uevent.uobject,
+								UVERBS_LOOKUP_READ);
+	return 0;
+ }
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING)(
+					struct uverbs_attr_bundle *attrs) {
+	struct ib_qp *qp;
+	int vhandle, handle;
+	int ret;
+
+	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+	
+	qp = uobj_get_obj_read(qp, UVERBS_OBJECT_QP, handle, attrs);
+	if(!qp)
+		return -EINVAL;
+
+	ret = register_qp_to_footprint(qp, qp->pd, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
+								UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	qp->cmd_fd = attrs->ufile->cmd_fd;
+
+	ret = register_qp_handle_mapping(attrs->ufile, qp, vhandle, handle);
+	if(ret) {
+		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
+								UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	qp->vhandle = vhandle;
+
+	ret = register_qp_to_uwrite_footprint(qp, attrs->ufile, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
+								UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	rdma_lookup_put_uobject(&qp->uobject->uevent.uobject,
+						UVERBS_LOOKUP_READ);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	struct ib_pd *pd;
+	int vhandle, handle;
+	int ret;
+
+	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+	
+	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, handle, attrs);
+	if(!pd) {
+		return -EINVAL;
+	}
+
+	ret = register_pd_to_footprint(pd, attrs->ufile, vhandle);
+	if(ret) {
+		uobj_put_obj_read(pd);
+		return ret;
+	}
+
+	ret = register_pd_handle_mapping(attrs->ufile, pd, vhandle, handle);
+	if(ret) {
+		uobj_put_obj_read(pd);
+		return ret;
+	}
+
+	uobj_put_obj_read(pd);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	struct ib_cq *cq;
+	int vhandle, handle;
+	int ret;
+
+	ret = uverbs_copy_from(&vhandle, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&handle, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+	
+	cq = uobj_get_obj_read(cq, UVERBS_OBJECT_CQ, handle, attrs);
+	if(!cq) {
+		return -EINVAL;
+	}
+
+	cq->comp_fd = cq->cq_context?
+						container_of(cq->cq_context, struct ib_uverbs_completion_event_file,
+								ev_queue)->comp_fd : -1;
+
+	ret = register_cq_to_footprint(cq, attrs->ufile, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
+						UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	ret = register_cq_to_uwrite_footprint(cq, attrs->ufile, vhandle);
+	if(ret) {
+		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
+						UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	ret = register_cq_handle_mapping(attrs->ufile, cq, vhandle, handle);
+	if(ret) {
+		rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
+						UVERBS_LOOKUP_READ);
+		return ret;
+	}
+
+	rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
+						UVERBS_LOOKUP_READ);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LQPN_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vqpn, qpn;
+	int ret;
+
+	ret = uverbs_copy_from(&vqpn, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&qpn, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+
+#if 0
+	if(update_lqpn_mapping(attrs->ufile, vqpn, qpn))
+		return add_lqpn_mapping(attrs->ufile, vqpn, qpn);
+	else
+		return 0;
+#endif
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LKEY_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vlkey, lkey;
+	int ret;
+	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
+
+	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&lkey, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+
+	lkey_arr[vlkey] = lkey;
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vrkey, rkey;
+	int ret;
+	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
+
+	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
+	ret = uverbs_copy_from(&rkey, attrs, UVERBS_ATTR_HANDLE);
+	if(ret)
+		return ret;
+
+	rkey_arr[vrkey] = rkey;
+	return service_register_rkey_mapping(current->tgid, vrkey, rkey);
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vrkey;
+	int ret;
+	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
+
+	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
+	if(ret)
+		return ret;
+
+	rkey_arr[vrkey] = 0;
+	return service_delete_rkey_mapping(current->tgid, vrkey);
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LQPN_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vqpn;
+	int ret;
+
+	ret = uverbs_copy_from(&vqpn, attrs, UVERBS_ATTR_VHANDLE);
+	if(ret)
+		return ret;
+	
+//	del_lqpn_mapping(attrs->ufile, vqpn);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LKEY_MAPPING)(
+				struct uverbs_attr_bundle *attrs) {
+	uint32_t vlkey;
+	int ret;
+	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
+
+	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
+	if(ret)
+		return ret;
+
+	lkey_arr[vlkey] = 0;
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_REGISTER_REMOTE_GID_PID)(
+				struct uverbs_attr_bundle *attrs) {
+	union ib_gid gid;
+	pid_t pid;
+	int ret;
+
+	ret = uverbs_copy_from(&gid, attrs, 0);
+	ret = uverbs_copy_from(&pid, attrs, 1);
+	if(ret)
+		return ret;
+
+	return register_remote_rkey_mapping(attrs->ufile, &gid, pid);
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_GET_LOCAL_RDMA_PID)(
+				struct uverbs_attr_bundle *attrs) {
+	pid_t rdma_pid = current->tgid;
+	return uverbs_copy_to(attrs, 0, &rdma_pid, sizeof(rdma_pid));
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD)(
+				struct uverbs_attr_bundle *attrs) {
+	struct ib_uobject *ev_file_uobj;
+	struct ib_uverbs_completion_event_file *ev_file;
+
+	ev_file_uobj = uverbs_attr_get_uobject(attrs, 0);
+	if(IS_ERR(ev_file_uobj)) {
+		return PTR_ERR(ev_file_uobj);
+	}
+
+	uverbs_uobject_get(ev_file_uobj);
+
+	ev_file = container_of(ev_file_uobj,
+					struct ib_uverbs_completion_event_file, uobj);
+	if(ev_file->uobj.id != ev_file->comp_fd) {
+		deregister_uverbs_completion_event_file_from_footprint(ev_file);
+		ev_file->comp_fd = ev_file->uobj.id;
+		register_uverbs_completion_event_file_to_footprint(ev_file, attrs->ufile, ev_file->comp_fd);
+	}
+
+	uverbs_uobject_put(ev_file_uobj);
+	return 0;
+}
+
+static int UVERBS_HANDLER(UVERBS_METHOD_REGISTER_ASYNC_FD)(
+				struct uverbs_attr_bundle *attrs) {
+	int async_fd;
+	int ret;
+
+	ret = uverbs_copy_from(&async_fd, attrs, UVERBS_ATTR_FOOTPRINT_IN_FD);
+	if(ret)
+		return ret;
+	
+	return register_async_fd(attrs->ufile, async_fd);
+}
+
 static int UVERBS_HANDLER(UVERBS_METHOD_GET_CONTEXT)(
 	struct uverbs_attr_bundle *attrs)
 {
@@ -431,6 +838,118 @@ out:
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_FOOTPRINT,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FOOTPRINT_IN_FD,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_QPN_DICT,
+	UVERBS_ATTR_PTR_IN(0,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(1,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_CTX_RESP,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESP_PTR,
+				UVERBS_ATTR_TYPE(__aligned_u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESP_SZ,
+				UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_REGISTER_ASYNC_FD,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_FOOTPRINT_IN_FD,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_LQPN_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_LKEY_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_DELETE_LQPN_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_DELETE_LKEY_MAPPING,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_GET_LOCAL_RDMA_PID,
+	UVERBS_ATTR_PTR_OUT(0,
+				UVERBS_ATTR_TYPE(pid_t), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD,
+	UVERBS_ATTR_FD(0, UVERBS_OBJECT_COMP_CHANNEL,
+			UVERBS_ACCESS_READ, UA_OPTIONAL));
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_REGISTER_REMOTE_GID_PID,
+	UVERBS_ATTR_PTR_IN(0,
+				UVERBS_ATTR_TYPE(union ib_gid), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(1,
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_METHOD_GET_CONTEXT,
 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_GET_CONTEXT_NUM_COMP_VECTORS,
 			    UVERBS_ATTR_TYPE(u32), UA_OPTIONAL),
@@ -497,7 +1016,32 @@ DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_DEVICE,
 			      &UVERBS_METHOD(UVERBS_METHOD_QUERY_GID_TABLE),
 			      &UVERBS_METHOD(UVERBS_METHOD_QUERY_GID_ENTRY));
 
+DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_FOOTPRINT,
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_QPN_DICT),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_FOOTPRINT),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_CTX_RESP),
+				&UVERBS_METHOD(UVERBS_METHOD_REGISTER_ASYNC_FD),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_PD_HANDLE_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_CQ_HANDLE_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_MR_HANDLE_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_QP_HANDLE_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_SRQ_HANDLE_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LQPN_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LKEY_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LQPN_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_DELETE_LKEY_MAPPING),
+				&UVERBS_METHOD(UVERBS_METHOD_REGISTER_REMOTE_GID_PID),
+				&UVERBS_METHOD(UVERBS_METHOD_GET_LOCAL_RDMA_PID),
+				&UVERBS_METHOD(UVERBS_METHOD_UPDATE_COMP_CHANNEL_FD));
+
 const struct uapi_definition uverbs_def_obj_device[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_DEVICE),
+	{},
+};
+
+const struct uapi_definition uverbs_def_obj_footprint[] = {
+	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_FOOTPRINT),
 	{},
 };
