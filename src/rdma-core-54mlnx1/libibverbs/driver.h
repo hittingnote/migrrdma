@@ -47,7 +47,13 @@
 #include <infiniband/cmd_ioctl.h>
 #include <sys/types.h>
 
+extern int __rdma_pid__;
+extern int signal_flag;
+
 struct verbs_device;
+
+extern void free_all_my_memory(void);
+extern void *my_malloc(size_t size);
 
 enum verbs_xrcd_mask {
 	VERBS_XRCD_HANDLE	= 1 << 0,
@@ -234,6 +240,13 @@ struct verbs_device_ops {
 
 	struct verbs_device *(*alloc_device)(struct verbs_sysfs_dev *sysfs_dev);
 	void (*uninit_device)(struct verbs_device *device);
+
+	struct verbs_context *(*resume_context)(struct ibv_device *ibdev, int cmd_fd,
+						int *async_fd, struct verbs_context *orig_ctx);
+	struct verbs_context *(*pre_resume_context)(struct ibv_device *ibdev, int cmd_fd);
+	void (*free_tmp_context)(struct ibv_context *context);
+	struct ibv_context *(*dup_context)(struct ibv_context *context, struct ibv_qp *qp);
+	struct verbs_context *(*get_ops_context)(struct ibv_device *ibdev, int cmd_fd);
 };
 
 /* Must change the PRIVATE IBVERBS_PRIVATE_ symbol if this is changed */
@@ -395,6 +408,44 @@ struct verbs_context_ops {
 	void (*unimport_dm)(struct ibv_dm *dm);
 	void (*unimport_mr)(struct ibv_mr *mr);
 	void (*unimport_pd)(struct ibv_pd *pd);
+
+	int (*uwrite_cq)(struct ibv_cq *cq, int cq_dir_fd);
+	struct ibv_cq *(*resume_cq)(struct ibv_context *context, struct ibv_cq *cq_meta,
+			int cqe, struct ibv_comp_channel *channel, int comp_vector,
+			void *buf_addr, void *db_addr, int vhandle);
+	int (*get_cons_index)(struct ibv_cq *cq);
+	void (*set_cons_index)(struct ibv_cq *cq, int cons_index);
+	void (*copy_cqe_to_shaded)(struct ibv_cq *cq);
+
+	int (*uwrite_qp)(struct ibv_qp *qp, struct ibv_qp *new_qp);
+	struct ibv_qp *(*resume_qp)(struct ibv_context *context, int pd_handle, int qp_handle,
+					struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
+					int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg);
+	void (*free_qp)(struct ibv_qp *qp);
+	int (*is_q_empty)(struct ibv_qp *qp);
+	void (*copy_qp)(struct ibv_qp *qp1, struct ibv_qp *qp2, void *param);
+	struct ibv_qp *(*calloc_qp)(void);
+	int (*replay_recv_wr)(struct ibv_qp *qp);
+	int (*prepare_qp_recv_replay)(struct ibv_qp *qp, struct ibv_qp *new_qp);
+	void (*record_qp_index)(struct ibv_qp *qp);
+
+	struct ibv_srq *(*resume_srq)(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
+
+	void (*migrrdma_start_poll)(struct ibv_cq *cq);
+	void (*migrrdma_end_poll)(struct ibv_cq *cq);
+	int (*migrrdma_poll_cq)(struct ibv_cq *cq, int ne,
+				struct ibv_wc *wc,
+				struct ibv_qp **qps, struct ibv_srq **srqs);
+	void (*migrrdma_start_inspect_qp)(struct ibv_qp *qp);
+	void (*migrrdma_start_inspect_qp_v2)(struct ibv_qp *qp);
+	int (*migrrdma_is_q_empty)(struct ibv_qp *qp);
+	uint64_t (*qp_get_n_posted)(struct ibv_qp *qp);
+	uint64_t (*qp_get_n_acked)(struct ibv_qp *qp);
+	uint64_t (*srq_get_n_acked)(struct ibv_srq *srq);
+
+	int (*uwrite_srq)(struct ibv_srq *srq, struct ibv_srq *new_srq);
+	int (*replay_srq_recv_wr)(struct ibv_srq *srq, int head, int tail);
+	int (*prepare_srq_replay)(struct ibv_srq *srq, struct ibv_srq *new_srq, int *head, int *tail);
 };
 
 static inline struct verbs_device *
@@ -453,6 +504,8 @@ void verbs_init_cq(struct ibv_cq *cq, struct ibv_context *context,
 		       struct ibv_comp_channel *channel,
 		       void *cq_context);
 
+int ibv_get_signal(void);
+
 struct ibv_context *verbs_open_device(struct ibv_device *device,
 				      void *private_data);
 int ibv_cmd_get_context(struct verbs_context *context,
@@ -475,6 +528,125 @@ int ibv_cmd_query_device_any(struct ibv_context *context,
 int ibv_cmd_query_port(struct ibv_context *context, uint8_t port_num,
 		       struct ibv_port_attr *port_attr,
 		       struct ibv_query_port *cmd, size_t cmd_size);
+
+#define resume_info(resume_param, dir_fd, info_fd, info_name, do_destroy, ret)						\
+	info_fd = openat(dir_fd, #info_name, O_WRONLY);													\
+	if(info_fd < 0) {																				\
+		close(dir_fd);																				\
+		do_destroy;																					\
+		return ret;																					\
+	}																								\
+																									\
+	if(write(info_fd, &(resume_param)->info_name, sizeof((resume_param)->info_name)) < 0) {			\
+		close(info_fd);																				\
+		close(dir_fd);																				\
+		do_destroy;																					\
+		return ret;																					\
+	}																								\
+																									\
+	close(info_fd)
+
+struct ibv_qp *ibv_pre_create_qp(struct ibv_pd *pd,
+		struct ibv_qp_init_attr *qp_init_attr, uint32_t vqpn);
+
+int add_bf_addr_map_entry(void *new_bf, void *alloc_bf);
+void *get_alloc_bf(void *new_bf);
+
+int ibv_cmd_install_footprint(struct ibv_context *context);
+int ibv_cmd_install_qpndict(struct ibv_context *context,
+				uint32_t real_qpn, uint32_t vqpn);
+int ibv_cmd_install_ctx_resp(struct ibv_context *context, void *resp, size_t size);
+int ibv_cmd_register_async_fd(struct ibv_context *context, int async_fd);
+int ibv_cmd_install_pd_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle);
+int ibv_cmd_install_cq_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle);
+int ibv_cmd_install_mr_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle);
+int ibv_cmd_install_qp_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle);
+int ibv_cmd_install_srq_handle_mapping(struct ibv_context *context,
+							int vhandle, int handle);
+int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
+							uint32_t vlkey, uint32_t lkey);
+int ibv_cmd_install_local_rkey_mapping(struct ibv_context *context,
+							uint32_t vrkey, uint32_t rkey);
+int ibv_cmd_delete_local_rkey_mapping(struct ibv_context *context, uint32_t vrkey);
+int ibv_cmd_delete_lkey_mapping(struct ibv_context *context, uint32_t vlkey);
+int ibv_cmd_register_remote_gid_pid(struct ibv_context *context,
+					const union ibv_gid *gid, pid_t pid);
+int ibv_cmd_update_comp_channel_fd(struct ibv_context *context,
+					struct ibv_comp_channel *channel);
+int ibv_cmd_get_rdma_pid(struct ibv_context *context);
+//int restore_rdma(void);
+
+struct gid_vid_key_value_type {
+	union ibv_gid					gid;
+	uint32_t						vid;
+};
+
+static inline int gid_vid_compare(struct gid_vid_key_value_type o1, struct gid_vid_key_value_type o2) {
+	int i;
+	for(i = 0; i < 16; i++) {
+		if(o1.gid.raw[i] < o2.gid.raw[i])
+			return -1;
+		else if(o1.gid.raw[i] > o2.gid.raw[i])
+			return 1;
+	}
+
+	if(o1.vid < o2.vid)
+		return -1;
+	else if(o1.vid > o2.vid)
+		return 1;
+	else
+		return 0;
+}
+
+int rbtree_search_cq(struct ibv_cq *cq);
+int rbtree_add_cq(struct ibv_cq *cq);
+void rbtree_del_cq(struct ibv_cq *cq);
+int rbtree_search_qp(struct ibv_qp *qp);
+int rbtree_add_qp(struct ibv_qp *qp);
+void rbtree_del_qp(struct ibv_qp *qp);
+int rbtree_search_srq(struct ibv_srq *srq);
+int rbtree_add_srq(struct ibv_srq *srq);
+void rbtree_del_srq(struct ibv_srq *srq);
+int rbtree_traverse_cq(int (*iter_cq_fn)(struct ibv_cq *cq,
+				void *entry, void *in_param), void *in_param);
+int rbtree_traverse_qp(int (*iter_qp_fn)(struct ibv_qp *qp,
+				void *entry, void *in_param), void *in_param);
+int rbtree_traverse_srq(int (*iter_srq_fn)(struct ibv_srq *srq,
+				void *entry, void *in_param), void *in_param);
+int rbtree_search_context(struct ibv_context *ctx);
+int rbtree_add_context(struct ibv_context *ctx);
+void rbtree_del_context(struct ibv_context *ctx);
+int rbtree_traverse_context(int (*iter_context_fn)(struct ibv_context *ctx,
+					void *entry, void *in_param), void *in_param);
+int add_qpn_dict_node(struct ibv_qp *qp);
+int get_qpn_dict(uint32_t pqpn, int *cmd_fd, int *qp_vhandle);
+void del_qpn_dict_node(struct ibv_qp *qp);
+int add_switch_list_node(uint32_t pqpn, struct ibv_qp *orig_qp, struct ibv_qp *new_qp);
+int switch_to_new_qp(uint32_t pqpn, void *param,
+				int (*switch_cb)(struct ibv_qp *orig_qp,
+				struct ibv_qp *new_qp,
+				void *param));
+int switch_all_qps(int (*switch_cb)(struct ibv_qp *orig_qp, struct ibv_qp *new_qp),
+				int (*load_cb)(struct ibv_qp *orig_qp, void *replay_fn));
+int add_srq_switch_node(struct ibv_srq *new_srq, struct ibv_srq *orig_srq);
+int switch_all_srqs(int (*switch_cb)(struct ibv_srq *orig_srq, struct ibv_srq *new_srq, int *head, int *tail),
+			int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail));
+int add_old_dict_node(struct ibv_qp *qp,
+				uint32_t real_qpn, uint32_t virt_qpn);
+int get_vqpn_from_old(uint32_t real_qpn, uint32_t *vqpn);
+void clear_old_qpndict(void);
+struct ibv_comp_channel *get_comp_channel_from_fd(int fd);
+int add_comp_channel(int fd, struct ibv_comp_channel *channel);
+int register_update_mem(void *ptr, size_t size, void *content_p);
+int register_keep_mmap_region(void *ptr, size_t size);
+int update_all_mem(int (*update_mem_fn)(void *ptr, size_t size,
+								void *content_p));
+int keep_all_mmap(int (*keep_mmap_fn)(unsigned long long start,
+								unsigned long long end));
 int ibv_cmd_alloc_async_fd(struct ibv_context *context);
 int ibv_cmd_alloc_pd(struct ibv_context *context, struct ibv_pd *pd,
 		     struct ibv_alloc_pd *cmd, size_t cmd_size,

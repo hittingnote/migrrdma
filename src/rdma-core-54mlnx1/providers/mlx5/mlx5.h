@@ -470,6 +470,8 @@ struct mlx5_cq {
 	struct verbs_cq			verbs_cq;
 	struct mlx5_buf			buf_a;
 	struct mlx5_buf			buf_b;
+	struct mlx5_buf			tmp_buf;
+	struct mlx5_buf			migr_buf;
 	struct mlx5_buf		       *active_buf;
 	struct mlx5_buf		       *resize_buf;
 	int				resize_cqes;
@@ -477,7 +479,13 @@ struct mlx5_cq {
 	struct mlx5_spinlock		lock;
 	uint32_t			cqn;
 	uint32_t			cons_index;
+	uint32_t			tmp_cons_index;
+	uint32_t			fake_index;
+	uint32_t			use_fake_index;
+	pthread_rwlock_t	fake_index_rwlock;
+	int					shaded_flag;
 	__be32			       *dbrec;
+	__be32					*migr_dbrec;
 	bool				custom_db;
 	int				arm_sn;
 	int				cqe_sz;
@@ -494,6 +502,8 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
+
+	int				migr_flag;
 };
 
 struct mlx5_tag_entry {
@@ -512,12 +522,19 @@ struct mlx5_srq_op {
 	uint32_t	       wqe_head;
 };
 
+struct srq_recv_wr_item {
+	struct ibv_recv_wr			recv_wr;
+	struct list_head			list;
+};
+
 struct mlx5_srq {
 	struct mlx5_resource            rsc;  /* This struct must be first */
 	struct verbs_srq		vsrq;
 	struct mlx5_buf			buf;
+	struct mlx5_buf			migr_buf;
 	struct mlx5_spinlock		lock;
 	uint64_t		       *wrid;
+	uint64_t				*tmp_wrid;
 	uint32_t			srqn;
 	int				max;
 	int				max_gs;
@@ -527,6 +544,7 @@ struct mlx5_srq {
 	int				waitq_head;
 	int				waitq_tail;
 	__be32			       *db;
+	__be32					*migr_db;
 	bool				custom_db;
 	uint16_t			counter;
 	int				wq_sig;
@@ -539,6 +557,28 @@ struct mlx5_srq {
 	int				op_tail;
 	int				unexp_in;
 	int				unexp_out;
+
+	struct srq_recv_wr_item		*onflight_recv_wr;
+	struct srq_recv_wr_item		*migrrdma_onflight;
+	struct list_head			onflight_list;
+	struct list_head			migrrdma_onflight_list;
+	struct list_head			staged_onflight_list;
+	unsigned			onflight_cap;
+	unsigned			onflight_max_sge;
+	int				inspect_flag;
+
+	int				migr_flag;
+	int				rollback_head;
+	int				rollback_tail;
+	uint16_t		rollback_counter;
+
+	int				*staged_index;
+	unsigned		staged_tail;
+	unsigned		staged_head;
+	uint64_t		n_posted;
+	uint64_t		n_acked;
+	uint64_t		migrrdma_acked;
+	uint64_t		commit_posted;
 };
 
 
@@ -559,18 +599,26 @@ struct wr_list {
 
 struct mlx5_wq {
 	uint64_t		       *wrid;
+	uint64_t				*tmp_wrid;
 	unsigned		       *wqe_head;
+	unsigned				*tmp_wqe_head;
 	struct mlx5_spinlock		lock;
 	unsigned			wqe_cnt;
 	unsigned			max_post;
 	unsigned			head;
 	unsigned			tail;
+	unsigned			commit_head;
+	unsigned			commit_tail;
 	unsigned			cur_post;
 	int				max_gs;
 	int				wqe_shift;
 	int				offset;
 	void			       *qend;
 	uint32_t			*wr_data;
+	uint32_t			*tmp_wr_data;
+	uint64_t			n_posted;
+	uint64_t			n_acked;
+	uint64_t			commit_posted;
 };
 
 struct mlx5_devx_uar {
@@ -627,12 +675,14 @@ struct mlx5_qp {
 	struct mlx5dv_qp_ex		dv_qp;
 	struct ibv_qp		       *ibv_qp;
 	struct mlx5_buf                 buf;
+	struct mlx5_buf					migr_buf;
 	int                             max_inline_data;
 	int                             buf_size;
 	/* For Raw Packet QP, use different buffers for the SQ and RQ */
 	struct mlx5_buf                 sq_buf;
 	int				sq_buf_size;
 	struct mlx5_bf		       *bf;
+	struct mlx5_bf				*new_bf;
 
 	/* Start of new post send API specific fields */
 	bool				inl_wqe;
@@ -655,6 +705,7 @@ struct mlx5_qp {
 	struct mlx5_wq                  sq;
 
 	__be32                         *db;
+	__be32							*migr_db;
 	bool				custom_db;
 	struct mlx5_wq                  rq;
 	int                             wq_sig;
@@ -683,6 +734,31 @@ struct mlx5_qp {
 	 * write to the set_ece will clear this field.
 	 */
 	uint32_t			get_ece;
+
+	struct ibv_recv_wr	*onflight_recv_wr;
+	unsigned			onflight_tail;
+	unsigned			onflight_head;
+	unsigned			onflight_cap;
+	unsigned			onflight_max_sge;
+
+	struct ibv_send_wr	*cached_send_wr_list;
+	unsigned			n_cached;
+	unsigned			cached_cap;
+
+	struct mlx5_wq		rollback_rq;
+	struct mlx5_wq		rollback_sq;
+	struct mlx5_bf		migr_bf;
+	void				*migr_reg;
+
+	int					migr_flag;
+
+	struct mlx5_qp			*switch_qp;
+
+	struct mlx5_wq		migrrdma_rq;
+	struct mlx5_wq		migrrdma_sq;
+
+	struct mlx5_wq		tmp_sq;
+	uint64_t			two_sided_posted;
 };
 
 struct mlx5_ah {
@@ -1052,6 +1128,57 @@ int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 			       struct ibv_comp_channel *channel,
 			       int comp_vector);
+
+struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_meta,
+			int cqe, struct ibv_comp_channel *channel, int comp_vector,
+			void *buf_addr, void *db_addr, int vhandle);
+
+struct ibv_qp *mlx5_resume_qp(struct ibv_context *context, int pd_handle, int qp_handle,
+				struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
+				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg);
+
+struct ibv_srq *mlx5_resume_srq(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
+
+void mlx5_free_qp(struct ibv_qp *qp);
+
+int mlx5_is_q_empty(struct ibv_qp *qp);
+
+int mlx5_migrrdma_is_q_empty(struct ibv_qp *qp);
+
+void mlx5_copy_qp(struct ibv_qp *qp1, struct ibv_qp *qp2, void *param);
+
+struct ibv_qp *mlx5_calloc_qp(void);
+
+int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp);
+
+int mlx5_replay_recv_wr(struct ibv_qp *qp);
+
+int mlx5_replay_srq_recv_wr(struct ibv_srq *srq, int head, int tail);
+
+int mlx5_prepare_srq_replay(struct ibv_srq *srq, struct ibv_srq *new_srq,
+						int *head, int *tail);
+
+uint32_t get_prod_index(struct mlx5_cq *cq);
+
+int mlx5_uwrite_cq(struct ibv_cq *cq, int cq_dir_fd);
+int mlx5_uwrite_qp(struct ibv_qp *qp, struct ibv_qp *new_qp);
+
+int mlx5_uwrite_srq(struct ibv_srq *srq, struct ibv_srq *new_srq);
+
+void migrrdma_start_poll(struct ibv_cq *ibcq);
+void migrrdma_end_poll(struct ibv_cq *ibcq);
+int migrrdma_poll_cq(struct ibv_cq *ibcq, int ne,
+		struct ibv_wc *wc, struct ibv_qp **qps, struct ibv_srq **srqs);
+
+void migrrdma_start_inspect_qp(struct ibv_qp *qp);
+void migrrdma_start_inspect_qp_v2(struct ibv_qp *qp);
+
+int mlx5_get_cons_index(struct ibv_cq *cq);
+void mlx5_set_cons_index(struct ibv_cq *cq, int cons_index);
+void mlx5_copy_cqe_to_shaded(struct ibv_cq *ibcq);
+
+void mlx5_record_qp_index(struct ibv_qp *qp);
+
 struct ibv_cq_ex *mlx5_create_cq_ex(struct ibv_context *context,
 				    struct ibv_cq_init_attr_ex *cq_attr);
 int mlx5_cq_fill_pfns(struct mlx5_cq *cq,
@@ -1085,6 +1212,13 @@ void mlx5_free_srq_wqe(struct mlx5_srq *srq, int ind);
 int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 		       struct ibv_recv_wr *wr,
 		       struct ibv_recv_wr **bad_wr);
+int __mlx5_post_srq_recv__(struct ibv_srq *ibsrq,
+		       struct ibv_recv_wr *wr,
+		       struct ibv_recv_wr **bad_wr);
+
+uint64_t mlx5_qp_get_n_posted(struct ibv_qp *qp);
+uint64_t mlx5_qp_get_n_acked(struct ibv_qp *qp);
+uint64_t mlx5_srq_get_n_acked(struct ibv_srq *srq);
 
 struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr);
 int mlx5_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
@@ -1098,10 +1232,15 @@ int mlx5_modify_qp_rate_limit(struct ibv_qp *qp,
 			      struct ibv_qp_rate_limit_attr *attr);
 int mlx5_modify_qp_drain_sigerr(struct ibv_qp *qp);
 int mlx5_destroy_qp(struct ibv_qp *qp);
+int mlx5_destroy_qp_tmp(struct ibv_qp *qp);
 void mlx5_init_qp_indices(struct mlx5_qp *qp);
 void mlx5_init_rwq_indices(struct mlx5_rwq *rwq);
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr);
+int __mlx5_post_recv__(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
+			struct ibv_recv_wr **bad_wr, const int is_app);
+int __mlx5_post_send__(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
+		   struct ibv_send_wr **bad_wr, const int is_app);
 int mlx5_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			  struct ibv_recv_wr **bad_wr);
 int mlx5_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,
@@ -1113,6 +1252,8 @@ void mlx5_set_sq_sizes(struct mlx5_qp *qp, struct ibv_qp_cap *cap,
 struct mlx5_qp *mlx5_find_qp(struct mlx5_context *ctx, uint32_t qpn);
 int mlx5_store_qp(struct mlx5_context *ctx, uint32_t qpn, struct mlx5_qp *qp);
 void mlx5_clear_qp(struct mlx5_context *ctx, uint32_t qpn);
+void change_uidx(struct mlx5_context *ctx,
+			struct mlx5_qp *tgt, struct mlx5_qp *src);
 int32_t mlx5_store_uidx(struct mlx5_context *ctx, void *rsc);
 void mlx5_clear_uidx(struct mlx5_context *ctx, uint32_t uidx);
 struct mlx5_srq *mlx5_find_srq(struct mlx5_context *ctx, uint32_t srqn);

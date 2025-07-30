@@ -171,10 +171,9 @@ void mlx5_complete_odp_fault(struct mlx5_srq *srq, int ind)
 	mlx5_spin_unlock(&srq->lock);
 }
 
-int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
+int __mlx5_post_srq_recv__(struct ibv_srq *ibsrq,
 		       struct ibv_recv_wr *wr,
-		       struct ibv_recv_wr **bad_wr)
-{
+		       struct ibv_recv_wr **bad_wr) {
 	struct mlx5_srq *srq = to_msrq(ibsrq);
 	struct mlx5_wqe_srq_next_seg *next;
 	struct mlx5_wqe_data_seg *scat;
@@ -182,9 +181,9 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 	int nreq;
 	int i;
 
-	mlx5_spin_lock(&srq->lock);
-
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
+		int cur_idx;
+
 		if (wr->num_sge > srq->max_gs) {
 			err = EINVAL;
 			*bad_wr = wr;
@@ -198,6 +197,7 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 			break;
 		}
 
+		cur_idx = srq->head;
 		srq->wrid[srq->head] = wr->wr_id;
 
 		next      = get_wqe(srq, srq->head);
@@ -205,8 +205,9 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 		scat      = (struct mlx5_wqe_data_seg *) (next + 1);
 
 		for (i = 0; i < wr->num_sge; ++i) {
+			uint32_t *lkey_arr = ibsrq->context->lkey_mapping;
 			scat[i].byte_count = htobe32(wr->sg_list[i].length);
-			scat[i].lkey       = htobe32(wr->sg_list[i].lkey);
+			scat[i].lkey       = htobe32(lkey_arr[wr->sg_list[i].lkey]);
 			scat[i].addr       = htobe64(wr->sg_list[i].addr);
 		}
 
@@ -215,6 +216,17 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 			scat[i].lkey       = htobe32(MLX5_INVALID_LKEY);
 			scat[i].addr       = 0;
 		}
+
+		{
+			struct srq_recv_wr_item *cur_recv_wr =
+							srq->onflight_recv_wr + cur_idx;
+			cur_recv_wr->recv_wr.wr_id = wr->wr_id;
+			cur_recv_wr->recv_wr.next = NULL;
+			cur_recv_wr->recv_wr.num_sge = wr->num_sge;
+			memcpy(cur_recv_wr->recv_wr.sg_list, wr->sg_list,
+						sizeof(struct ibv_sge) * wr->num_sge);
+			list_add_tail(&srq->staged_onflight_list, &cur_recv_wr->list);
+	}
 	}
 
 	if (nreq) {
@@ -227,6 +239,71 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 		udma_to_device_barrier();
 
 		*srq->db = htobe32(srq->counter);
+	}
+
+	srq->n_posted += nreq;
+
+	return err;
+}
+
+int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
+		       struct ibv_recv_wr *wr,
+		       struct ibv_recv_wr **bad_wr)
+{
+	struct mlx5_srq *srq = to_msrq(ibsrq);
+	int err;
+
+	mlx5_spin_lock(&srq->lock);
+	if(srq->migr_flag) {
+		struct mlx5_buf tmp_buf;
+		__be32 *tmp_db;
+
+		srq->migr_flag = 0;
+
+		memcpy(&tmp_buf, &srq->buf, sizeof(tmp_buf));
+		memcpy(&srq->buf, &srq->migr_buf, sizeof(tmp_buf));
+		memcpy(&srq->migr_buf, &tmp_buf, sizeof(tmp_buf));
+
+		tmp_db = srq->db;
+		srq->db = srq->migr_db;
+		srq->migr_db = tmp_db;
+
+		srq->head = srq->rollback_head;
+		srq->tail = srq->rollback_tail;
+		srq->counter = srq->rollback_counter;
+
+		/* Commit */
+		for(; srq->staged_tail < srq->staged_head; srq->staged_tail++) {
+			unsigned cur = srq->staged_tail;
+			struct mlx5_wqe_srq_next_seg *next;
+
+			/* void mlx5_free_srq_wqe() without spinlock on srq */
+			next = get_wqe(srq, srq->tail);
+			next->next_wqe_index = htobe16(srq->staged_index[cur % srq->onflight_cap]);
+			srq->tail = srq->staged_index[cur % srq->onflight_cap];
+		}
+
+		list_head_init(&srq->staged_onflight_list);
+	}
+
+	err = __mlx5_post_srq_recv__(ibsrq, wr, bad_wr);
+	{
+		struct list_head *staged_head = (struct list_head *)srq->staged_onflight_list.n.next;
+		struct list_head *staged_tail = (struct list_head *)srq->staged_onflight_list.n.prev;
+		struct list_head *commit_head = (struct list_head *)srq->onflight_list.n.next;
+		struct list_head *commit_tail = (struct list_head *)srq->onflight_list.n.prev;
+
+		commit_tail->n.next = &staged_head->n;
+		staged_head->n.prev = &commit_tail->n;
+		staged_tail->n.next = &srq->onflight_list.n;
+		srq->onflight_list.n.prev = &staged_tail->n;
+
+		list_head_init(&srq->staged_onflight_list);
+	}
+
+	if(srq->migr_flag) {
+		mlx5_spin_unlock(&srq->lock);
+		return mlx5_post_srq_recv(ibsrq, wr, bad_wr);
 	}
 
 	mlx5_spin_unlock(&srq->lock);
@@ -245,6 +322,9 @@ static void set_srq_buf_ll(struct mlx5_srq *srq, int start, int end)
 
 	for (i = start; i < end; ++i) {
 		next = get_wqe(srq, i);
+		next->next_wqe_index = htobe16(i + 1);
+
+		next = srq->migr_buf.buf + (i << srq->wqe_shift);
 		next->next_wqe_index = htobe16(i + 1);
 	}
 }
@@ -313,6 +393,13 @@ int mlx5_alloc_srq_buf(struct ibv_context *context, struct mlx5_srq *srq,
 				    MLX5_SRQ_PREFIX))
 		return -1;
 
+	if (mlx5_alloc_prefered_buf(ctx,
+				    &srq->migr_buf, buf_size,
+				    to_mdev(context->device)->page_size,
+				    alloc_type,
+				    MLX5_SRQ_PREFIX))
+		return -1;
+
 	if (srq->buf.type != MLX5_ALLOC_TYPE_CUSTOM)
 		memset(srq->buf.buf, 0, buf_size);
 
@@ -329,6 +416,15 @@ int mlx5_alloc_srq_buf(struct ibv_context *context, struct mlx5_srq *srq,
 	srq->wrid = malloc(srq->max * sizeof(*srq->wrid));
 	if (!srq->wrid) {
 		mlx5_free_actual_buf(ctx, &srq->buf);
+		mlx5_free_actual_buf(ctx, &srq->migr_buf);
+		return -1;
+	}
+
+	srq->tmp_wrid = malloc(srq->max * sizeof(*srq->wrid));
+	if(!srq->tmp_wrid) {
+		free(srq->wrid);
+		mlx5_free_actual_buf(ctx, &srq->buf);
+		mlx5_free_actual_buf(ctx, &srq->migr_buf);
 		return -1;
 	}
 

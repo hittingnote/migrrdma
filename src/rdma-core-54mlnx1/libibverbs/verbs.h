@@ -1213,6 +1213,8 @@ struct ibv_srq {
 	pthread_mutex_t		mutex;
 	pthread_cond_t		cond;
 	uint32_t		events_completed;
+	uint64_t			cnt;
+	void			*wait_srq_node;
 };
 
 /*
@@ -1259,6 +1261,31 @@ struct ibv_qp {
 	pthread_mutex_t		mutex;
 	pthread_cond_t		cond;
 	uint32_t		events_completed;
+	uint32_t				real_qpn;
+	uint32_t				orig_real_qpn;
+	int					clear_qpndict_flag;
+	uint32_t				dest_vqpn;
+	uint32_t				dest_qpn;
+	pid_t					dest_pid;
+	uint32_t				*rkey_arr;
+	union ibv_gid			local_gid;
+	union ibv_gid			rc_dest_gid;
+
+	int						pause_flag;
+	pthread_rwlock_t		rwlock;
+
+	struct {
+		uint32_t			real_qpn;
+		uint32_t			virt_qpn;
+		unsigned long		color;
+		void				*left;
+		void				*right;
+		long				padding;
+
+	} old_dict_node;
+
+	int					touched;
+	void*					wait_qp_node;
 };
 
 struct ibv_qp_ex {
@@ -1461,6 +1488,11 @@ struct ibv_cq {
 	pthread_cond_t		cond;
 	uint32_t		comp_events_completed;
 	uint32_t		async_events_completed;
+	int				arm_flag;
+	struct ibv_wc	*wc;
+	struct ibv_qp	**qps;
+	struct ibv_srq	**srqs;
+	int				stop_flag;
 };
 
 struct ibv_poll_cq_attr {
@@ -1932,6 +1964,7 @@ struct ibv_device {
 	char			dev_path[IBV_SYSFS_PATH_MAX];
 	/* Path to infiniband class device in sysfs */
 	char			ibdev_path[IBV_SYSFS_PATH_MAX];
+	uint32_t		*qpn_dict;
 };
 
 struct _compat_ibv_port_attr;
@@ -1976,7 +2009,41 @@ struct ibv_context_ops {
 	void *(*_compat_attach_mcast)(void);
 	void *(*_compat_detach_mcast)(void);
 	void *(*_compat_async_event)(void);
+
+	int (*_compat_uwrite_cq)(void);
+	void *(*_compat_resume_cq)(void);
+	int (*_compat_get_cons_index)(void);
+	void (*_compat_set_cons_index)(void);
+	void (*_compat_copy_cqe_to_shaded)(void);
+
+	int (*_compat_uwrite_qp)(void);
+	void *(*_compat_resume_qp)(void);
+	void (*_compat_free_qp)(void);
+	int (*_compat_is_q_empty)(void);
+	int (*_compat_copy_qp)(void);
+	void *(*_compat_calloc_qp)(void);
+	int (*_compat_replay_recv_wr)(void);
+	int (*_compat_prepare_qp_recv_replay)(void);
+	void (*_compat_record_qp_index)(void);
+
+	void *(*_compat_resume_srq)(void);
+
+	void (*_compat_migrrdma_start_poll)(void);
+	void (*_compat_migrrdma_end_poll)(void);
+	int (*_compat_migrrdma_poll_cq)(void);
+	void (*_compat_migrrdma_start_inspect_qp)(void);
+	void (*_compat_migrrdma_start_inspect_qp_v2)(void);
+	int (*_compat_migrrdma_is_q_empty)(void);
+	uint64_t (*_compat_qp_get_n_posted)(void);
+	uint64_t (*_compat_qp_get_n_acked)(void);
+	uint64_t (*_compat_srq_get_n_acked)(void);
+
+	int (*_compat_uwrite_srq)(void);
+	int (*_compat_replay_srq_recv_wr)(void);
+	int (*_compat_prepare_srq_replay)(void);
 };
+
+#include <sys/mman.h>
 
 struct ibv_context {
 	struct ibv_device      *device;
@@ -1986,6 +2053,11 @@ struct ibv_context {
 	int			num_comp_vectors;
 	pthread_mutex_t		mutex;
 	void		       *abi_compat;
+
+	int						lkey_fd;
+	void					*lkey_mapping;
+	int						rkey_fd;
+	void					*rkey_mapping;
 };
 
 enum ibv_cq_init_attr_mask {
@@ -2260,10 +2332,49 @@ int ibv_get_device_index(struct ibv_device *device);
  */
 __be64 ibv_get_device_guid(struct ibv_device *device);
 
+struct verbs_device *get_verbs_device(struct ibv_device **p_ib_dev,
+				struct ibv_device **dev_list, int cmd_fd);
+
+pid_t rdma_getpid(struct ibv_context *context);
+
 /**
  * ibv_open_device - Initialize device for use
  */
 struct ibv_context *ibv_open_device(struct ibv_device *device);
+
+struct footprint_gid_entry {
+	union ibv_gid					gid;
+	uint32_t						gid_index;
+	uint32_t						gid_type;
+};
+
+struct ibv_resume_context_param {
+	char								cdev[32];
+	int									cmd_fd;
+	int									async_fd;
+	int									lkey_mmap_fd;
+//	void								*lkey_mmap_addr;
+	char								lkey_map[4096];
+//	int									local_rkey_mmap_fd;
+//	void								*local_rkey_mmap_addr;
+//	char								local_rkey_map[4096 * 256];
+//	int									lqpn_mmap_fd;
+//	void								*lqpn_mmap_addr;
+//	char								lqpn_map[4096 * 256];
+	int									rkey_mmap_fd;
+//	void								*rkey_mmap_addr;
+	char								rkey_map[4096];
+//	int									rqpn_mmap_fd;
+//	void								*rqpn_mmap_addr;
+//	char								rqpn_map[4096 * 256];
+	struct footprint_gid_entry			gid_table[256];
+	void								*ctx_uaddr;
+};
+
+struct ibv_context *ibv_resume_context(struct ibv_device **dev_list,
+		const struct ibv_resume_context_param *context_param);
+
+void ibv_free_tmp_context(struct ibv_context *context);
 
 /**
  * ibv_close_device - Release device
@@ -2415,6 +2526,21 @@ int ibv_get_pkey_index(struct ibv_context *context, uint8_t port_num,
  * ibv_alloc_pd - Allocate a protection domain
  */
 struct ibv_pd *ibv_alloc_pd(struct ibv_context *context);
+
+struct ibv_pd *ibv_resume_pd(struct ibv_context *context, int vhandle);
+
+struct ibv_resume_mr_param {
+	int							pd_vhandle;
+	int							mr_vhandle;
+	void						*iova;
+	size_t						length;
+	int							access_flags;
+	uint32_t					vlkey;
+	uint32_t					vrkey;
+};
+
+int ibv_resume_mr(struct ibv_context *context, struct ibv_pd *pd,
+			const struct ibv_resume_mr_param *mr_param);
 
 /**
  * ibv_dealloc_pd - Free a protection domain
@@ -2642,6 +2768,7 @@ static inline int ibv_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
  * ibv_create_comp_channel - Create a completion event channel
  */
 struct ibv_comp_channel *ibv_create_comp_channel(struct ibv_context *context);
+int ibv_resume_comp_channel(struct ibv_context *ctx, int comp_fd);
 
 /**
  * ibv_destroy_comp_channel - Destroy a completion event channel
@@ -2767,6 +2894,8 @@ struct ibv_mr *ibv_reg_dm_mr(struct ibv_pd *pd, struct ibv_dm *dm,
 	return vctx->reg_dm_mr(pd, dm, dm_offset, length, access);
 }
 
+void ibv_wait_local_wqes(void);
+
 /**
  * ibv_create_cq - Create a completion queue
  * @context - Context CQ will be attached to
@@ -2781,6 +2910,64 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
 			     void *cq_context,
 			     struct ibv_comp_channel *channel,
 			     int comp_vector);
+
+struct ibv_resume_cq_param {
+	int							cq_size;
+	int							comp_fd;
+	void						*meta_uaddr;
+	void						*buf_addr;
+	void						*db_addr;
+	int							cq_vhandle;
+	uint32_t					cons_index;
+	uint32_t					prod_index;
+};
+
+struct ibv_resume_srq_param {
+	struct ibv_srq_init_attr	init_attr;
+	void						*meta_uaddr;
+	void						*buf_addr;
+	void						*db_addr;
+	int							pd_vhandle;
+	int							vhandle;
+};
+
+struct ibv_cq *ibv_resume_cq(struct ibv_context *context, 
+				const struct ibv_resume_cq_param *cq_param);
+
+struct ibv_resume_qp_param {
+	int									pd_vhandle;
+	int									qp_vhandle;
+	int									send_cq_handle;
+	int									recv_cq_handle;
+	enum ibv_qp_state					qp_state;
+	struct ibv_qp_init_attr				init_attr;
+	struct ibv_qp_attr					modify_qp_attr[3];
+	int									modify_qp_mask[3];
+	void								*meta_uaddr;
+	uint32_t							vqpn;
+	void								*buf_addr;
+	void								*db_addr;
+	uint32_t							send_cur_post;
+	uint32_t							recv_head;
+	uint32_t							recv_tail;
+	int32_t								usr_idx;
+};
+
+struct ibv_qp *ibv_resume_create_qp(struct ibv_context *context,
+		struct ibv_pd *pd, struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
+		const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg);
+
+void ibv_resume_free_qp(struct ibv_qp *qp);
+
+int ibv_prepare_for_replay(int (*qp_load_cb)(struct ibv_qp *orig_qp, void *replay_fn),
+						int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail));
+int ibv_update_mem(int (*update_mem_fn)(void *ptr, size_t size,
+								void *content_p),
+					int (*keep_mmap_fn)(unsigned long long start,
+								unsigned long long end));
+
+int ibv_update_rkey_mapping(struct ibv_context *context, const union ibv_gid *vgid,
+					const union ibv_gid *real_gid, const uint32_t vrkey, const uint32_t rkey);
 
 /**
  * ibv_create_cq_ex - Create a completion queue
@@ -2896,6 +3083,9 @@ static inline int ibv_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *at
  */
 struct ibv_srq *ibv_create_srq(struct ibv_pd *pd,
 			       struct ibv_srq_init_attr *srq_init_attr);
+
+struct ibv_srq *ibv_resume_srq(struct ibv_pd *pd,
+				   struct ibv_resume_srq_param *param);
 
 static inline struct ibv_srq *
 ibv_create_srq_ex(struct ibv_context *context,
