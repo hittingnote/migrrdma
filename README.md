@@ -47,26 +47,36 @@ and replace the `5:20.10.13~3-0~ubuntu-jammy` part with what you prefer.
 
 ## Build and Install
 
-Run `./build.sh` script to install all the components in `src/`.
+Run the following commands to build a container image, compile and install MigrRDMA.
 
 ```Bash
+$ ./container_init.sh
 $ ./build.sh
+$ make
 ```
 
-To verify that all the components are installed correctly,
-you can run `show_gids`:
+## Live Migration Demo
+
+To verify whether all the components are installed correctly,
+you can first run the following commands:
 
 ```Bash
 $ show_gids
-DEV     PORT    INDEX   GID                                     IPv4            VER     DEV
----     ----    -----   ---                                     ------------    ---     ---
-[All the info]
+$ ls /proc/rdma
 ```
 
-Then, run `perftest` with the following settings:
+`show_gids` lists all the information of RDMA NICs. If all the information are shown, that means the RDMA driver works.
+
+MigrRDMA maintains the RDMA information in `procfs`. If you see `/proc/rdma` in your system, that means you have installed MigrRDMA's driver, rather than the regular one.
+
+To test whether the regular `perftest` runs correctly, you can start `perftest` with the following settings:
 
 ```Bash
 $ ib_send_bw -d [DEV] --use_old_post_send -a
 ```
 
 Please note that our implementation only covers the standard verbs APIs. Thus, `--use_old_post_send` option is necessary here.
+
+After all the verification is done, you can run a simple demo for RDMA live migration.
+
+[TBA]
