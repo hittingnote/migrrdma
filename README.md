@@ -27,6 +27,24 @@ $ source ~/.bashrc
 `protobuf`, `libnet`, `asciidoc`, and `libcap` are for CRIU.
 `go1.20` is for runc.
 
+Besides, we also need to install `docker-ce`.
+Currently, our prototype integrates well with Docker 19.03 and 20.10.
+Please execute the following commands to install `docker-ce` (you can refer to [this Docker installation tutorial](https://docs.docker.com/engine/install/ubuntu/)):
+
+```Bash
+$ sudo apt-get update
+$ sudo apt-get -y install ca-certificates curl
+$ sudo install -m 0755 -d /etc/apt/keyrings
+$ sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+$ sudo chmod a+r /etc/apt/keyrings/docker.asc
+$ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+$ sudo apt-get update
+$ sudo apt-get -y install docker-ce=5:20.10.13~3-0~ubuntu-jammy
+```
+
+You can execute `apt-cache madison docker-ce` to check all the available versions of `docker-ce` on your local server,
+and replace the `5:20.10.13~3-0~ubuntu-jammy` part with what you prefer.
+
 ## Build and Install
 
 Run `./build.sh` script to install all the components in `src/`.
