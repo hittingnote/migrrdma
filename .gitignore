@@ -1,0 +1,6 @@
+MLNX_OFED_LINUX*
+.mlnx_drv*
+.rdma_core*
+.criu*
+.runc*
+.mlnx_utils*
