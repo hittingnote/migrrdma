@@ -938,6 +938,33 @@ LATEST_SYMVER_FUNC(ibv_resume_cq, 1_1, "IBVERBS_1.1",
 	return cq;
 }
 
+LATEST_SYMVER_FUNC(ibv_resume_cq_v2, 1_1, "IBVERBS_1.1",
+			struct ibv_cq *, struct ibv_context *context,
+			const struct ibv_resume_cq_param *cq_param) {
+	struct ibv_cq *cq;
+	struct ibv_comp_channel *channel;
+	struct ibv_cq *orig_cq = cq_param->meta_uaddr;
+
+	channel = get_comp_channel_from_fd(cq_param->comp_fd);
+
+	cq = get_ops(context)->resume_cq_v2(context, cq_param->meta_uaddr, cq_param->cq_size,
+				channel, 0, cq_param->buf_addr, cq_param->db_addr, cq_param->cq_vhandle);
+	if(!cq)
+		return NULL;
+
+	cq->context = context;
+	cq->handle = cq_param->cq_vhandle;
+	if(write_cq_meta_uaddr(context, cq, cq_param->meta_uaddr)) {
+		ibv_destroy_cq(cq);
+		return NULL;
+	}
+
+	cq->arm_flag = 0;
+	orig_cq->stop_flag = 0;
+
+	return cq;
+}
+
 LATEST_SYMVER_FUNC(ibv_resize_cq, 1_1, "IBVERBS_1.1",
 		   int,
 		   struct ibv_cq *cq, int cqe)
@@ -1090,6 +1117,46 @@ LATEST_SYMVER_FUNC(ibv_resume_srq, 1_1, "IBVERBS_1.1",
 
 	pd->handle = srq_param->pd_vhandle;
 	srq = get_ops(pd->context)->resume_srq(pd, srq_param);
+	if(!srq) {
+		return NULL;
+	}
+
+	if (srq) {
+		srq->context          = pd->context;
+		srq->srq_context      = srq_param->init_attr.srq_context;
+		srq->pd               = pd;
+		srq->events_completed = 0;
+		pthread_mutex_init(&srq->mutex, NULL);
+		pthread_cond_init(&srq->cond, NULL);
+	}
+
+	if(write_srq_umeta_addr(pd->context, srq, srq_param->meta_uaddr,
+						&srq_param->init_attr)) {
+		ibv_destroy_srq(srq);
+		return NULL;
+	}
+
+	if(add_srq_switch_node(srq, srq_param->meta_uaddr)) {
+		perror("add_srq_switch_node");
+		ibv_destroy_srq(srq);
+		return NULL;
+	}
+
+	return srq;
+}
+
+LATEST_SYMVER_FUNC(ibv_resume_srq_v2, 1_1, "IBVERBS_1.1",
+		   struct ibv_srq *,
+		   struct ibv_pd *pd,
+		   struct ibv_resume_srq_param *srq_param) {
+	struct ibv_srq *srq;
+
+	if(get_ops(pd->context)->uwrite_srq(srq_param->meta_uaddr, 0)) {
+		return NULL;
+	}
+
+	pd->handle = srq_param->pd_vhandle;
+	srq = get_ops(pd->context)->resume_srq_v2(pd, srq_param);
 	if(!srq) {
 		return NULL;
 	}
@@ -1491,6 +1558,76 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp, 1_1, "IBVERBS_1.1",
 	return qp;
 }
 
+LATEST_SYMVER_FUNC(ibv_resume_create_qp_v2, 1_1, "IBVERBS_1.1",
+			struct ibv_qp *, struct ibv_context *context, struct ibv_pd *pd,
+			struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
+			const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg) {
+	struct ibv_qp *qp_ptr = qp_param->meta_uaddr;
+	struct ibv_qp *qp;
+	struct ibv_qp_init_attr qp_init_attr;
+	char fname[128];
+	int info_fd;
+	int err;
+	pthread_t thread_id;
+
+	if(get_ops(context)->uwrite_qp(qp_ptr, qp)) {
+		return NULL;
+	}
+
+	memcpy(&qp_init_attr, &qp_param->init_attr, sizeof(qp_init_attr));
+
+	send_cq->handle = qp_param->send_cq_handle;
+	recv_cq->handle = qp_param->recv_cq_handle;
+	qp_init_attr.send_cq = send_cq;
+	qp_init_attr.recv_cq = recv_cq;
+	qp_init_attr.srq = srq;
+	
+	qp = get_ops(context)->resume_qp(context, qp_param->pd_vhandle, qp_param->qp_vhandle,
+					&qp_init_attr, qp_param->buf_addr, qp_param->db_addr,
+					qp_param->usr_idx, qp_param->meta_uaddr, bf_reg);
+	if(!qp) {
+		return NULL;
+	}
+
+	qp->pd = pd;
+	qp->send_cq = send_cq;
+	qp->recv_cq = recv_cq;
+	qp->real_qpn = qp->qp_num;
+	
+	qp->handle = qp_param->qp_vhandle;
+	if(write_qp_umeta_addr(context, qp, qp_param->meta_uaddr,
+						&qp_param->init_attr, qp_param->vqpn)) {
+		ibv_destroy_qp(qp);
+		return NULL;
+	}
+
+	qp->qp_num = qp_param->vqpn;
+
+	qp_ptr->orig_real_qpn = qp_ptr->real_qpn;
+	qp_ptr->real_qpn = qp->real_qpn;
+	memcpy(&qp_ptr->local_gid, &qp->local_gid, sizeof(union ibv_gid));
+	qp_ptr->pause_flag = 0;
+
+	if(add_switch_list_node(qp->real_qpn, qp_ptr, qp)) {
+		perror("add_switch_list_node");
+		ibv_destroy_qp(qp);
+		return NULL;
+	}
+
+	if(qp->qp_type != IBV_QPT_UD && qp_param->qp_state >= IBV_QPS_RTR)
+		pthread_create(&thread_id, NULL, pid_service, (void*)qp);
+
+	pthread_rwlock_init(&qp->rwlock, NULL);
+
+	if(ibv_cmd_install_qpndict(qp->context, qp->real_qpn,
+				qp->qp_num)) {
+		ibv_destroy_qp(qp);
+		return NULL;
+	}
+
+	return qp;
+}
+
 LATEST_SYMVER_FUNC(ibv_resume_free_qp, 1_1, "IBVERBS_1.1",
 			void, struct ibv_qp *qp) {
 	get_ops(qp->context)->free_qp(qp);
@@ -1506,7 +1643,7 @@ static int replay_srq_recv_wr_cb(struct ibv_srq *orig_srq, struct ibv_qp *new_sr
 	return get_ops(new_srq->context)->prepare_srq_replay(orig_srq, new_srq, head, tail);
 }
 
-static int iter_cq_insert_fake_comp_event(struct ibv_cq *cq,
+int iter_cq_insert_fake_comp_event(struct ibv_cq *cq,
 					void *entry, void *in_param) {
 	struct ib_uverbs_comp_event_desc desc;
 
@@ -1659,6 +1796,11 @@ static inline struct rendpoint_entry *to_rendpoint_entry(struct rb_node *n) {
 	return n? container_of(n, struct rendpoint_entry, node): NULL;
 }
 
+static void free_rendpoint_entry(struct rb_node *node) {
+	struct rendpoint_entry *ent = to_rendpoint_entry(node);
+	free(ent);
+}
+
 static inline int rendpoint_entry_compare(const struct rb_node *n1, const struct rb_node *n2) {
 	struct rendpoint_entry *ent1 = to_rendpoint_entry(n1);
 	struct rendpoint_entry *ent2 = to_rendpoint_entry(n2);
@@ -1732,6 +1874,10 @@ static void *get_rkey_arr_from_rgid_and_rpid(union ibv_gid *gid, pid_t pid) {
 	addr = ent->rkey_arr;
 	pthread_rwlock_unlock(&rendpoint_tree.rwlock);
 	return addr;
+}
+
+void clear_rendpoint_tree(void) {
+	clean_rbtree(&rendpoint_tree, free_rendpoint_entry);
 }
 
 LATEST_SYMVER_FUNC(ibv_modify_qp, 1_1, "IBVERBS_1.1",

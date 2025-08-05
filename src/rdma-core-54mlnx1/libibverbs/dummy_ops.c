@@ -144,6 +144,13 @@ static struct ibv_cq *resume_cq(struct ibv_context *context, struct ibv_cq *cq_m
 	return NULL;
 }
 
+static struct ibv_cq *resume_cq_v2(struct ibv_context *context, struct ibv_cq *cq_meta,
+			int cqe, struct ibv_comp_channel *channel, int comp_vector,
+			void *buf_addr, void *db_addr, int vhandle) {
+	errno = EOPNOTSUPP;
+	return NULL;
+}
+
 static int uwrite_cq(struct ibv_cq *cq, int cq_dir_fd) {
 	errno = EOPNOTSUPP;
 	return -1;
@@ -258,6 +265,11 @@ static struct ibv_srq *resume_srq(struct ibv_pd *pd, struct ibv_resume_srq_param
 	return NULL;
 }
 
+static struct ibv_srq *resume_srq_v2(struct ibv_pd *pd, struct ibv_resume_srq_param *param) {
+	errno = EOPNOTSUPP;
+	return NULL;
+}
+
 static int migrrdma_is_q_empty(struct ibv_qp *qp) {
 	return 1;
 }
@@ -279,11 +291,19 @@ static int prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp) {
 	return -1;
 }
 
+static int prepare_qp_recv_replay_v2(struct ibv_qp *qp, struct ibv_qp *new_qp) {
+	return -1;
+}
+
 static int replay_srq_recv_wr(struct ibv_srq *srq, int head, int tail) {
 	return -1;
 }
 
 static int prepare_srq_replay(struct ibv_srq *srq, struct ibv_srq *new_srq, int *head, int *tail) {
+	return -1;
+}
+
+static int copy_uar_list(struct verbs_context *orig_ctx, struct ibv_context *new_ctx) {
 	return -1;
 }
 
@@ -703,6 +723,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	unimport_pd,
 	uwrite_cq,
 	resume_cq,
+	resume_cq_v2,
 	get_cons_index,
 	set_cons_index,
 	copy_cqe_to_shaded,
@@ -714,8 +735,10 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	calloc_qp,
 	replay_recv_wr,
 	prepare_qp_recv_replay,
+	prepare_qp_recv_replay_v2,
 	record_qp_index,
 	resume_srq,
+	resume_srq_v2,
 	migrrdma_start_poll,
 	migrrdma_end_poll,
 	migrrdma_poll_cq,
@@ -728,6 +751,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	uwrite_srq,
 	replay_srq_recv_wr,
 	prepare_srq_replay,
+	copy_uar_list,
 };
 
 /*
@@ -856,6 +880,7 @@ void verbs_set_ops(struct verbs_context *vctx,
 
 	SET_PRIV_OP(ctx, uwrite_cq);
 	SET_PRIV_OP(ctx, resume_cq);
+	SET_PRIV_OP(ctx, resume_cq_v2);
 	SET_PRIV_OP(ctx, get_cons_index);
 	SET_PRIV_OP(ctx, set_cons_index);
 	SET_PRIV_OP(ctx, copy_cqe_to_shaded);
@@ -868,9 +893,11 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, calloc_qp);
 	SET_PRIV_OP(ctx, replay_recv_wr);
 	SET_PRIV_OP(ctx, prepare_qp_recv_replay);
+	SET_PRIV_OP(ctx, prepare_qp_recv_replay_v2);
 	SET_PRIV_OP(ctx, record_qp_index);
 
 	SET_PRIV_OP(ctx, resume_srq);
+	SET_PRIV_OP(ctx, resume_srq_v2);
 
 	SET_PRIV_OP(ctx, migrrdma_start_poll);
 	SET_PRIV_OP(ctx, migrrdma_end_poll);
@@ -885,6 +912,7 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, uwrite_srq);
 	SET_PRIV_OP(ctx, replay_srq_recv_wr);
 	SET_PRIV_OP(ctx, prepare_srq_replay);
+	SET_PRIV_OP(ctx, copy_uar_list);
 
 #undef SET_OP
 #undef SET_OP2

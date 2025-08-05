@@ -243,6 +243,8 @@ struct verbs_device_ops {
 
 	struct verbs_context *(*resume_context)(struct ibv_device *ibdev, int cmd_fd,
 						int *async_fd, struct verbs_context *orig_ctx);
+	struct verbs_context *(*resume_context_v2)(struct ibv_device *ibdev, int cmd_fd,
+						int *async_fd, struct verbs_context *orig_ctx);
 	struct verbs_context *(*pre_resume_context)(struct ibv_device *ibdev, int cmd_fd);
 	void (*free_tmp_context)(struct ibv_context *context);
 	struct ibv_context *(*dup_context)(struct ibv_context *context, struct ibv_qp *qp);
@@ -413,6 +415,9 @@ struct verbs_context_ops {
 	struct ibv_cq *(*resume_cq)(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
 			void *buf_addr, void *db_addr, int vhandle);
+	struct ibv_cq *(*resume_cq_v2)(struct ibv_context *context, struct ibv_cq *cq_meta,
+			int cqe, struct ibv_comp_channel *channel, int comp_vector,
+			void *buf_addr, void *db_addr, int vhandle);
 	int (*get_cons_index)(struct ibv_cq *cq);
 	void (*set_cons_index)(struct ibv_cq *cq, int cons_index);
 	void (*copy_cqe_to_shaded)(struct ibv_cq *cq);
@@ -427,9 +432,11 @@ struct verbs_context_ops {
 	struct ibv_qp *(*calloc_qp)(void);
 	int (*replay_recv_wr)(struct ibv_qp *qp);
 	int (*prepare_qp_recv_replay)(struct ibv_qp *qp, struct ibv_qp *new_qp);
+	int (*prepare_qp_recv_replay_v2)(struct ibv_qp *qp, struct ibv_qp *new_qp);
 	void (*record_qp_index)(struct ibv_qp *qp);
 
 	struct ibv_srq *(*resume_srq)(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
+	struct ibv_srq *(*resume_srq_v2)(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
 
 	void (*migrrdma_start_poll)(struct ibv_cq *cq);
 	void (*migrrdma_end_poll)(struct ibv_cq *cq);
@@ -446,6 +453,8 @@ struct verbs_context_ops {
 	int (*uwrite_srq)(struct ibv_srq *srq, struct ibv_srq *new_srq);
 	int (*replay_srq_recv_wr)(struct ibv_srq *srq, int head, int tail);
 	int (*prepare_srq_replay)(struct ibv_srq *srq, struct ibv_srq *new_srq, int *head, int *tail);
+
+	int (*copy_uar_list)(struct verbs_context *orig_ctx, struct ibv_context *new_ctx);
 };
 
 static inline struct verbs_device *
@@ -551,6 +560,10 @@ struct ibv_qp *ibv_pre_create_qp(struct ibv_pd *pd,
 
 int add_bf_addr_map_entry(void *new_bf, void *alloc_bf);
 void *get_alloc_bf(void *new_bf);
+
+extern int iter_cq_insert_fake_comp_event(struct ibv_cq *cq,
+					void *entry, void *in_param);
+extern void clear_rendpoint_tree(void);
 
 int ibv_cmd_install_footprint(struct ibv_context *context);
 int ibv_cmd_install_qpndict(struct ibv_context *context,

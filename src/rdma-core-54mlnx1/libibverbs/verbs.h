@@ -2012,6 +2012,7 @@ struct ibv_context_ops {
 
 	int (*_compat_uwrite_cq)(void);
 	void *(*_compat_resume_cq)(void);
+	void *(*_compat_resume_cq_v2)(void);
 	int (*_compat_get_cons_index)(void);
 	void (*_compat_set_cons_index)(void);
 	void (*_compat_copy_cqe_to_shaded)(void);
@@ -2024,9 +2025,11 @@ struct ibv_context_ops {
 	void *(*_compat_calloc_qp)(void);
 	int (*_compat_replay_recv_wr)(void);
 	int (*_compat_prepare_qp_recv_replay)(void);
+	int (*_compat_prepare_qp_recv_replay_v2)(void);
 	void (*_compat_record_qp_index)(void);
 
 	void *(*_compat_resume_srq)(void);
+	void *(*_compat_resume_srq_v2)(void);
 
 	void (*_compat_migrrdma_start_poll)(void);
 	void (*_compat_migrrdma_end_poll)(void);
@@ -2041,6 +2044,7 @@ struct ibv_context_ops {
 	int (*_compat_uwrite_srq)(void);
 	int (*_compat_replay_srq_recv_wr)(void);
 	int (*_compat_prepare_srq_replay)(void);
+	int (*_compat_copy_uar_list)(void);
 };
 
 #include <sys/mman.h>
@@ -2371,8 +2375,16 @@ struct ibv_resume_context_param {
 	void								*ctx_uaddr;
 };
 
+struct ibv_context *ibv_pre_resume_context(struct ibv_device **dev_list,
+		const struct ibv_resume_context_param *context_param);
+
 struct ibv_context *ibv_resume_context(struct ibv_device **dev_list,
 		const struct ibv_resume_context_param *context_param);
+
+struct ibv_context *ibv_resume_context_v2(struct ibv_device **dev_list,
+		const struct ibv_resume_context_param *context_param);
+
+int ibv_post_resume_context(struct verbs_context *orig_ctx, struct ibv_context *new_ctx);
 
 void ibv_free_tmp_context(struct ibv_context *context);
 
@@ -2934,6 +2946,9 @@ struct ibv_resume_srq_param {
 struct ibv_cq *ibv_resume_cq(struct ibv_context *context, 
 				const struct ibv_resume_cq_param *cq_param);
 
+struct ibv_cq *ibv_resume_cq_v2(struct ibv_context *context, 
+				const struct ibv_resume_cq_param *cq_param);
+
 struct ibv_resume_qp_param {
 	int									pd_vhandle;
 	int									qp_vhandle;
@@ -2954,6 +2969,10 @@ struct ibv_resume_qp_param {
 };
 
 struct ibv_qp *ibv_resume_create_qp(struct ibv_context *context,
+		struct ibv_pd *pd, struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
+		const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg);
+
+struct ibv_qp *ibv_resume_create_qp_v2(struct ibv_context *context,
 		struct ibv_pd *pd, struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
 		const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg);
 
@@ -3085,6 +3104,9 @@ struct ibv_srq *ibv_create_srq(struct ibv_pd *pd,
 			       struct ibv_srq_init_attr *srq_init_attr);
 
 struct ibv_srq *ibv_resume_srq(struct ibv_pd *pd,
+				   struct ibv_resume_srq_param *param);
+
+struct ibv_srq *ibv_resume_srq_v2(struct ibv_pd *pd,
 				   struct ibv_resume_srq_param *param);
 
 static inline struct ibv_srq *

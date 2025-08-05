@@ -856,6 +856,8 @@ static int fill_reply_buf(struct ibv_qp *qp,
 	return 0;
 }
 
+#include "rdma_migr.h"
+
 static void *migrside_wait_local_wqes(void *arg) {
 	struct list_head wait_qp_list;
 	struct list_head wait_srq_list;
@@ -961,14 +963,20 @@ static void *migrside_wait_local_wqes(void *arg) {
 
 	rbtree_traverse_qp(count_qp, &total_cnt);
 	reply_hdr = my_malloc(sizeof(struct reply_hdr_fmt) +
-				total_cnt * sizeof(struct reply_item_fmt));
+				total_cnt * sizeof(struct reply_item_fmt) +
+				sizeof(void *));
 	reply_hdr->cnt = 0;
 	rbtree_traverse_qp(fill_reply_buf, reply_hdr);
+
+	void **hook = (void *)reply_hdr + sizeof(struct reply_hdr_fmt) +
+					total_cnt * sizeof(struct reply_item_fmt);
+	*hook = restore_rdma;
 
 	sprintf(fname, "/proc/rdma_uwrite/%d/frm_buf", __rdma_pid__);
 	partner_buf_fd = open(fname, O_WRONLY);
 	write(partner_buf_fd, reply_hdr, sizeof(struct reply_hdr_fmt) +
-				reply_hdr->cnt * sizeof(struct reply_item_fmt));
+				reply_hdr->cnt * sizeof(struct reply_item_fmt) +
+				sizeof(void *));
 	close(partner_buf_fd);
 
 	rbtree_traverse_cq(iter_cq_uwrite, NULL);
@@ -1693,6 +1701,55 @@ LATEST_SYMVER_FUNC(ibv_free_tmp_context, 1_1, "IBVERBS_1.1",
 	verbs_device->ops->free_tmp_context(context);
 }
 
+int ibv_post_resume_context(struct verbs_context *orig_ctx, struct ibv_context *new_ctx) {
+	return get_ops(new_ctx)->copy_uar_list(orig_ctx, new_ctx);
+}
+
+LATEST_SYMVER_FUNC(ibv_pre_resume_context, 1_1, "IBVERBS_1.1",
+			struct ibv_context *, struct ibv_device **dev_list,
+			const struct ibv_resume_context_param *context_param) {
+	int ctx_cmd_fd = -1;
+	struct verbs_device *verbs_device;
+	struct ibv_device *ib_dev = NULL;
+	struct verbs_context *context_ex;
+	int context_dir_fd;
+	int info_fd;
+	char fname[128];
+	int ctx_async_fd = -1;
+	int ret;
+
+	signal_flag = 0;
+
+	sprintf(fname, "/dev/infiniband/%s", context_param->cdev);
+	ctx_cmd_fd = open(fname, O_RDWR | O_CLOEXEC);
+	if(ctx_cmd_fd < 0) {
+		return NULL;
+	}
+
+	if(ctx_cmd_fd != context_param->cmd_fd &&
+					dup2(ctx_cmd_fd, context_param->cmd_fd) < 0) {
+		close(ctx_cmd_fd);
+		return NULL;
+	}
+
+	if(ctx_cmd_fd != context_param->cmd_fd) {
+		close(ctx_cmd_fd);
+	}
+
+	verbs_device = get_verbs_device(&ib_dev, dev_list, context_param->cmd_fd);
+	if(!verbs_device) {
+		close(context_param->cmd_fd);
+		return NULL;
+	}
+
+	context_ex = verbs_device->ops->pre_resume_context(ib_dev, context_param->cmd_fd);
+	if(!context_ex) {
+		return NULL;
+	}
+
+	return &context_ex->context;
+}
+
 LATEST_SYMVER_FUNC(ibv_resume_context, 1_1, "IBVERBS_1.1",
 			struct ibv_context *, struct ibv_device **dev_list,
 			const struct ibv_resume_context_param *context_param) {
@@ -1751,14 +1808,68 @@ LATEST_SYMVER_FUNC(ibv_resume_context, 1_1, "IBVERBS_1.1",
 	close(context_dir_fd);
 	context_dir_fd = context_dir_fd + 1000;
 
-#if 0
-	resume_info(context_param, context_dir_fd, info_fd, gid_table,									\
-					ibv_close_device(&(context_ex)->context), -1);
-#endif
-
 	close(context_dir_fd);
 	ibv_free_tmp_context(&context_ex->context);
 	context_ex = verbs_device->ops->resume_context(ib_dev,
+					context_param->cmd_fd, &ctx_async_fd,
+					context_param->ctx_uaddr);
+
+	if(ctx_async_fd < 0) {
+		close(context_param->cmd_fd);
+		return NULL;
+	}
+
+	set_lib_ops(context_ex);
+
+	if(ctx_async_fd != context_param->async_fd &&
+					dup2(ctx_async_fd, context_param->async_fd) < 0) {
+		ibv_close_device(&context_ex->context);
+		return NULL;
+	}
+
+	if(ctx_async_fd != context_param->async_fd)
+		close(ctx_async_fd);
+
+	context_ex->context.async_fd = context_param->async_fd;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/ctx_uaddr",
+			rdma_getpid(&context_ex->context), context_ex->context.cmd_fd);
+	info_fd = open(fname, O_WRONLY);
+	if(info_fd < 0) {
+		ibv_close_device(&context_ex->context);
+		return NULL;
+	}
+
+	if(write(info_fd, &context_param->ctx_uaddr, sizeof(context_ex)) < 0) {
+		close(info_fd);
+		ibv_close_device(&context_ex->context);
+		return NULL;
+	}
+
+	close(info_fd);
+	return &context_ex->context;
+}
+
+LATEST_SYMVER_FUNC(ibv_resume_context_v2, 1_1, "IBVERBS_1.1",
+			struct ibv_context *, struct ibv_device **dev_list,
+			const struct ibv_resume_context_param *context_param) {
+	int ctx_cmd_fd = -1;
+	struct verbs_device *verbs_device;
+	struct ibv_device *ib_dev = NULL;
+	struct verbs_context *context_ex;
+	int context_dir_fd;
+	int info_fd;
+	char fname[128];
+	int ctx_async_fd = -1;
+	int ret;
+
+	verbs_device = get_verbs_device(&ib_dev, dev_list, context_param->cmd_fd);
+	if(!verbs_device) {
+		close(context_param->cmd_fd);
+		return NULL;
+	}
+
+	context_ex = verbs_device->ops->resume_context_v2(ib_dev,
 					context_param->cmd_fd, &ctx_async_fd,
 					context_param->ctx_uaddr);
 

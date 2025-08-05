@@ -1133,11 +1133,16 @@ struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_met
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
 			void *buf_addr, void *db_addr, int vhandle);
 
+struct ibv_cq *mlx5_resume_cq_v2(struct ibv_context *context, struct ibv_cq *cq_meta,
+			int cqe, struct ibv_comp_channel *channel, int comp_vector,
+			void *buf_addr, void *db_addr, int vhandle);
+
 struct ibv_qp *mlx5_resume_qp(struct ibv_context *context, int pd_handle, int qp_handle,
 				struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
 				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg);
 
 struct ibv_srq *mlx5_resume_srq(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
+struct ibv_srq *mlx5_resume_srq_v2(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
 
 void mlx5_free_qp(struct ibv_qp *qp);
 
@@ -1150,6 +1155,7 @@ void mlx5_copy_qp(struct ibv_qp *qp1, struct ibv_qp *qp2, void *param);
 struct ibv_qp *mlx5_calloc_qp(void);
 
 int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp);
+int mlx5_prepare_qp_recv_replay_v2(struct ibv_qp *qp, struct ibv_qp *new_qp);
 
 int mlx5_replay_recv_wr(struct ibv_qp *qp);
 
@@ -1157,6 +1163,8 @@ int mlx5_replay_srq_recv_wr(struct ibv_srq *srq, int head, int tail);
 
 int mlx5_prepare_srq_replay(struct ibv_srq *srq, struct ibv_srq *new_srq,
 						int *head, int *tail);
+
+int mlx5_copy_uar_list(struct verbs_context *orig_ctx, struct ibv_context *new_ctx);
 
 uint32_t get_prod_index(struct mlx5_cq *cq);
 

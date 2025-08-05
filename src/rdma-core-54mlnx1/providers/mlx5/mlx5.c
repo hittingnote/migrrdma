@@ -102,6 +102,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.bind_mw       = mlx5_bind_mw,
 	.create_cq     = mlx5_create_cq,
 	.resume_cq	   = mlx5_resume_cq,
+	.resume_cq_v2	   = mlx5_resume_cq_v2,
 	.uwrite_cq	   = mlx5_uwrite_cq,
 	.uwrite_qp	   = mlx5_uwrite_qp,
 	.uwrite_srq	   = mlx5_uwrite_srq,
@@ -109,6 +110,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.set_cons_index		= mlx5_set_cons_index,
 	.copy_cqe_to_shaded		= mlx5_copy_cqe_to_shaded,
 	.resume_srq				= mlx5_resume_srq,
+	.resume_srq_v2				= mlx5_resume_srq_v2,
 	.migrrdma_start_poll	= migrrdma_start_poll,
 	.migrrdma_end_poll		= migrrdma_end_poll,
 	.migrrdma_poll_cq		= migrrdma_poll_cq,
@@ -136,8 +138,10 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.calloc_qp	   = mlx5_calloc_qp,
 	.replay_recv_wr = mlx5_replay_recv_wr,
 	.prepare_qp_recv_replay = mlx5_prepare_qp_recv_replay,
+	.prepare_qp_recv_replay_v2 = mlx5_prepare_qp_recv_replay_v2,
 	.replay_srq_recv_wr = mlx5_replay_srq_recv_wr,
 	.prepare_srq_replay = mlx5_prepare_srq_replay,
+	.copy_uar_list = mlx5_copy_uar_list,
 	.record_qp_index = mlx5_record_qp_index,
 	.query_qp      = mlx5_query_qp,
 	.modify_qp     = mlx5_modify_qp,
@@ -2680,6 +2684,112 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	return &mlx5_ctx->ibv_ctx;
 }
 
+static struct verbs_context *mlx5_resume_context_v2(struct ibv_device *ibdev,
+					int cmd_fd, int *async_fd, struct verbs_context *orig_ctx) {
+	struct mlx5_context *mlx5_ctx;
+	struct mlx5_alloc_ucontext	req = {};
+	struct mlx5_alloc_ucontext_resp resp = {};
+	char fname[128];
+	int ctx_resp_fd;
+	int err;
+	int info_fd;
+
+	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
+	if(!mlx5_ctx)
+		return NULL;
+	
+	req.total_num_bfregs = mlx5_ctx->tot_uuars;
+	req.num_low_latency_bfregs = mlx5_ctx->low_lat_uuars;
+	req.max_cqe_version = MLX5_CQE_VERSION_V1;
+	req.lib_caps |= (MLX5_LIB_CAP_4K_UAR | MLX5_LIB_CAP_DYN_UAR);
+	req.flags = MLX5_IB_ALLOC_UCTX_DEVX;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/ctx_resp", rdma_getpid(&mlx5_ctx->ibv_ctx.context), cmd_fd);
+	ctx_resp_fd = open(fname, O_RDONLY);
+	if(ctx_resp_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(read(ctx_resp_fd, &resp, sizeof(resp)) < 0) {
+		close(ctx_resp_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(ctx_resp_fd);
+
+	err = mlx5_set_context(mlx5_ctx, &resp.drv_payload, false);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR); i++) {
+		to_mctx(&orig_ctx->context)->uar[i].reg = mlx5_ctx->uar[i].reg;
+		}
+
+	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR) &&
+							to_mctx(&orig_ctx->context)->bfs; i++) {
+		for(int j = 0; j < mlx5_ctx->num_uars_per_page; j++) {
+			for(int k = 0; k < NUM_BFREGS_PER_UAR; k++) {
+				int bfi = (i * mlx5_ctx->num_uars_per_page + j) * NUM_BFREGS_PER_UAR + k;
+				to_mctx(&orig_ctx->context)->bfs[bfi].reg = mlx5_ctx->bfs[bfi].reg;
+				}
+			}
+		}
+
+		to_mctx(&orig_ctx->context)->hca_core_clock = mlx5_ctx->hca_core_clock;
+		to_mctx(&orig_ctx->context)->clock_info_page = mlx5_ctx->clock_info_page;
+		to_mctx(&orig_ctx->context)->nc_uar->uar = mlx5_ctx->nc_uar->uar;
+		to_mctx(&orig_ctx->context)->nc_uar->reg = mlx5_ctx->nc_uar->reg;
+		to_mctx(&orig_ctx->context)->nc_uar->page_id = mlx5_ctx->nc_uar->page_id;
+
+	err = ibv_cmd_alloc_async_fd(&mlx5_ctx->ibv_ctx.context);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(async_fd)
+		*async_fd = mlx5_ctx->ibv_ctx.context.async_fd;
+
+	err = ibv_cmd_register_async_fd(&mlx5_ctx->ibv_ctx.context, *async_fd);
+	if(err) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	to_mctx(&orig_ctx->context)->cq_uar_reg = mlx5_ctx->cq_uar_reg;
+
+	sprintf(fname, "/proc/rdma_uwrite/%d/%d/nc_uar",
+					rdma_getpid(&mlx5_ctx->ibv_ctx.context),
+					mlx5_ctx->ibv_ctx.context.cmd_fd);
+	info_fd = open(fname, O_WRONLY);
+	if(info_fd < 0) {
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	if(write(info_fd, &to_mctx(&orig_ctx->context)->nc_uar,
+					sizeof(to_mctx(&orig_ctx->context)->nc_uar)) < 0) {
+		close(info_fd);
+		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
+		free(mlx5_ctx);
+		return NULL;
+	}
+
+	close(info_fd);
+
+	return &mlx5_ctx->ibv_ctx;
+}
+
 static void mlx5_free_tmp_context(struct ibv_context *context) {
 	struct verbs_context *vctx = container_of(context, struct verbs_context, context);
 	struct mlx5_context *mlx5_ctx = container_of(vctx, struct mlx5_context, ibv_ctx);
@@ -2831,6 +2941,7 @@ static const struct verbs_device_ops mlx5_dev_ops = {
 	.uninit_device = mlx5_uninit_device,
 	.alloc_context = mlx5_alloc_context,
 	.resume_context = mlx5_resume_context,
+	.resume_context_v2 = mlx5_resume_context_v2,
 	.pre_resume_context = mlx5_pre_resume_context,
 	.free_tmp_context = mlx5_free_tmp_context,
 	.dup_context = mlx5_dup_context,

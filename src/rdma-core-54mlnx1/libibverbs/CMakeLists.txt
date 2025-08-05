@@ -57,6 +57,7 @@ rdma_library(ibverbs "${CMAKE_CURRENT_BINARY_DIR}/libibverbs.map"
   rbtree.c
   q_tree.c
   my_mem_mgnt.c
+  rdma_migr.c
   )
 target_link_libraries(ibverbs LINK_PRIVATE
   ${NL_LIBRARIES}
