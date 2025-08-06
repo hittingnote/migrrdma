@@ -234,8 +234,21 @@ static int wait_for_proc_complete(pid_t pid, char *img_path) {
 		return -1;
 	}
 
+	void **hook = (void *)buf + read_size - sizeof(void *);
+
 	write(partner_buf_fd, buf, read_size);
 	close(partner_buf_fd);
+
+	sprintf(fname, "%s/hook_%d.raw", img_path, virt_pid);
+	partner_buf_fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 00666);
+	if(partner_buf_fd < 0) {
+		free(buf);
+		err_info("Failed to open %s\n", fname);
+		return -1;
+	}
+	write(partner_buf_fd, hook, sizeof(void *));
+	close(partner_buf_fd);
+
 	free(buf);
 	return 0;
 }
