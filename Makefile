@@ -1,4 +1,4 @@
-tgt:=src/wbs_external src/migrrdma_daemon utils/prerestore
+tgt:=src/wbs_external src/migrrdma_daemon utils/prerestore utils/fullrestore
 
 all:
 	@for i in $(tgt); do \
