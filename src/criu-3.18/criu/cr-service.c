@@ -52,6 +52,8 @@
 
 unsigned int service_sk_ino = -1;
 char check_buf[1024];
+char *ip_addr;
+int enable_pre_setup;
 
 static int recv_criu_msg(int socket_fd, CriuReq **req)
 {
@@ -107,6 +109,42 @@ static int recv_criu_msg(int socket_fd, CriuReq **req)
 			errno = ECONNRESET;
 			goto err;
 		}
+
+		asprintf(&ip_addr, "%s", check_buf);
+		enable_pre_setup = 1;
+	}
+	else if((*req)->type == CRIU_REQ_TYPE__DUMP ||
+				(*req)->type == CRIU_REQ_TYPE__RESTORE) {
+		char pre_setup_flag[32];
+		off_t off;
+
+		len = recv(socket_fd, NULL, 0, MSG_TRUNC | MSG_PEEK);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		len = recv(socket_fd, check_buf, len, MSG_TRUNC);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		if (len == 0) {
+			pr_info("Client exited unexpectedly\n");
+			errno = ECONNRESET;
+			goto err;
+		}
+
+		sscanf(check_buf, "%s%ln", &pre_setup_flag, &off);
+		if(!strcmp(pre_setup_flag, "false")) {
+			enable_pre_setup = 0;
+		}
+		else {
+			enable_pre_setup = 1;
+		}
+
+		asprintf(&ip_addr, "%s", check_buf + off + 1);
 	}
 
 	exit_code = 0;
@@ -991,8 +1029,6 @@ static int pre_dump_rdma_using_req(int sk, CriuOpts *req, bool single)
 
 		opts.final_state = TASK_ALIVE;
 		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
-
-		pr_info("check_buf: %s\n", check_buf);
 
 		if (init_pidfd_store_hash())
 			goto pidfd_store_err;

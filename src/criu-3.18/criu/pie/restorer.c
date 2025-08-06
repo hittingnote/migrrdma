@@ -1578,6 +1578,7 @@ long __export_restore_task(struct task_restore_args *args)
 	rt_sigaction_t act;
 	bool has_vdso_proxy;
 	int sk;
+	int enable_pre_setup;
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
@@ -2183,6 +2184,7 @@ long __export_restore_task(struct task_restore_args *args)
 		size_t size = args->msg_arr[i].size;
 		void *buf = args->msg_arr[i].buf;
 		struct sockaddr_in remote_addr;
+
 		sk = sys_socket(AF_INET, SOCK_STREAM, 0);
 
 		if(sk < 0) {
@@ -2211,8 +2213,21 @@ long __export_restore_task(struct task_restore_args *args)
 		sys_close(sk);
 	}
 
-	pr_info("Restore RDMA communication finish\n");
+	if(!args->enable_pre_setup) {
+		if(args->restore_hook) {
+			int (*restore_rdma)(pid_t pid, char *img_dir_path);
+			restore_rdma = args->restore_hook;
+			if(restore_rdma(sys_getpid(), args->images_dir)) {
+				return -1;
+			}
+		}
+		pr_info("Full restore RDMA finish\n");
+	}
+	else {
+		pr_info("Restore RDMA communication finish\n");
+	}
 
+	enable_pre_setup = args->enable_pre_setup;
 	sys_munmap(args->rst_mem, args->rst_mem_size);
 
 	/*
@@ -2220,7 +2235,7 @@ long __export_restore_task(struct task_restore_args *args)
 	 */
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
 
-	{
+	if(enable_pre_setup) {
 		int sock = sys_socket(AF_UNIX, SOCK_DGRAM, 0);
 		struct sockaddr_un sock_un;
 		char buf[32];

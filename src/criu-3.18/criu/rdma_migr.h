@@ -45,4 +45,3 @@ extern void *get_fe_ptr_from_id(uint32_t id);
 extern int rdma_plugin_main(int argc, char *argv[]);
 
 #endif
-

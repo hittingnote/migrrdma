@@ -2223,7 +2223,7 @@ int cr_dump_tasks(pid_t pid)
 
 		sprintf(args[1], "%d", root_item->pid->real);
 		sprintf(args[2], "%.110s", images_dir);
-		sprintf(args[3], "%.250s", check_buf);
+		sprintf(args[3], "%.250s", ip_addr);
 		argvs[0] = args[0];
 		argvs[1] = args[1];
 		argvs[2] = args[2];
@@ -2231,6 +2231,24 @@ int cr_dump_tasks(pid_t pid)
 		if(rdma_plugin_main(4, argvs)) {
 			goto err;
 		}
+	}
+	else if(opts.mode == CR_DUMP && !enable_pre_setup) {
+		/* For MigrRDMA wo pre-setup test */
+		char args[4][256];
+		char *argvs[4];
+
+		pr_info("Start to dump RDMA\n");
+		sprintf(args[1], "%d", root_item->pid->real);
+		sprintf(args[2], "%.110s", images_dir);
+		sprintf(args[3], "%.250s", ip_addr);
+		argvs[0] = args[0];
+		argvs[1] = args[1];
+		argvs[2] = args[2];
+		argvs[3] = args[3];
+		if(rdma_plugin_main(4, argvs)) {
+			goto err;
+		}
+		pr_info("Dump RDMA finish\n");
 	}
 
 	for_each_pstree_item(item) {

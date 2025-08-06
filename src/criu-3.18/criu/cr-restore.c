@@ -981,6 +981,37 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		content_p += up_align_four(ta->msg_arr[i].size);
 	}
 
+	ta->enable_pre_setup = enable_pre_setup;
+
+	if(!enable_pre_setup) {
+		int fd;
+		char fname[128];
+
+		sprintf(fname, "%.110s/hook_%d.raw", images_dir, pid);
+		fd = open(fname, O_RDWR);
+		if(fd < 0) {
+			ta->restore_hook = NULL;
+			goto skip_hook;
+		}
+
+		if(read(fd, &ta->restore_hook, sizeof(void *)) < 0) {
+			close(fd);
+			return -1;
+		}
+
+		close(fd);
+
+skip_hook:
+		sprintf(ta->images_dir, "%.127s", images_dir);
+
+		pr_info("Start to pre-restore RDMA\n");
+		if(restore_rdma(pid, images_dir)) {
+			pr_err("restore_rdma failed. errno: %d\n", errno);
+			return -1;
+		}
+		pr_info("Pre-restore RDMA finish\n");
+	}
+
 	if (prepare_fds(current))
 		return -1;
 
@@ -1319,7 +1350,7 @@ static int restore_one_helper(void)
 	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++)
 		close_service_fd(i);
 
-	{
+	if(enable_pre_setup) {
 		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
 		struct sockaddr_un sock_un;
 		char buf[32];
@@ -2142,12 +2173,14 @@ static int restore_task_with_children(void *_arg)
 			goto err;
 	}
 
-	if(add_rdma_vma_node(pid)) {
-		goto err;
-	}
+	if(enable_pre_setup) {
+		if(add_rdma_vma_node(pid)) {
+			goto err;
+		}
 
-	if(only_prepare_rdma_mappings(current)) {
-		goto err;
+		if(only_prepare_rdma_mappings(current)) {
+			goto err;
+		}
 	}
 
 	if (setup_newborn_fds(current))
@@ -2156,7 +2189,7 @@ static int restore_task_with_children(void *_arg)
 	if (restore_task_mnt_ns(current))
 		goto err;
 
-	if (prepare_mappings(current, false))
+	if (prepare_mappings(current, !enable_pre_setup))
 		goto err;
 
 	if (prepare_sigactions(ca->core) < 0)
@@ -2177,114 +2210,121 @@ static int restore_task_with_children(void *_arg)
 
 	timing_stop(TIME_FORK);
 
-	if(restore_rdma(pid, images_dir)) {
-		pr_err("restore_rdma failed. errno: %d\n", errno);
-		goto err;
-	}
-
-	{
-		int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-		struct sockaddr_un sock_un;
-		char buf[32];
-		int err;
-
-		if(sock < 0) {
-			pr_perror("socket");
-			return -1;
+	if(enable_pre_setup) {
+		if(restore_rdma(pid, images_dir)) {
+			pr_err("restore_rdma failed. errno: %d\n", errno);
+			goto err;
 		}
 
-		memset(&sock_un, 0, sizeof(sock_un));
-		sock_un.sun_family = AF_UNIX;
-		sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
-		sprintf(buf, "FINISH");
-		err = sendto(sock, buf, strlen(buf)+1, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
-		if(err < 0) {
-			pr_perror("sendto");
-			return -1;
-		}
+		{
+			int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+			struct sockaddr_un sock_un;
+			char buf[32];
+			int err;
 
-		close(sock);
-	}
+			if(sock < 0) {
+				pr_perror("socket");
+				return -1;
+			}
 
-	{
-		char *sockname;
-		char buf[32];
-		int sock = init_server_unix_socket(&sockname);
+			memset(&sock_un, 0, sizeof(sock_un));
+			sock_un.sun_family = AF_UNIX;
+			sprintf(sock_un.sun_path, "/dev/shm/prerestore_%d.sock", prerestore_parent_pid);
+			sprintf(buf, "FINISH");
+			err = sendto(sock, buf, strlen(buf)+1, 0, (struct sockaddr *)&sock_un, sizeof(sock_un));
+			if(err < 0) {
+				pr_perror("sendto");
+				return -1;
+			}
 
-		pr_info("Partial restore finished. Now wait for the rest states ready.\n");
-
-		if(recvfrom(sock, buf, 32, 0, NULL, NULL) < 0) {
 			close(sock);
-			pr_perror("recvfrom");
-			return -1;
 		}
+	}
 
-		close(sock);
-		unlink(sockname);
-		free(sockname);
-
+	if(!enable_pre_setup) {
 		pr_info("Full restore starts.\n");
 	}
+	else {
+		{
+			char *sockname;
+			char buf[32];
+			int sock = init_server_unix_socket(&sockname);
 
-	if(stop_and_copy_update_state(current, ca))
-		goto err;
+			pr_info("Partial restore finished. Now wait for the rest states ready.\n");
 
-	if(prepare_mappings(current, true))
-		goto err;
+			if(recvfrom(sock, buf, 32, 0, NULL, NULL) < 0) {
+				close(sock);
+				pr_perror("recvfrom");
+				return -1;
+			}
 
-	if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback)) {
-		goto err;
-	}
+			close(sock);
+			unlink(sockname);
+			free(sockname);
 
-	if(ibv_update_mem(add_update_node, add_one_rdma_vma_node)) {
-		goto err;
-	}
-
-	if(current->pid->state != TASK_HELPER) {
-		struct rdma_mmap_item item;
-		int fd;
-		char fname[128];
-		int err;
-
-		sprintf(fname, "%.110s/rdma_mmap_%d.raw",
-					images_dir, vpid(current));
-		fd = open(fname, O_RDONLY);
-		if(fd < 0) {
-			pr_info("No RDMA. Skip RDMA mmap\n");
-			goto skip_rdma_mmap;
+			pr_info("Full restore starts.\n");
 		}
 
-		do {
-			void *addr;
+		if(stop_and_copy_update_state(current, ca))
+			goto err;
 
-			err = read(fd, &item, sizeof(item));
-			if(err != 0 && err != sizeof(item)) {
-				pr_perror("read");
-				goto err;
+		if(prepare_mappings(current, true))
+			goto err;
+
+		if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback)) {
+			goto err;
+		}
+
+		if(ibv_update_mem(add_update_node, add_one_rdma_vma_node)) {
+			goto err;
+		}
+
+		if(current->pid->state != TASK_HELPER) {
+			struct rdma_mmap_item item;
+			int fd;
+			char fname[128];
+			int err;
+
+			sprintf(fname, "%.110s/rdma_mmap_%d.raw",
+						images_dir, vpid(current));
+			fd = open(fname, O_RDONLY);
+			if(fd < 0) {
+				pr_info("No RDMA. Skip RDMA mmap\n");
+				goto skip_rdma_mmap;
 			}
 
-			if(err == 0) {
-				continue;
-			}
+			do {
+				void *addr;
 
-			addr = mmap((void *)item.start, item.end - item.start,
-					PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if(addr != (void *)item.start) {
-				perror("mmap");
-				goto err;
-			}
+				err = read(fd, &item, sizeof(item));
+				if(err != 0 && err != sizeof(item)) {
+					pr_perror("read");
+					goto err;
+				}
 
-			add_one_rdma_vma_node(item.start, item.end);
+				if(err == 0) {
+					continue;
+				}
 
-			pr_info("mmap null RDMA register: %lx-%lx, %c%c%c%c\n",
-							item.start, item.end,
-							(item.prot & PROT_READ)? 'r': '-',
-							(item.prot & PROT_WRITE)? 'w': '-',
-							(item.prot & PROT_EXEC)? 'x': '-',
-							(item.flag == MAP_SHARED)? 's': 'p');
-		} while(err != 0);
+				addr = mmap((void *)item.start, item.end - item.start,
+						PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+				if(addr != (void *)item.start) {
+					perror("mmap");
+					goto err;
+				}
 
-		close(fd);
+				add_one_rdma_vma_node(item.start, item.end);
+
+				pr_info("mmap null RDMA register: %lx-%lx, %c%c%c%c\n",
+								item.start, item.end,
+								(item.prot & PROT_READ)? 'r': '-',
+								(item.prot & PROT_WRITE)? 'w': '-',
+								(item.prot & PROT_EXEC)? 'x': '-',
+								(item.flag == MAP_SHARED)? 's': 'p');
+			} while(err != 0);
+
+			close(fd);
+		}
 	}
 
 skip_rdma_mmap:
@@ -3120,7 +3160,7 @@ int cr_restore_tasks(void)
 	if (prepare_lazy_pages_socket() < 0)
 		goto clean_cgroup;
 
-	{
+	if(enable_pre_setup) {
 		int total_wait = 0;
 		struct pstree_item *it;
 		int sock;

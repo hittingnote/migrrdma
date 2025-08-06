@@ -234,7 +234,11 @@ static int wait_for_proc_complete(pid_t pid, char *img_path) {
 		return -1;
 	}
 
-	write(partner_buf_fd, buf, read_size);
+	if(write(partner_buf_fd, buf, read_size) < 0) {
+		err_info("write failed\n");
+		return -1;
+	}
+
 	close(partner_buf_fd);
 	free(buf);
 	return 0;
@@ -247,7 +251,7 @@ static int get_all_thread_ids(pid_t pid, pid_t **tids,
 	DIR *dir;
 	struct dirent *ent;
 	int ret_n_tids = 0;
-	pid_t *tids_arr;
+	pid_t *tids_arr = NULL;
 	int curp = 0;
 
 	sprintf(fname, "/proc/%d/task", pid);
@@ -325,7 +329,8 @@ int rdma_plugin_main(int argc, char *argv[]) {
 				}
 
 				n_tids--;
-				write(fd_to_proc, &n_tids, sizeof(int));
+				if(write(fd_to_proc, &n_tids, sizeof(int)) < 0)
+					exit(-1);
 				close(fd_to_proc);
 				for(int i = 0; i < n_tids + 1; i++) {
 					dprintf(1, "tids[i]: %d\n", tids[i]);
@@ -371,7 +376,8 @@ int rdma_plugin_main(int argc, char *argv[]) {
 					}
 
 					n_tids--;
-					write(fd_to_proc, &n_tids, sizeof(int));
+					if(write(fd_to_proc, &n_tids, sizeof(int)) < 0)
+						exit(-1);
 					close(fd_to_proc);
 					for(int j = 0; j < n_tids + 1; j++) {
 						dprintf(1, "tids[j]: %d\n", tids[j]);

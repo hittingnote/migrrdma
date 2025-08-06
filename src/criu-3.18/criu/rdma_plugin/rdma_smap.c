@@ -179,7 +179,9 @@ int dump_rdma_mmap(pid_t pid, char *img_path) {
 
 	sprintf(fname, "/proc/rdma/%d/user_pid", pid);
 	info_fd = open(fname, O_RDONLY);
-	read(info_fd, &virt_pid, sizeof(virt_pid));
+	if(read(info_fd, &virt_pid, sizeof(virt_pid)) < 0) {
+		return -1;
+	}
 	close(info_fd);
 
 	sprintf(fname, "%s/rdma_mmap_%d.raw", img_path, virt_pid);
@@ -232,7 +234,8 @@ int dump_rdma_mmap(pid_t pid, char *img_path) {
 			item.flag = MAP_SHARED;
 		}
 
-		write(fd_out, &item, sizeof(item));
+		if(write(fd_out, &item, sizeof(item)) < 0)
+			return -1;
 	}
 
 	fclose(fp);

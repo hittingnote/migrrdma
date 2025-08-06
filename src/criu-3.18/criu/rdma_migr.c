@@ -702,13 +702,19 @@ static void *restore_context(void *parent, int cmd_fd,
 	dump_mmap(cmd_fd, info_fd, &context_param, lkey);
 	dump_mmap(cmd_fd, info_fd, &context_param, rkey);
 
-	context = ibv_resume_context(ibv_device_list, &context_param);
+	if(!enable_pre_setup) {
+		context = ibv_pre_resume_context(ibv_device_list, &context_param);
+	}
+	else {
+		context = ibv_resume_context(ibv_device_list, &context_param);
+	}
 	if(!context)
 		*p_err = -1;
 	else
 		*p_err = 0;
 
-	__rdma_pid__ = rdma_getpid(context);
+	if(enable_pre_setup)
+		__rdma_pid__ = rdma_getpid(context);
 
 	return context;
 }
@@ -717,6 +723,9 @@ static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
 	struct ibv_context *tmp_context = g_tmp_context;
 	DIR *cmd_dir;
 	struct dirent *cmd_dirent;
+
+	if(!enable_pre_setup)
+		return 0;
 
 	cmd_dir = fdopendir(cmd_fd);
 	if(!cmd_dir)
@@ -1404,29 +1413,6 @@ int stop_and_copy_update_state(struct pstree_item *current,
 	if(current == root_item) {
 		struct pstree_item *pi;
 
-#if 1
-#if 0
-		/* Update PB_TIMENS. Only once */
-		if (root_ns_mask & CLONE_NEWTIME) {
-			if (prepare_timens(current->ids->time_ns_id))
-				return -1;
-		} else if (kdat.has_timens) {
-			if (prepare_timens(0))
-				return -1;
-		}
-#endif
-#else
-		/* Update PB_TIMENS. Only once */
-		if (root_ns_mask & CLONE_NEWTIME) {
-			if (prepare_timens_v2(current->ids->time_ns_id,
-							timens_helper_pid))
-				return -1;
-		} else if (kdat.has_timens) {
-			if (prepare_timens_v2(0, timens_helper_pid))
-				return -1;
-		}
-#endif
-
 		for_each_pstree_item(pi) {
 			int sock, err;
 			struct sockaddr_un sock_un;
@@ -1535,12 +1521,6 @@ int stop_and_copy_update_state(struct pstree_item *current,
 				memcpy(vma2->page_bitmap, vma1->page_bitmap, BITS_TO_LONGS(nr_pages) * sizeof(long));
 			}
 			vma2->premmaped_addr = vma1->premmaped_addr;
-
-#if 0
-//			vma2->e->status = vma1->e->status;
-			memcpy(vma2->e, vma1->e, sizeof(*vma1->e));
-			vma1->e = vma2->e;
-#endif
 
 			vma1 = list_entry(vma1->list.next, struct vma_area, list);
 			vma2 = list_entry(vma2->list.next, struct vma_area, list);
@@ -1664,14 +1644,6 @@ int stop_and_copy_update_state(struct pstree_item *current,
 		vma1 = list_entry(vma1->list.next, struct vma_area, list);
 		vma2 = list_entry(vma2->list.next, struct vma_area, list);
 	}
-
-#if 0
-	for(int idx = 0; idx < ri->mm->n_vmas; idx++) {
-//		memcpy(ri->mm->vmas[idx], new_mm->vmas[idx], sizeof(VmaEntry));
-		ri->mm->vmas[idx]->start = new_mm->vmas[idx]->start;
-		ri->mm->vmas[idx]->end = new_mm->vmas[idx]->end;
-	}
-#endif
 
 	ri->mm = new_mm;
 	rsti(current)->vmas.nr = ri->mm->n_vmas;

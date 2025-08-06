@@ -552,6 +552,7 @@ static void *wait_fn(void *arg) {
 	}
 
 	close(sk);
+	return NULL;
 }
 
 static int send_msg(union ibv_gid *dest_gid, void *buf, int size, int need_wait) {

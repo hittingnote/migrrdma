@@ -244,6 +244,9 @@ struct cr_options {
 #include <linux/limits.h>
 
 extern char check_buf[1024];
+extern char *ip_addr;
+extern int enable_pre_setup;
+
 extern struct cr_options opts;
 extern char images_dir[PATH_MAX];
 extern char images_dir_path[PATH_MAX];

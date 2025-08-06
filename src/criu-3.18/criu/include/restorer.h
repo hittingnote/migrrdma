@@ -172,6 +172,9 @@ struct send_msg_entry {
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 	void						*base;
+	void						*restore_hook;
+	int							enable_pre_setup;
+	char						images_dir[128];
 	struct unmapped_node *unmapped;
 	int n_unmapped;
 	struct update_mem_node			*update_arr;

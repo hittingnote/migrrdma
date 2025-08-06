@@ -768,6 +768,8 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 
 	DIR *map_files_dir = NULL;
 	struct bfd f;
+	int flag;
+	int cond;
 
 	vm_area_list_init(vma_area_list);
 
@@ -815,7 +817,29 @@ parse_vma_file:
 			goto err;
 		}
 
-		if(!strncmp(str + path_off, "/dev/infiniband/", 16)) {
+		if(!enable_pre_setup) {
+			pid_t pid;
+			int cmd_fd;
+			off_t off;
+			if(sscanf(str + path_off, "/proc/rdma_uwrite/%d/%d/%ln", &pid, &cmd_fd, &off) < 2) {
+				flag = 0;
+			}
+			else {
+				if(*(str + path_off + off) == '<')
+					flag = 1;
+				else
+					flag = 0;
+			}
+		}
+
+		if(enable_pre_setup) {
+			cond = !strncmp(str + path_off, "/dev/infiniband/", 16);
+		}
+		else {
+			cond = (!strncmp(str + path_off, "/dev/infiniband/", 16) || flag);
+		}
+
+		if(cond) {
 			pr_info("Skip mapping of file %s\n", str + path_off);
 read_line:
 			str = breadline(&f);
