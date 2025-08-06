@@ -42,6 +42,7 @@ cp /dev/shm/restorerdma/* /dev/shm/predump_img/ -r
 ./utils/prerestore/rdma_prerestore --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v1.linux/moby/${new_cont_id}.json \
 					--log-format json rdmarestore --image-path /dev/shm/restorerdma/ \
 					--work-path /var/lib/containerd/io.containerd.runtime.v1.linux/moby/${new_cont_id} \
+					--rdma-presetup \
 					--detach --pid-file /run/containerd/io.containerd.runtime.v1.linux/moby/${new_cont_id}/init.pid -no-subreaper \
 					--bundle /run/containerd/io.containerd.runtime.v1.linux/moby/${new_cont_id} ${new_cont_id} < /proc/${new_init_pid}/fd/0 > /proc/${new_init_pid}/fd/1 2> /proc/${new_init_pid}/fd/2
 
@@ -70,6 +71,7 @@ wbc_time=`echo "scale=3; ( $end - $start ) * 1000.0 / 1.0" | bc`
 
 runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/log.json --log-format json checkpoint \
 					--image-path /dev/shm/dump_img `if [ $iters_precopy -gt 0 ]; then echo "--parent-path ./pre_${iters_precopy}"; fi` \
+					--rdma-presetup --migr-dst ${migr_dst} \
 					--work-path /var/lib/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/criu-work ${orig_cont_id}
 mkdir /dev/shm/dump_img/fdiff
 cp `docker inspect ${orig_cont} | grep Upper | awk -F '[:," ]+' '{print $3}'`/* /dev/shm/dump_img/fdiff/ -r
