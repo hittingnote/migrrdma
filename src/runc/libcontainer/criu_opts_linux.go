@@ -32,4 +32,5 @@ type CriuOpts struct {
 	LsmProfile              string             // LSM profile used to restore the container
 	LsmMountContext         string             // LSM mount context value to use during restore
 	MigrDst					string
+	RDMAPreSetup			bool
 }

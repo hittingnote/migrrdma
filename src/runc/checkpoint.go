@@ -43,6 +43,8 @@ checkpointed.`,
 		cli.StringFlag{Name: "manage-cgroups-mode", Value: "", Usage: "cgroups mode: soft|full|strict|ignore (default: soft)"},
 		cli.StringSliceFlag{Name: "empty-ns", Usage: "create a namespace, but don't restore its properties"},
 		cli.BoolFlag{Name: "auto-dedup", Usage: "enable auto deduplication of memory images"},
+		cli.BoolFlag{Name: "rdma-presetup", Usage: "enable RDMA pre-setup feature"},
+		cli.StringFlag{Name: "migr-dst", Value: "", Usage: "Hostname of migration destination"},
 	},
 	Action: func(context *cli.Context) error {
 		var tv_start syscall.Timeval
@@ -79,6 +81,8 @@ checkpointed.`,
 
 		options.ShellJob = true
 		options.TcpEstablished = true
+		options.RDMAPreSetup = context.Bool("rdma-presetup")
+		options.MigrDst = context.String("migr-dst")
 		err = container.Checkpoint(options)
 		if err == nil && !(options.LeaveRunning || options.PreDump) {
 			// Destroy the container unless we tell CRIU to keep it.

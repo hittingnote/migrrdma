@@ -256,6 +256,10 @@ following will output a list of processes running in the container:
 			Value: "",
 			Usage: "Specify an LSM mount context to be used during restore.",
 		},
+		cli.BoolFlag{
+			Name: "rdma-presetup",
+			Usage: "enable RDMA pre-setup feature",
+		},
 	},
 	Action: func(context *cli.Context) error {
 		if err := checkArgs(context, 1, minArgs); err != nil {
@@ -269,7 +273,8 @@ following will output a list of processes running in the container:
 		if err != nil {
 			return err
 		}
-		
+
+		options.RDMAPreSetup = context.Bool("rdma-presetup")
 		status, err := execProcess(context, CT_ACT_RESTORE, options)
 		if err == nil {
 			os.Exit(status)

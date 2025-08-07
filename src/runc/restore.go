@@ -182,6 +182,10 @@ using the runc checkpoint command.`,
 			Value: "",
 			Usage: "Specify an LSM mount context to be used during restore.",
 		},
+		cli.BoolFlag{
+			Name: "rdma-presetup",
+			Usage: "enable RDMA pre-setup feature",
+		},
 	},
 	Action: func(context *cli.Context) error {
 		if err := checkArgs(context, 1, exactArgs); err != nil {
@@ -199,6 +203,7 @@ using the runc checkpoint command.`,
 
 		options.ShellJob = true
 		options.TcpEstablished = true
+		options.RDMAPreSetup = context.Bool("rdma-presetup")
 		status, err := startContainer(context, CT_ACT_RESTORE, options)
 		if err != nil {
 			return err

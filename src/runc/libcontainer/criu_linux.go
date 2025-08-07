@@ -1436,7 +1436,7 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts, is_init bool) 
 				this_pid := int(v)
 	
 				os.Mkdir(fmt.Sprintf("/var/lib/containerd/io.containerd.runtime.v1.linux/moby/%064d", this_pid), 0o644)
-	
+
 				wg.Add(1)
 				go func(c Container, criuOpts CriuOpts, this_pid int, entry string, resChan chan error) {
 					defer wg.Done()
@@ -1444,8 +1444,10 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts, is_init bool) 
 					my_criuOpts := CriuOpts(criuOpts)
 					my_pid := this_pid
 					my_entry := entry
-	
-					cmd := exec.Command("runc", "--root", "/var/run/docker/runtime-runc/moby", "--log",
+
+					var cmd *exec.Cmd
+					if(my_criuOpts.RDMAPreSetup == false) {
+						cmd = exec.Command("runc", "--root", "/var/run/docker/runtime-runc/moby", "--log",
 								fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/log.json", my_container.ID()),
 								"--log-format", "json", "execrestore",
 								"--image-path", fmt.Sprintf("%s/%d", my_criuOpts.ImagesDirectory, this_pid),
@@ -1453,7 +1455,17 @@ func (c *Container) Restore(process *Process, criuOpts *CriuOpts, is_init bool) 
 								"--process", fmt.Sprintf("%s/procspec_%s", my_criuOpts.ImagesDirectory, my_entry),
 								"--detach", "--pid-file", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/%064d.pid", c.ID(), my_pid),
 								my_container.ID())
-	
+					} else {
+						cmd = exec.Command("runc", "--root", "/var/run/docker/runtime-runc/moby", "--log",
+								fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/log.json", my_container.ID()),
+								"--log-format", "json", "execrestore",
+								"--image-path", fmt.Sprintf("%s/%d", my_criuOpts.ImagesDirectory, this_pid),
+								"--work-path", fmt.Sprintf("/var/lib/containerd/io.containerd.runtime.v1.linux/moby/%064d", my_pid),
+								"--process", fmt.Sprintf("%s/procspec_%s", my_criuOpts.ImagesDirectory, my_entry),
+								"--detach", "--pid-file", fmt.Sprintf("/run/containerd/io.containerd.runtime.v1.linux/moby/%s/%064d.pid", c.ID(), my_pid),
+								"--rdma-presetup", my_container.ID())
+					}
+
 					output, err := cmd.CombinedOutput()
 					fmt.Printf("%s", output)
 					resChan <- err
@@ -1662,6 +1674,18 @@ func (c *Container) criuSwrk(process *Process, req *criurpc.CriuReq, opts *CriuO
 
 	if(*req.Type == criurpc.CriuReqType_SINGLE_PRE_DUMP_RDMA) {
 		_, err = criuClientCon.Write([]byte(opts.MigrDst))
+		if err != nil {
+			return err
+		}
+	} else if(*req.Type == criurpc.CriuReqType_DUMP || *req.Type == criurpc.CriuReqType_RESTORE) {
+		var buf bytes.Buffer
+		buf.Write(strconv.AppendBool([]byte{}, opts.RDMAPreSetup))
+		if(*req.Type == criurpc.CriuReqType_DUMP) {
+			buf.Write([]byte(" "))
+			buf.Write([]byte(opts.MigrDst))
+		}
+
+		_, err = criuClientCon.Write(buf.Bytes())
 		if err != nil {
 			return err
 		}
