@@ -1046,7 +1046,8 @@ int run_iter_fw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 		}
 
 		if (user_param->use_event) {
-			if (ctx_notify_send_recv_events(ctx)) {
+
+			if (ctx_notify_events(ctx->channel)) {
 				fprintf(stderr, "Failed to notify events to CQ");
 				return_value = FAILURE;
 				goto cleaning;

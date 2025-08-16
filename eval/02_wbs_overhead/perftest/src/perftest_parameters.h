@@ -602,7 +602,6 @@ struct perftest_parameters {
 	int 				dont_xchg_versions;
 	int 				ipv6;
 	int 				raw_ipv6;
-	int 				ai_family;
 	int 				report_per_port;
 	int 				use_odp;
 	int				use_hugepages;

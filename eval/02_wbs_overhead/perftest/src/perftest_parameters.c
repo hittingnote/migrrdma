@@ -461,13 +461,11 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 	if (connection_type != RawEth) {
 		printf("      --ipv6 ");
 		printf(" Use IPv6 GID. Default is IPv4\n");
-		printf("      --ipv6-addr=<IPv6> ");
-		printf(" Use IPv6 address for parameters negotiation. Default is IPv4\n");
 	}
 
 	// please note it is a different source_ip from raw_ethernet case
 	if (connection_type != RawEth) {
-		printf("      --bind_source_ip ");
+		printf("      --source_ip ");
 		printf(" Source IP of the interface used for connection establishment. By default taken from routing table.\n");
 	}
 
@@ -818,7 +816,6 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->retry_count			= DEF_RETRY_COUNT;
 	user_param->dont_xchg_versions		= 0;
 	user_param->ipv6			= 0;
-	user_param->ai_family			= AF_INET;
 	user_param->report_per_port		= 0;
 	user_param->use_odp			= 0;
 	user_param->use_hugepages		= 0;
@@ -1534,6 +1531,11 @@ static void force_dependecies(struct perftest_parameters *user_param)
 			fprintf(stderr, " SRD does not support RDMA_CM\n");
 			exit(1);
 		}
+		if (user_param->use_event == ON) {
+			printf(RESULT_LINE);
+			fprintf(stderr, " SRD does not support events\n");
+			exit(1);
+		}
 		user_param->cq_mod = 1;
 	}
 
@@ -2178,7 +2180,6 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int mmap_file_flag = 0;
 	static int mmap_offset_flag = 0;
 	static int ipv6_flag = 0;
-	static int ipv6_addr_flag = 0;
 	static int raw_ipv6_flag = 0;
 	static int report_per_port_flag = 0;
 	static int odp_flag = 0;
@@ -2330,7 +2331,6 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "mmap",		.has_arg = 1, .flag = &mmap_file_flag, .val = 1},
 			{ .name = "mmap-offset",	.has_arg = 1, .flag = &mmap_offset_flag, .val = 1},
 			{ .name = "ipv6",		.has_arg = 0, .flag = &ipv6_flag, .val = 1},
-			{ .name = "ipv6-addr",		.has_arg = 0, .flag = &ipv6_addr_flag, .val = 1},
 			#ifdef HAVE_IPV6
 			{ .name = "raw_ipv6",		.has_arg = 0, .flag = &raw_ipv6_flag, .val = 1},
 			#endif
@@ -2375,7 +2375,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			#if defined HAVE_OOO_ATTR
 			{.name = "use_ooo", .has_arg = 0, .flag = &use_ooo_flag, .val = 1},
 			#endif
-			{.name = "bind_source_ip", .has_arg = 1, .flag = &source_ip_flag, .val = 1},
+			{.name = "source_ip", .has_arg = 1, .flag = &source_ip_flag, .val = 1},
 			{0}
 		};
 		if (!duplicates_checker) {
@@ -2893,7 +2893,8 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					local_ip = optarg;
 					local_ip_flag = 0;
 				}
-				if (source_ip_flag) {
+				if (source_ip_flag)
+				{
 					user_param->has_source_ip = 1;
 					GET_STRING(user_param->source_ip, strdupa(optarg));
 					source_ip_flag = 0;
@@ -3052,10 +3053,6 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 		user_param->ipv6 = 1;
 	}
 
-	if (ipv6_addr_flag) {
-		user_param->ai_family = AF_INET6;
-	}
-
 	if (raw_ipv6_flag) {
 		if (user_param->is_new_raw_eth_param) {
 			if (user_param->is_server_ip) {
@@ -3161,12 +3158,8 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 		user_param->print_eth_func = &print_ethernet_vlan_header;
 		vlan_en = 0;
 	}
-	if (optind == argc - 1) {
+	if (optind < argc) {
 		GET_STRING(user_param->servername,strdupa(argv[optind]));
-
-	} else if (optind < argc) {
-		fprintf(stderr," Invalid Command line. Please check command rerun \n");
-		return 1;
 	}
 
 	if(user_param->connection_type != RawEth)
@@ -3521,14 +3514,17 @@ void print_report_bw (struct perftest_parameters *user_param, struct bw_report_d
 	run_inf_bi_factor = (user_param->duplex && user_param->test_method == RUN_INFINITELY) ? (user_param->verb == SEND ? 1 : 2) : 1 ;
 	tsize = run_inf_bi_factor * user_param->size;
 	num_of_calculated_iters *= (user_param->test_type == DURATION) ? 1 : num_of_qps;
-	location_arr = (user_param->noPeak) ? 0 : num_of_calculated_iters - 1;
 	/* support in GBS format */
 	format_factor = (user_param->report_fmt == MBS) ? 0x100000 : 125000000;
+	int location_count = (user_param->noPeak) ? num_of_calculated_iters : ((int)(1<<25) / user_param->size);	
+	location_arr = (user_param->noPeak) ? 0 : location_count - 1;
+	cycles_t last_count_cycle = user_param->tposted[0];
+	for(; location_arr<num_of_calculated_iters; location_arr+=location_count) {
+	sum_of_test_cycles = ((double)(user_param->tcompleted[location_arr] - last_count_cycle));
+	last_count_cycle = user_param->tcompleted[location_arr];
 
-	sum_of_test_cycles = ((double)(user_param->tcompleted[location_arr] - user_param->tposted[0]));
-
-	double bw_avg = ((double)tsize*num_of_calculated_iters * cycles_to_units) / (sum_of_test_cycles * format_factor);
-	double msgRate_avg = ((double)num_of_calculated_iters * cycles_to_units * run_inf_bi_factor) / (sum_of_test_cycles * 1000000);
+	double bw_avg = ((double)tsize*location_count * cycles_to_units) / (sum_of_test_cycles * format_factor);
+	double msgRate_avg = ((double)location_count * cycles_to_units * run_inf_bi_factor) / (sum_of_test_cycles * 1000000);
 
 	double bw_avg_p1 = ((double)tsize*user_param->iters_per_port[0] * cycles_to_units) / (sum_of_test_cycles * format_factor);
 	double msgRate_avg_p1 = ((double)user_param->iters_per_port[0] * cycles_to_units * run_inf_bi_factor) / (sum_of_test_cycles * 1000000);
@@ -3545,9 +3541,11 @@ void print_report_bw (struct perftest_parameters *user_param, struct bw_report_d
 		memset(my_bw_rep, 0, sizeof(struct bw_report_data));
 	}
 
+	
+	sum_of_test_cycles = ((double)(user_param->tcompleted[location_arr] - user_param->tposted[0]));
 	my_bw_rep->size = (unsigned long)user_param->size;
-	my_bw_rep->iters = num_of_calculated_iters;
-	my_bw_rep->bw_peak = (double)peak_up/peak_down;
+	my_bw_rep->iters = location_count;
+	my_bw_rep->bw_peak = sum_of_test_cycles * 1000 / cycles_to_units;
 	my_bw_rep->bw_avg = bw_avg;
 	my_bw_rep->msgRate_avg = msgRate_avg;
 	my_bw_rep->bw_avg_p1 = bw_avg_p1;
@@ -3559,7 +3557,7 @@ void print_report_bw (struct perftest_parameters *user_param, struct bw_report_d
 	if (!user_param->duplex || (user_param->verb == SEND && user_param->test_type == DURATION)
 			|| user_param->test_method == RUN_INFINITELY || user_param->connection_type == RawEth)
 		print_full_bw_report(user_param, my_bw_rep, NULL);
-
+	}
 	if (free_my_bw_rep == 1) {
 		free(my_bw_rep);
 	}
