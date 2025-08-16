@@ -157,3 +157,18 @@ All the scripts supporting live migration with and without RDMA pre-setup are in
 ## Artifact Evaluation
 
 Please refer to [this README](eval).
+
+Note: Before conducting the evaluations, please loose the limits on the file descriptors.
+
+```Bash
+$ ulimit -n 32768
+```
+
+To make this configuration effective system-wide, add the following in `/etc/security/limits.conf`:
+
+```Conf
+[Other users]			soft	nofile		32768
+[Other users]			hard	nofile		32768
+root					soft	nofile		32768
+root					hard	nofile		32768
+```
