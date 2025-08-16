@@ -34,7 +34,7 @@ elif [ "${migr_who}" == "send" ]; then
 				done &
 	sleep 2
 	./rdma_migr_demo.sh ${pre_setup} ${migr_dst} $@ -d ${ibdev} --use_old_post_send --run_infinitely ${partner} |
-				grep -E "DumpRDMA|DumpOthers|Transfer|RestoreRDMA|FullRestore" &
+				grep -E "DumpRDMA|DumpOthers|Transfer|RestoreRDMA|FullRestore|Wait-before-stop" &
 else
 	echo "Invalid argument!" > /dev/stderr
 fi
