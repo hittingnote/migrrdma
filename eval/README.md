@@ -28,4 +28,6 @@ the `eval_basic.sh` script will embed all the rest options to the brief options.
 Inside each directory is the scripts to reproduce the evaluations and plot the results.
 Please read the README inside to reproduce each of them.
 
-[Benefit of RDMA Pre-setup](01_pre_setup_benefit)
+[Eval 1: Benefit of RDMA Pre-setup](01_pre_setup_benefit)
+
+[Eval 2: Overhead of Wait-before-stop](02_wbs_overhead)
