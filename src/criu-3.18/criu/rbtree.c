@@ -352,3 +352,86 @@ void rb_replace_node(struct rb_node *victim, struct rb_node *new, struct rb_root
 	/* Copy the pointers/colour from the victim to the replacement */
 	*new = *victim;
 }
+
+/* rbtree_wrap */
+enum TRAV_DIRECTION {
+	GO_LEFT,
+	GO_RIGHT,
+	NO_DIRECTION,
+};
+
+struct rb_node *___search(const struct rb_node *target, struct rbtree_struct *rbtree,
+						struct rb_node **p_parent, struct rb_node ***p_insert, enum search_ops ops,
+						int (*compare)(const struct rb_node*, const struct rb_node*)) {
+	struct rb_node *parent = NULL;
+	struct rb_node **insert = &rbtree->tree.rb_node;
+	struct rb_node *node = rbtree->tree.rb_node;
+	enum TRAV_DIRECTION direction = NO_DIRECTION;
+
+	while(node) {
+		parent = node;
+
+		if(compare(target, node) < 0) {
+			node = node->rb_left;
+			insert = &(*insert)->rb_left;
+			direction = GO_LEFT;
+		}
+		else if(compare(target, node) > 0) {
+			node = node->rb_right;
+			insert = &(*insert)->rb_right;
+			direction = GO_RIGHT;
+		}
+		else {
+			switch(ops) {
+			case SEARCH_EXACTLY:
+			case SEARCH_LAST_PRECURSOR_INC_ITSELF:
+			case SEARCH_FIRST_SUCCESSOR_INC_ITSELF:
+				parent = NULL;
+				insert = NULL;
+				goto out;
+			case SEARCH_LAST_PRECURSOR:
+				node = node->rb_left;
+				insert = &(*insert)->rb_left;
+				direction = GO_LEFT;
+				break;
+			case SEARCH_FIRST_SUCCESSOR:
+				node = node->rb_right;
+				insert = &(*insert)->rb_right;
+				direction = GO_RIGHT;
+				break;
+			}
+		}
+	}
+
+	if((!parent) || (ops == SEARCH_EXACTLY))
+		goto out;
+
+	if(p_parent)
+		*p_parent = parent;
+
+	while(parent && (((ops & SEARCH_LAST_PRECURSOR) && direction == GO_LEFT) ||
+				((ops & SEARCH_FIRST_SUCCESSOR) && direction == GO_RIGHT))) {
+		struct rb_node *grandpa = rb_parent(parent);
+		if(!grandpa)
+			direction = NO_DIRECTION;
+		else if(grandpa->rb_left == parent)
+			direction = GO_LEFT;
+		else
+			direction = GO_RIGHT;
+		parent = grandpa;
+	}
+
+	node = parent;
+
+	if(p_insert)
+		*p_insert = insert;
+	
+	return node;
+
+out:
+	if(p_parent)
+		*p_parent = parent;
+	if(p_insert)
+		*p_insert = insert;
+	return node;
+}

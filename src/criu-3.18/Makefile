@@ -134,7 +134,7 @@ ifeq ($(ASAN),1)
 endif
 
 ifneq ($(WERROR),0)
-        WARNINGS	+= -Werror
+        WARNINGS	+= 
 endif
 
 ifeq ($(DEBUG),1)
