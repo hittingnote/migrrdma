@@ -91,13 +91,22 @@ fi
 
 for i in `j=1; while [ $j -le $iters_precopy ]; do echo $j; j=\`expr $j + 1\`; done`; do
 	mkdir /dev/shm/restorerdma/checkpoint1/pre_$i -p
-	runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/log.json --log-format json predump \
+	if [ ${docker_new} -ne 0 ]; then
+		runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v2.task/moby/${orig_cont_id}/log.json --log-format json predump \
+						--image-path /dev/shm/restorerdma/checkpoint1/pre_$i `if [ $i -ne 1 ]; then echo "--parent-path ../pre_\`expr $i - 1\`"; fi` \
+						--work-path /run/containerd/io.containerd.runtime.v2.task/moby/${orig_cont_id}/work/criu-work ${orig_cont_id}
+	else
+		runc --root /var/run/docker/runtime-runc/moby --log /run/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/log.json --log-format json predump \
 						--image-path /dev/shm/restorerdma/checkpoint1/pre_$i `if [ $i -ne 1 ]; then echo "--parent-path ../pre_\`expr $i - 1\`"; fi` \
 						--work-path /var/lib/containerd/io.containerd.runtime.v1.linux/moby/${orig_cont_id}/criu-work ${orig_cont_id}
+	fi
 done
 
 echo "Ready to notify"
 mkdir /dev/shm/dump_img
+if [ ${iters_precopy} -gt 0 ]; then
+	cp /dev/shm/restorerdma/checkpoint1/pre_* /dev/shm/dump_img/ -r
+fi
 ./src/wbs_external/wbs ${old_init_pid} /dev/shm/dump_img/
 if [ ${docker_new} -ne 0 ]; then
 	for pid in `get_exec_pid_v2 ${orig_cont}`; do
