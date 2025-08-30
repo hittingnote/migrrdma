@@ -454,6 +454,8 @@ static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
 	return ops;
 }
 
+#include "rdma_migr.h"
+
 static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 {
 	struct fd_link *link_old = p->link;
@@ -483,6 +485,9 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
 		}
 
 		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
+		if(is_rdma_dev(p->stat.st_rdev)) {
+			return -10;
+		}
 		err = dump_unsupp_fd(p, lfd, "chr", more, e);
 		p->link = link_old;
 		return err;
@@ -500,6 +505,10 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
 	struct fd_link link;
+
+	if(fd > pid->max_fd) {
+		pid->max_fd = fd;
+	}
 
 	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
 		pr_err("Can't get stat on %d\n", fd);
@@ -548,8 +557,11 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
 #endif
-		else
+		else {
+			if(is_rdma_event_fd(link))
+				return -10;
 			return dump_unsupp_fd(&p, lfd, "anon", link, e);
+		}
 
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
@@ -647,8 +659,13 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
-			if (ret)
-				break;
+			if (ret) {
+				if(ret == -10) {
+					ret = 0;
+					continue;
+				}
+ 				break;
+			}
 
 			ret = pb_write_one(img, &e, PB_FDINFO);
 			if (ret)
@@ -1726,6 +1743,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 		return -1;
 	case FD_TYPES__REG:
 		ret = collect_one_file_entry(fe, fe->reg->id, &fe->reg->base, &reg_file_cinfo);
+		if(!ret) {
+			ret = insert_id_fe_map_entry(fe->id, fe);
+		}
 		break;
 	case FD_TYPES__INETSK:
 		ret = collect_one_file_entry(fe, fe->isk->id, &fe->isk->base, &inet_sk_cinfo);

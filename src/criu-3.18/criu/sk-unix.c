@@ -1059,7 +1059,13 @@ static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct 
 	 * Some other task restores this file. Pretend that
 	 * we're another user of it.
 	 */
+	if(owner->pid->max_fd < 0) {
 	fd = find_unused_fd(owner, -1);
+	}
+	else {
+		fd = owner->pid->max_fd + 1;
+		owner->pid->max_fd++;
+	}
 	pr_info("`- will add fake %d fd\n", fd);
 
 	if (e != NULL) {

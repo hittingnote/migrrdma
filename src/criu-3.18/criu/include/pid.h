@@ -35,6 +35,7 @@ struct pid {
 	 * that caused task to stop.
 	 */
 	int stop_signo;
+	int max_fd;
 
 	/*
 	 * The @virt pid is one which used in the image itself and keeps
