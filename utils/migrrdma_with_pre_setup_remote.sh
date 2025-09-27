@@ -33,7 +33,7 @@ mkdir /dev/shm/dump /dev/shm/dumprdma /dev/shm/restorerdma/ /dev/shm/workpath
 
 #sleep 30
 
-ssh root@${migr_dst} `pwd`/utils/remote_start_cont.sh ${new_cont}
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo `pwd`/utils/remote_start_cont.sh ${new_cont}
 orig_cont_id=`docker inspect ${orig_cont} | grep Id | awk -F '[" ]+' '{print $4}'`
 old_init_pid=`docker inspect ${orig_cont} | grep \"Pid\" | awk -F '[", ]+' '{print $4}'`
 
@@ -60,8 +60,9 @@ runc --root /var/run/docker/runtime-runc/moby/ --log /dev/shm/${orig_cont_id}.js
 mkdir /dev/shm/predump_img
 cp /dev/shm/restorerdma/* /dev/shm/predump_img/ -r
 
-scp -q -r /dev/shm/restorerdma/ root@${migr_dst}:/dev/shm/
-ssh root@${migr_dst} `pwd`/utils/remote_prerestore.sh ${new_cont} ${migr_dst} `pwd`/utils/prerestore/rdma_prerestore
+chown ${SUDO_USER} /dev/shm/restorerdma/ -R
+scp -q -r -i `eval echo ~$SUDO_USER`/.ssh/id_rsa /dev/shm/restorerdma/ ${SUDO_USER}@${migr_dst}:/dev/shm/
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo `pwd`/utils/remote_prerestore.sh ${new_cont} ${migr_dst} `pwd`/utils/prerestore/rdma_prerestore
 
 mkdir /dev/shm/restorerdma/checkpoint1/
 if [ ${docker_new} -ne 0 ]; then
@@ -114,11 +115,12 @@ rm /dev/shm/restorerdma/* -r
 cp /dev/shm/dump_img/* /dev/shm/restorerdma/ -r
 
 start=`date +"%s.%N"`
-scp -q -r /dev/shm/restorerdma/ root@${migr_dst}:/dev/shm/
+chown ${SUDO_USER} /dev/shm/restorerdma/ -R
+scp -q -r -i `eval echo ~$SUDO_USER`/.ssh/id_rsa /dev/shm/restorerdma/ ${SUDO_USER}@${migr_dst}:/dev/shm/
 end=`date +"%s.%N"`
-ssh root@${migr_dst} `pwd`/utils/remote_restore.sh ${new_cont}
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo `pwd`/utils/remote_restore.sh ${new_cont}
 
-scp -q -r root@${migr_dst}:/dev/shm/restore*.log /dev/shm/
+scp -q -r -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst}:/dev/shm/restore*.log /dev/shm/
 
 transfer_time=`echo "scale=3; ($end - $start) * 1000.0" | bc`
 checkpoint_time_raw=`cat /dev/shm/dump_*.log | tail -n 1 | awk -F '[()]+' '{print $2}'`
@@ -141,5 +143,5 @@ echo "Wait-before-stop: ${wbc_time} ms"
 
 cd /dev/shm/
 rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r
-ssh root@${migr_dst} rm /dev/shm/*.json /dev/shm/checkpoint_time /dev/shm/*.log /dev/shm/dump_img/ /dev/shm/predump_img/ \
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo rm /dev/shm/*.json /dev/shm/checkpoint_time /dev/shm/*.log /dev/shm/dump_img/ /dev/shm/predump_img/ \
 						/dev/shm/restorerdma/ /dev/shm/workpath /dev/shm/*.sock /dev/shm/dump /dev/shm/dumprdma -r
