@@ -34,7 +34,9 @@ all: .mlnx_drv .rdma_core .criu .runc .cc_utils
 
 install: .mlnx_drv_install .rdma_core_install .criu_install .runc_install .mlnx_utils .mlnx_utils_install
 
-mlnx_install: .mlnx_drv_install
+load: .mlnx_drv_load
+
+mlnx_load: .mlnx_drv_install .mlnx_drv_load
 
 .mlnx_drv: $(mlnx_drv_src)
 	@cd src/mlnx-ofed-kernel-5.4/; \
@@ -59,6 +61,11 @@ mlnx_install: .mlnx_drv_install
 	@touch $@
 
 .mlnx_drv_install: .mlnx_drv
+	@cd src/mlnx-ofed-kernel-5.4/; \
+			make install
+	@touch $@
+
+.mlnx_drv_load: .mlnx_drv_install
 	@./src/mlnx-ofed-kernel-5.4/load.sh
 	@touch $@
 
@@ -105,6 +112,6 @@ mlnx_install: .mlnx_drv_install
 		cd ..;													\
 		tar -zxf mlnx-tools_5.2.0.orig.tar.gz;									\
 		cd mlnx-tools-5.2.0;											\
-		make install || true
+		make install 2> /dev/null || true
 	@touch $@
 
