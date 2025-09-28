@@ -124,6 +124,7 @@ struct ib_uverbs_async_event_desc {
 
 struct ib_uverbs_comp_event_desc {
 	__aligned_u64 cq_handle;
+	__u64			flag;
 };
 
 struct ib_uverbs_cq_moderation_caps {

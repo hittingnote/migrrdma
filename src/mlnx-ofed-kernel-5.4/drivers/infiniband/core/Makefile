@@ -48,8 +48,9 @@ ib_uverbs-y :=			uverbs_main.o uverbs_cmd.o uverbs_marshall.o \
 				uverbs_std_types_async_fd.o \
 				uverbs_std_types_srq.o \
 				uverbs_std_types_wq.o \
-				uverbs_std_types_qp.o
-
+				uverbs_std_types_qp.o rdma_footprint.o rbtree_core.o \
+				res_mapping_kern.o res_mapping_user.o migrrdma_service.o #pause_ud_signal.o \
+				migr_channel.o migrrdma_service.o
 
 ib_core-$(CONFIG_INFINIBAND_USER_MEM) += umem.o peer_mem.o 
 ib_core-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += umem_odp.o

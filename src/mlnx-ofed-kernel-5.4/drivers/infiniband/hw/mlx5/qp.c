@@ -1103,6 +1103,8 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		ubuffer->umem = NULL;
 	}
 
+	qp->ibqp.buf_addr = ucmd->buf_addr;
+
 	*inlen = MLX5_ST_SZ_BYTES(create_qp_in) +
 		 MLX5_FLD_SZ_BYTES(create_qp_in, pas[0]) * ncont;
 	*in = kvzalloc(*inlen, GFP_KERNEL);
@@ -1134,6 +1136,8 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		mlx5_ib_dbg(dev, "map failed\n");
 		goto err_free;
 	}
+
+	qp->ibqp.db_addr = ucmd->db_addr;
 
 	return 0;
 
@@ -3228,6 +3232,8 @@ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attr,
 		err = get_qp_uidx(qp, &params);
 		if (err)
 			goto free_qp;
+		
+		qp->ibqp.usr_idx = params.uidx;
 	}
 	err = process_create_flags(dev, qp, attr);
 	if (err)
