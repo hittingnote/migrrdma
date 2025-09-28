@@ -98,4 +98,4 @@ echo "FullRestore: `echo \"scale=3; ${partial_restore} + ${full_restore}\" | bc`
 echo "RestoreRDMA: ${restore_rdma} ms"
 
 cd /dev/shm/
-rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r
+rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r 2> /dev/null

@@ -44,11 +44,11 @@ ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo `pwd`/u
 
 mkdir /dev/shm/restorerdma/checkpoint1/
 
-while [ -z "`ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} ls /dev/shm/restore_*.log 2> /dev/null`" ]; do
+while [ -z "`ssh -i $(eval echo ~$SUDO_USER)/.ssh/id_rsa ${SUDO_USER}@${migr_dst} ls /dev/shm/restore_*.log 2> /dev/null`" ]; do
 	sleep 1
 done
 
-while [ -n "`ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} ps -C criu | grep -v PID`" ]; do
+while [ -n "`ssh -i $(eval echo ~$SUDO_USER)/.ssh/id_rsa ${SUDO_USER}@${migr_dst} ps -C criu | grep -v PID`" ]; do
 	sleep 1
 done
 
@@ -88,6 +88,6 @@ echo "FullRestore: `echo \"scale=3; ${partial_restore} + ${full_restore}\" | bc`
 echo "RestoreRDMA: ${restore_rdma} ms"
 
 cd /dev/shm/
-rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r
+rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r 2> /dev/null
 ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo rm /dev/shm/*.json /dev/shm/checkpoint_time /dev/shm/*.log /dev/shm/dump_img/ /dev/shm/predump_img/ \
-						/dev/shm/restorerdma/ /dev/shm/workpath /dev/shm/*.sock /dev/shm/dump /dev/shm/dumprdma -r
+						/dev/shm/restorerdma/ /dev/shm/workpath /dev/shm/*.sock /dev/shm/dump /dev/shm/dumprdma -r 2> /dev/null
