@@ -142,6 +142,6 @@ echo "FullRestore: ${restore_time} ms"
 echo "Wait-before-stop: ${wbc_time} ms"
 
 cd /dev/shm/
-rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r
+rm *.json checkpoint_time *.log dump_img/ predump_img/ restorerdma/ workpath *.sock dump dumprdma -r 2> /dev/null
 ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo rm /dev/shm/*.json /dev/shm/checkpoint_time /dev/shm/*.log /dev/shm/dump_img/ /dev/shm/predump_img/ \
-						/dev/shm/restorerdma/ /dev/shm/workpath /dev/shm/*.sock /dev/shm/dump /dev/shm/dumprdma -r
+						/dev/shm/restorerdma/ /dev/shm/workpath /dev/shm/*.sock /dev/shm/dump /dev/shm/dumprdma -r 2> /dev/null
