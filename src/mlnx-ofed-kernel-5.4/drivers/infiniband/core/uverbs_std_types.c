@@ -122,9 +122,6 @@ static int uverbs_free_pd(struct ib_uobject *uobject,
 	if (ret)
 		return ret;
 
-	unregister_pd_handle_mapping(attrs->ufile, pd);
-	deregister_pd_from_footprint(pd);
-
 	ib_dealloc_pd_user(pd, &attrs->driver_udata);
 	return 0;
 }
@@ -162,7 +159,6 @@ uverbs_completion_event_file_destroy_uobj(struct ib_uobject *uobj,
 			     uobj);
 
 	ib_uverbs_free_event_queue(&file->ev_queue);
-	deregister_uverbs_completion_event_file_from_footprint(file);
 	return 0;
 }
 
@@ -178,7 +174,7 @@ DECLARE_UVERBS_NAMED_OBJECT(
 			     uverbs_completion_event_file_destroy_uobj,
 			     &uverbs_event_fops,
 			     "[infinibandevent]",
-			     O_RDWR));
+			     O_RDONLY));
 
 DECLARE_UVERBS_NAMED_METHOD_DESTROY(
 	UVERBS_METHOD_MW_DESTROY,
