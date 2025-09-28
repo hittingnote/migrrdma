@@ -42,7 +42,7 @@ fi
 sleep 60
 
 docker rm -f test
-ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo docker rm -f test1
-ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo docker rm -f test1
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo docker rm -f test1 2> /dev/null
+ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${migr_dst} sudo docker rm -f test1 2> /dev/null
 ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${partner} sudo pkill -9 `echo $@ | awk '{print $1}'`
 ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${partner} sudo pkill -9 migrrdma_daemon
