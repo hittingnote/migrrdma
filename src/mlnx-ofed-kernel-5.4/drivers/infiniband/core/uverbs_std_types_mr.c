@@ -33,11 +33,15 @@
 #include "rdma_core.h"
 #include "uverbs.h"
 #include <rdma/uverbs_std_types.h>
+#include "rdma_footprint.h"
 
 static int uverbs_free_mr(struct ib_uobject *uobject,
 			  enum rdma_remove_reason why,
 			  struct uverbs_attr_bundle *attrs)
 {
+	unregister_mr_handle_mapping(attrs->ufile, (struct ib_mr *)uobject->object);
+	deregister_mr_from_footprint((struct ib_mr *)uobject->object);
+	deregister_mr_from_uwrite_footprint((struct ib_mr *)uobject->object);
 	return ib_dereg_mr_user((struct ib_mr *)uobject->object,
 				&attrs->driver_udata);
 }

@@ -334,6 +334,9 @@ static int uverbs_process_attr(struct bundle_priv *pbundle,
 			if (put_user(id, &pbundle->user_attrs[uattr_idx].data))
 				return -EFAULT;
 		}
+		else if (spec->type == UVERBS_ATTR_TYPE_FD) {
+			o_attr->uobject->id = uattr->data_s64;
+		}
 
 		break;
 

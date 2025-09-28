@@ -41,6 +41,7 @@
 #include "uverbs.h"
 #include "core_priv.h"
 #include "rdma_core.h"
+#include "rdma_footprint.h"
 
 static void uverbs_uobject_free(struct kref *ref)
 {
@@ -927,6 +928,39 @@ uverbs_get_uobject_from_file(u16 object_id, enum uverbs_obj_access access,
 {
 	const struct uverbs_api_object *obj =
 		uapi_get_object(attrs->ufile->device->uapi, object_id);
+
+	if(uobj_get_type(attrs, UVERBS_OBJECT_PD) == obj) {
+		int handle, err;
+		err = get_pd_handle(attrs->ufile, id, &handle);
+		if(err)
+			return err;
+		
+		id = (s64)handle;
+	}
+	else if(uobj_get_type(attrs, UVERBS_OBJECT_CQ) == obj) {
+		int handle, err;
+		err = get_cq_handle(attrs->ufile, id, &handle);
+		if(!err)
+			id = (s64)handle;
+	}
+	else if(uobj_get_type(attrs, UVERBS_OBJECT_MR) == obj) {
+		int handle, err;
+		err = get_mr_handle(attrs->ufile, id, &handle);
+		if(!err)
+			id = (s64)handle;
+	}
+	else if(uobj_get_type(attrs, UVERBS_OBJECT_QP) == obj) {
+		int handle, err;
+		err = get_qp_handle(attrs->ufile, id, &handle);
+		if(!err)
+			id = (s64)handle;
+	}
+	else if(uobj_get_type(attrs, UVERBS_OBJECT_SRQ) == obj) {
+		int handle, err;
+		err = get_srq_handle(attrs->ufile, id, &handle);
+		if(!err)
+			id = (s64)handle;
+	}
 
 	switch (access) {
 	case UVERBS_ACCESS_READ:
