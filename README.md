@@ -79,6 +79,7 @@ $ ./container_init.sh
 ```Bash
 $ make
 $ sudo make install
+$ sudo make load
 ```
 
 Note: Feel free to ignore the error message during the installation of `mlnx-tools`.
@@ -88,8 +89,8 @@ After reboot, the server loads the regular RDMA driver by default.
 Thus, you need to execute the following commands to install the MigrRDMA driver again:
 
 ```Bash
-$ sudo rm .mlnx_drv_install
-$ sudo make mlnx_install
+$ sudo rm .mlnx_drv_install .mlnx_drv_load
+$ sudo make mlnx_load
 ```
 
 ### Verify
