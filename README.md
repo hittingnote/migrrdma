@@ -145,15 +145,19 @@ $ sudo ./migrrdma_daemon [DEV]
 
 where [DEV] is the name of one of the devices listed in the first column of `show_gids`.
 
-Besides, add `./rdma_migr_demo.sh with_pre_setup (or wo_pre_setup) [IP address of migr_dst]` before the commands executed by the migration source, e.g.,
+Besides, add `./rdma_migr_demo.sh with_pre_setup (or wo_pre_setup) [IP address of migr_dst] [the number of memory pre-copy iterations]` before the commands executed by the migration source, e.g.,
 
 ```Bash
 $ cd [ROOT directory of this repository]
-$ ./rdma_migr_demo.sh with_pre_setup [IP address of migr_dst] ib_send_bw ...
+$ ./rdma_migr_demo.sh with_pre_setup [IP address of migr_dst] [the number of memory pre-copy iterations] ib_send_bw ...
 ```
 
 The `rdma_migr_demo.sh` first starts a container that runs the commands started from the 3rd argument (./rdma_migr_demo.sh is the 0th argument), and starts live migration after 30 seconds.
 All the scripts supporting live migration with and without RDMA pre-setup are in [utils/](./utils).
+
+For the `with_pre_setup` case, you can specify the number of memory pre-copy iterations when executing `./rdma_migr_demo.sh`.
+Before stop-and-copy, the demo will perform communication pre-setup, plus the memory pre-copy for the specified number of iterations.
+For the `wo_pre_setup` case, our script will discard the number of memory pre-copy iterations.
 
 ## Artifact Evaluation
 
