@@ -5,15 +5,16 @@ migr_who=$2
 partner=$3
 migr_dst=$4
 ibdev=$5
+num_iter=$6
 
-shift 5
+shift 6
 
 cd ../
 
 ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${partner} sudo `pwd`/src/migrrdma_daemon/migrrdma_daemon ${ibdev} &> /dev/null &
 
 if [ "${migr_who}" == "recv" ]; then
-	./rdma_migr_demo.sh ${pre_setup} ${migr_dst} $@ -d ${ibdev} --use_old_post_send --run_infinitely |
+	./rdma_migr_demo.sh ${pre_setup} ${migr_dst} ${num_iter} $@ -d ${ibdev} --use_old_post_send --run_infinitely |
 				grep -E "DumpRDMA|DumpOthers|Transfer|RestoreRDMA|FullRestore" &
 	sleep 2
 	ssh -i `eval echo ~$SUDO_USER`/.ssh/id_rsa ${SUDO_USER}@${partner} $@ -d ${ibdev} --use_old_post_send --run_infinitely \
@@ -33,7 +34,7 @@ elif [ "${migr_who}" == "send" ]; then
 					echo "[FROM Partner (Receiver)]: $LINE" > /dev/stderr
 				done &
 	sleep 2
-	./rdma_migr_demo.sh ${pre_setup} ${migr_dst} $@ -d ${ibdev} --use_old_post_send --run_infinitely ${partner} |
+	./rdma_migr_demo.sh ${pre_setup} ${migr_dst} ${num_iter} $@ -d ${ibdev} --use_old_post_send --run_infinitely ${partner} |
 				grep -E "DumpRDMA|DumpOthers|Transfer|RestoreRDMA|FullRestore|Wait-before-stop" &
 else
 	echo "Invalid argument!" > /dev/stderr
