@@ -19,24 +19,37 @@ This is done by one of the existing repository:
 Here, we just copy the [`many-to-one`](https://github.com/chengwx1992/perftest/tree/many_to_one) branch in our directory.
 You can click the commit message behind the perftest directory to see what exact change was made.
 
-In the extended `perftest`, the client connects to multiple servers and issues verbs operations.
-Thus, you need to type the following commands:
-
-On the servers:
+##### Compile
 
 ```Bash
-$ for i in {1..4}; do ib_send_bw -d [mlnx_dev] --use_old_post_send --run_infinitely -p `expr 12345 + $i` [other options] & done
+$ cd perftest
+$ ./autogen.sh
+$ ./configure
+$ make
+```
+
+Note: Do not execute `sudo make install` to overwrite the original binary of `perftest`.
+
+##### Run
+
+On the servers (Execute the original binary):
+
+```Bash
+$ for i in {1..4}; do ib_send_bw -d [mlnx_dev] --use_old_post_send --run_infinitely -p `expr 12345 + $i` [other options] -D [duration] & done
 ```
 
 Note: `--run_infinitely` is necessary here because the extended `perftest` only supports this option.
 Besides, you also need to ensure the port number (`-p` option) is consecutive.
 
-On the client:
+On the client (Execute the binary we've just compiled):
 
 ```Bash
-ib_send_bw -d [mlnx_dev] --use_old_post_send --run_infinitely -p 12346 [other options] `for i in {1..4}; do echo "${server_ip}"; done`
+$ cd perftest
+$ ./ib_send_bw -d [mlnx_dev] --use_old_post_send --run_infinitely -p 12346 [other options] -D [duration] `for i in {1..4}; do echo "${server_ip}"; done`
 ```
 
-Note: You need to specify the IP addresses of all the servers. If the servers reside on a single node, just repeat the IP address of the node as many times as the number of servers (in this example, we need to repeat 4 times).
-
-If you want many senders to issue verbs operations to one receiver, just add `--reversed` flag in both commands to reverse the traffic.
+Note:
+* You need to specify the IP addresses of all the servers. If the servers reside on a single node, just repeat the IP address of the node as many times as the number of servers (in this example, we need to repeat 4 times).
+* The modified `perftest` does not exit elegantly. You need to use `Ctrl+C` or `pkill -9 ib_send_bw` to kill them.
+* To run RDMA live migration with the varying numbers of partners, we recommend modifying [`container_init.sh`](../../container_init.sh) to build the modified `perftest` inside the container, then rebuild the container image.
+* If you want many senders to issue verbs operations to one receiver, just add `--reversed` flag in both commands to reverse the traffic.
