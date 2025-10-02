@@ -50,7 +50,6 @@ enum {
 	CQ_OK					=  0,
 	CQ_EMPTY				= -1,
 	CQ_POLL_ERR				= -2,
-	CQ_SHADED				= -3,
 	CQ_POLL_NODATA				= ENOENT
 };
 
@@ -151,37 +150,9 @@ static void *get_sw_cqe(struct mlx5_cq *cq, int n)
 	}
 }
 
-static void *migrrdma_next_cqe_sw(struct mlx5_cq *cq, int *err) {
-	void *cqe = get_sw_cqe(cq, cq->fake_index);
-	*err = CQ_OK;
-	return cqe;
-}
-
-static void *next_cqe_sw(struct mlx5_cq *cq, int *err)
+static void *next_cqe_sw(struct mlx5_cq *cq)
 {
-	void *tmp_cqe = cq->tmp_buf.buf +
-						(cq->tmp_cons_index & cq->verbs_cq.cq.cqe) *
-							cq->cqe_sz;
-	struct mlx5_cqe64 *tmp_cqe64;
-
-	tmp_cqe64 = (cq->cqe_sz == 64)? tmp_cqe: tmp_cqe + 64;
-
-	if(cq->shaded_flag &&
-			(likely(mlx5dv_get_cqe_opcode(tmp_cqe64) != MLX5_CQE_INVALID) &&
-				!((tmp_cqe64->op_own & MLX5_CQE_OWNER_MASK) ^
-				!!(cq->tmp_cons_index & (cq->verbs_cq.cq.cqe + 1))))) {
-		*err = CQ_SHADED;
-		cq->tmp_cons_index++;
-		return tmp_cqe;
-	}
-	else {
-		cq->shaded_flag = 0;
-		*err = CQ_OK;
-		tmp_cqe = get_sw_cqe(cq, cq->cons_index);
-		if(tmp_cqe)
-			cq->cons_index++;
-		return tmp_cqe;
-	}
+	return get_sw_cqe(cq, cq->cons_index);
 }
 
 static void update_cons_index(struct mlx5_cq *cq)
@@ -189,8 +160,7 @@ static void update_cons_index(struct mlx5_cq *cq)
 	cq->dbrec[MLX5_CQ_SET_CI] = htobe32(cq->cons_index & 0xffffff);
 }
 
-static inline void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe, struct mlx5_wq *wq, int idx,
-						struct mlx5_cq *cq, int is_shaded)
+static inline void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe, struct mlx5_wq *wq, int idx)
 {
 	switch (be32toh(cqe->sop_drop_qpn) >> 24) {
 	case MLX5_OPCODE_RDMA_WRITE_IMM:
@@ -221,10 +191,7 @@ static inline void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe, st
 	case MLX5_OPCODE_UMR:
 	case MLX5_OPCODE_SET_PSV:
 	case MLX5_OPCODE_NOP:
-		if(likely(!is_shaded && !cq->migr_flag))
-			wc->opcode = wq->wr_data[idx];
-		else
-			wc->opcode = wq->tmp_wr_data[idx];
+		wc->opcode = wq->wr_data[idx];
 		break;
 	case MLX5_OPCODE_TSO:
 		wc->opcode    = IBV_WC_TSO;
@@ -232,12 +199,8 @@ static inline void handle_good_req(struct ibv_wc *wc, struct mlx5_cqe64 *cqe, st
 	}
 }
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 static inline int handle_responder_lazy(struct mlx5_cq *cq, struct mlx5_cqe64 *cqe,
-					struct mlx5_resource *cur_rsc, struct mlx5_srq *srq, int is_shaded)
+					struct mlx5_resource *cur_rsc, struct mlx5_srq *srq)
 {
 	uint16_t	wqe_ctr;
 	struct mlx5_wq *wq;
@@ -246,25 +209,8 @@ static inline int handle_responder_lazy(struct mlx5_cq *cq, struct mlx5_cqe64 *c
 
 	if (srq) {
 		wqe_ctr = be16toh(cqe->wqe_counter);
-		if(likely(!is_shaded && !cq->migr_flag))
-			cq->verbs_cq.cq_ex.wr_id = srq->wrid[wqe_ctr];
-		else
-			cq->verbs_cq.cq_ex.wr_id = srq->tmp_wrid[wqe_ctr];
-		if(!is_shaded) {
-			if(!srq->migr_flag)
-				mlx5_free_srq_wqe(srq, wqe_ctr);
-			else {
-				mlx5_spin_lock(&srq->lock);
-				srq->staged_index[(srq->staged_head++) % srq->onflight_cap] = wqe_ctr;
-				mlx5_spin_unlock(&srq->lock);
-			}
-			{
-				struct srq_recv_wr_item *cur_recv_wr =
-							srq->onflight_recv_wr + wqe_ctr;
-				list_del(&cur_recv_wr->list);
-				srq->n_acked++;
-		}
-		}
+		cq->verbs_cq.cq_ex.wr_id = srq->wrid[wqe_ctr];
+		mlx5_free_srq_wqe(srq, wqe_ctr);
 		if (cqe->op_own & MLX5_INLINE_SCATTER_32)
 			err = mlx5_copy_to_recv_srq(srq, wqe_ctr, cqe,
 						    be32toh(cqe->byte_cnt));
@@ -280,26 +226,9 @@ static inline int handle_responder_lazy(struct mlx5_cq *cq, struct mlx5_cqe64 *c
 			wq = &(rsc_to_mrwq(cur_rsc)->rq);
 		}
 
-		wqe_ctr = be16toh(cqe->wqe_counter) & (wq->wqe_cnt - 1);
-		if(likely(!is_shaded && !cq->migr_flag))
-			cq->verbs_cq.cq_ex.wr_id = wq->wrid[wqe_ctr];
-		else
-			cq->verbs_cq.cq_ex.wr_id = wq->tmp_wrid[wqe_ctr];
-		if(!is_shaded) {
-			++wq->tail;
-			wq->n_acked++;
-			if(ibv_get_signal()) {
-				wq->commit_head = wq->head;
-				wq->commit_posted = wq->n_posted;
-			}
-			qp->onflight_tail++;
-#if 0
-			if(qp->switch_qp) {
-				mlx5_destroy_qp_tmp(&qp->switch_qp->verbs_qp.qp);
-				qp->switch_qp = NULL;
-			}
-#endif
-		}
+		wqe_ctr = wq->tail & (wq->wqe_cnt - 1);
+		cq->verbs_cq.cq_ex.wr_id = wq->wrid[wqe_ctr];
+		++wq->tail;
 		if (cqe->op_own & MLX5_INLINE_SCATTER_32)
 			err = mlx5_copy_to_recv_wqe(qp, wqe_ctr, cqe,
 						    be32toh(cqe->byte_cnt));
@@ -320,89 +249,8 @@ static inline int get_csum_ok(struct mlx5_cqe64 *cqe)
 	       << IBV_WC_IP_CSUM_OK_SHIFT;
 }
 
-static inline int migrrdma_handle_responder(struct mlx5_cq *cq, struct ibv_wc *wc, struct mlx5_cqe64 *cqe,
-				   struct mlx5_resource *cur_rsc, struct mlx5_srq *srq, int is_shaded) {
-	uint16_t	wqe_ctr;
-	struct mlx5_wq *wq;
-	struct mlx5_qp *qp = rsc_to_mqp(cur_rsc);
-	uint8_t g;
-	int err = 0;
-
-	wc->byte_len = be32toh(cqe->byte_cnt);
-	if (srq) {
-		if(srq->inspect_flag) {
-			struct srq_recv_wr_item *cur_item;
-		wqe_ctr = be16toh(cqe->wqe_counter);
-			cur_item = srq->migrrdma_onflight + wqe_ctr;
-			list_del(&cur_item->list);
-			srq->migrrdma_acked++;
-		}
-	} else {
-		if (likely(cur_rsc->type == MLX5_RSC_TYPE_QP)) {
-			wq = &qp->rq;
-			if (qp->qp_cap_cache & MLX5_RX_CSUM_VALID)
-				wc->wc_flags |= get_csum_ok(cqe);
-		} else {
-			wq = &(rsc_to_mrwq(cur_rsc)->rq);
-		}
-
-		wqe_ctr = qp->migrrdma_rq.tail & (wq->wqe_cnt - 1);
-		if(likely(!is_shaded && !cq->migr_flag))
-			wc->wr_id = wq->wrid[wqe_ctr];
-		else
-			wc->wr_id = wq->tmp_wrid[wqe_ctr];
-
-		if(!is_shaded) {
-			++qp->migrrdma_rq.tail;
-			qp->migrrdma_rq.n_acked++;
-//			qp->onflight_tail++;
-		}
-
-#if 0
-		if (cqe->op_own & MLX5_INLINE_SCATTER_32)
-			err = mlx5_copy_to_recv_wqe(qp, wqe_ctr, cqe,
-						    wc->byte_len);
-		else if (cqe->op_own & MLX5_INLINE_SCATTER_64)
-			err = mlx5_copy_to_recv_wqe(qp, wqe_ctr, cqe - 1,
-						    wc->byte_len);
-#endif
-	}
-	if (err)
-		return err;
-
-	switch (cqe->op_own >> 4) {
-	case MLX5_CQE_RESP_WR_IMM:
-		wc->opcode	= IBV_WC_RECV_RDMA_WITH_IMM;
-		wc->wc_flags	|= IBV_WC_WITH_IMM;
-		wc->imm_data = cqe->imm_inval_pkey;
-		break;
-	case MLX5_CQE_RESP_SEND:
-		wc->opcode   = IBV_WC_RECV;
-		break;
-	case MLX5_CQE_RESP_SEND_IMM:
-		wc->opcode	= IBV_WC_RECV;
-		wc->wc_flags	|= IBV_WC_WITH_IMM;
-		wc->imm_data = cqe->imm_inval_pkey;
-		break;
-	case MLX5_CQE_RESP_SEND_INV:
-		wc->opcode = IBV_WC_RECV;
-		wc->wc_flags |= IBV_WC_WITH_INV;
-		wc->invalidated_rkey = be32toh(cqe->imm_inval_pkey);
-		break;
-	}
-	wc->slid	   = be16toh(cqe->slid);
-	wc->sl		   = (be32toh(cqe->flags_rqpn) >> 24) & 0xf;
-	wc->src_qp	   = be32toh(cqe->flags_rqpn) & 0xffffff;
-	wc->dlid_path_bits = cqe->ml_path & 0x7f;
-	g = (be32toh(cqe->flags_rqpn) >> 28) & 3;
-	wc->wc_flags |= g ? IBV_WC_GRH : 0;
-	wc->pkey_index     = be32toh(cqe->imm_inval_pkey) & 0xffff;
-
-	return IBV_WC_SUCCESS;
-}
-
-static inline int handle_responder(struct mlx5_cq *cq, struct ibv_wc *wc, struct mlx5_cqe64 *cqe,
-				   struct mlx5_resource *cur_rsc, struct mlx5_srq *srq, int is_shaded)
+static inline int handle_responder(struct ibv_wc *wc, struct mlx5_cqe64 *cqe,
+				   struct mlx5_resource *cur_rsc, struct mlx5_srq *srq)
 {
 	uint16_t	wqe_ctr;
 	struct mlx5_wq *wq;
@@ -413,25 +261,8 @@ static inline int handle_responder(struct mlx5_cq *cq, struct ibv_wc *wc, struct
 	wc->byte_len = be32toh(cqe->byte_cnt);
 	if (srq) {
 		wqe_ctr = be16toh(cqe->wqe_counter);
-		if(likely(!is_shaded && !cq->migr_flag))
-			wc->wr_id = srq->wrid[wqe_ctr];
-		else
-			wc->wr_id = srq->tmp_wrid[wqe_ctr];
-		if(!is_shaded) {
-			if(!srq->migr_flag)
-				mlx5_free_srq_wqe(srq, wqe_ctr);
-			else {
-				mlx5_spin_lock(&srq->lock);
-				srq->staged_index[(srq->staged_head++) % srq->onflight_cap] = wqe_ctr;
-				mlx5_spin_unlock(&srq->lock);
-			}
-			{
-				struct srq_recv_wr_item *cur_recv_wr =
-							srq->onflight_recv_wr + wqe_ctr;
-				list_del(&cur_recv_wr->list);
-			srq->n_acked++;
-		}
-		}
+		wc->wr_id = srq->wrid[wqe_ctr];
+		mlx5_free_srq_wqe(srq, wqe_ctr);
 		if (cqe->op_own & MLX5_INLINE_SCATTER_32)
 			err = mlx5_copy_to_recv_srq(srq, wqe_ctr, cqe,
 						    wc->byte_len);
@@ -447,26 +278,9 @@ static inline int handle_responder(struct mlx5_cq *cq, struct ibv_wc *wc, struct
 			wq = &(rsc_to_mrwq(cur_rsc)->rq);
 		}
 
-		wqe_ctr = be16toh(cqe->wqe_counter) & (wq->wqe_cnt - 1);
-		if(likely(!is_shaded && !cq->migr_flag))
-			wc->wr_id = wq->wrid[wqe_ctr];
-		else
-			wc->wr_id = wq->tmp_wrid[wqe_ctr];
-		if(!is_shaded) {
-			++wq->tail;
-			wq->n_acked++;
-			if(ibv_get_signal()) {
-				wq->commit_head = wq->head;
-				wq->commit_posted = wq->n_posted;
-			}
-			qp->onflight_tail++;
-#if 0
-			if(qp->switch_qp) {
-				mlx5_destroy_qp_tmp(&qp->switch_qp->verbs_qp.qp);
-				qp->switch_qp = NULL;
-			}
-#endif
-		}
+		wqe_ctr = wq->tail & (wq->wqe_cnt - 1);
+		wc->wr_id = wq->wrid[wqe_ctr];
+		++wq->tail;
 		if (cqe->op_own & MLX5_INLINE_SCATTER_32)
 			err = mlx5_copy_to_recv_wqe(qp, wqe_ctr, cqe,
 						    wc->byte_len);
@@ -710,38 +524,6 @@ static inline int get_cur_rsc(struct mlx5_context *mctx,
 
 }
 
-static inline int migrrdma_get_next_cqe(struct mlx5_cq *cq,
-				    struct mlx5_cqe64 **pcqe64,
-				    void **pcqe) {
-	void *cqe;
-	struct mlx5_cqe64 *cqe64;
-	int err = CQ_OK;
-
-	cqe = migrrdma_next_cqe_sw(cq, &err);
-	if(!cqe) {
-		return CQ_EMPTY;
-	}
-
-	cqe64 = (cq->cqe_sz == 64) ? cqe : cqe + 64;
-
-	pthread_rwlock_wrlock(&cq->fake_index_rwlock);
-	++cq->fake_index;
-	pthread_rwlock_unlock(&cq->fake_index_rwlock);
-
-	VALGRIND_MAKE_MEM_DEFINED(cqe64, sizeof *cqe64);
-
-	/*
-	 * Make sure we read CQ entry contents after we've checked the
-	 * ownership bit.
-	 */
-	udma_from_device_barrier();
-
-	*pcqe64 = cqe64;
-	*pcqe = cqe;
-
-	return err;
-}
-
 static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
 				    struct mlx5_cqe64 **pcqe64,
 				    void **pcqe)
@@ -752,15 +534,14 @@ static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
 {
 	void *cqe;
 	struct mlx5_cqe64 *cqe64;
-	int err = CQ_OK;
 
-	cqe = next_cqe_sw(cq, &err);
+	cqe = next_cqe_sw(cq);
 	if (!cqe)
 		return CQ_EMPTY;
 
 	cqe64 = (cq->cqe_sz == 64) ? cqe : cqe + 64;
 
-//	++cq->cons_index;
+	++cq->cons_index;
 
 	VALGRIND_MAKE_MEM_DEFINED(cqe64, sizeof *cqe64);
 
@@ -784,7 +565,7 @@ static inline int mlx5_get_next_cqe(struct mlx5_cq *cq,
 	*pcqe64 = cqe64;
 	*pcqe = cqe;
 
-	return err;
+	return CQ_OK;
 }
 
 static int handle_tag_matching(struct mlx5_cq *cq,
@@ -915,368 +696,13 @@ static inline int is_odp_pfault_err(struct mlx5_err_cqe *ecqe)
 	       ecqe->vendor_err_synd == MLX5_CQE_VENDOR_SYNDROME_ODP_PFAULT;
 }
 
-static inline int migrrdma_parse_cqe(struct mlx5_cq *cq,
-				 struct mlx5_cqe64 *cqe64,
-				 void *cqe,
-				 struct mlx5_resource **cur_rsc,
-				 struct mlx5_srq **cur_srq,
-				 struct ibv_wc *wc, struct ibv_qp **qps, struct ibv_srq **srqs,
-				 int cqe_ver, int lazy, int is_shaded) {
-	struct mlx5_wq *wq;
-	uint16_t wqe_ctr;
-	uint32_t qpn;
-	uint32_t srqn_uidx;
-	int idx;
-	uint8_t opcode;
-	struct mlx5_err_cqe *ecqe;
-	struct mlx5_sigerr_cqe *sigerr_cqe;
-	struct mlx5_mkey *mkey;
-	int err;
-	struct mlx5_qp *mqp;
-	struct mlx5_context *mctx;
-	uint8_t is_srq;
-
-again:
-	is_srq = 0;
-	err = 0;
-
-	mctx = to_mctx(cq->verbs_cq.cq.context);
-	qpn = be32toh(cqe64->sop_drop_qpn) & 0xffffff;
-	if (lazy) {
-		cq->cqe64 = cqe64;
-		cq->flags &= (~MLX5_CQ_LAZY_FLAGS);
-	} else {
-		wc->wc_flags = 0;
-		if(!is_shaded && !cq->migr_flag) {
-			uint32_t *qpn_dict = cq->verbs_cq.cq.context->device->qpn_dict;
-			wc->qp_num = qpn_dict[qpn];
-		}
-		else {
-			int err;
-			uint32_t vqpn;
-			err = get_vqpn_from_old(qpn, &vqpn);
-			if(err) {
-				return CQ_POLL_ERR;
-			}
-			wc->qp_num = vqpn;
-		}
-	}
-
-	opcode = mlx5dv_get_cqe_opcode(cqe64);
-	switch (opcode) {
-	case MLX5_CQE_REQ:
-	{
-		mqp = get_req_context(mctx, cur_rsc,
-				      (cqe_ver ? (be32toh(cqe64->srqn_uidx) & 0xffffff) : qpn),
-				      cqe_ver);
-		if (unlikely(!mqp))
-			return CQ_POLL_ERR;
-		if(qps)
-			*qps = &mqp->verbs_qp.qp;
-		if(srqs)
-			*srqs = NULL;
-		wq = &mqp->sq;
-		wqe_ctr = be16toh(cqe64->wqe_counter);
-		idx = wqe_ctr & (wq->wqe_cnt - 1);
-		if (lazy) {
-			uint32_t wc_byte_len;
-
-			switch (be32toh(cqe64->sop_drop_qpn) >> 24) {
-			case MLX5_OPCODE_UMR:
-			case MLX5_OPCODE_SET_PSV:
-			case MLX5_OPCODE_NOP:
-				if(likely(!is_shaded && !cq->migr_flag))
-					cq->cached_opcode = wq->wr_data[idx];
-				else
-					cq->cached_opcode = wq->tmp_wr_data[idx];
-				break;
-
-			case MLX5_OPCODE_RDMA_READ:
-				wc_byte_len = be32toh(cqe64->byte_cnt);
-				goto scatter_out;
-			case MLX5_OPCODE_ATOMIC_CS:
-			case MLX5_OPCODE_ATOMIC_FA:
-				wc_byte_len = 8;
-
-			scatter_out:
-#if 0
-				if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
-					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe, wc_byte_len);
-				else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
-					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe - 1, wc_byte_len);
-#endif
-				break;
-			}
-
-			if(likely(!is_shaded && !cq->migr_flag))
-				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
-			else
-				cq->verbs_cq.cq_ex.wr_id = wq->tmp_wrid[idx];
-			cq->verbs_cq.cq_ex.status = err;
-		} else {
-			handle_good_req(wc, cqe64, wq, idx, cq, is_shaded);
-
-#if 0
-			if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
-				err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe,
-							    wc->byte_len);
-			else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
-				err = mlx5_copy_to_send_wqe(
-				    mqp, wqe_ctr, cqe - 1, wc->byte_len);
-#endif
-
-			if(likely(!is_shaded && !cq->migr_flag))
-				wc->wr_id = wq->wrid[idx];
-			else
-				wc->wr_id = wq->tmp_wrid[idx];
-			wc->status = err;
-		}
-
-		if(!is_shaded &&
-					mqp->rsc.rsn == (be32toh(cqe64->srqn_uidx) & 0xffffff)) {
-#if 0
-			if(mqp->switch_qp) {
-				mlx5_destroy_qp_tmp(&mqp->switch_qp->verbs_qp.qp);
-				mqp->switch_qp = NULL;
-			}
-#endif
-			mqp->migrrdma_sq.n_acked += (wq->wqe_head[idx] + 1 - mqp->migrrdma_sq.tail);
-			mqp->migrrdma_sq.tail = wq->wqe_head[idx] + 1;
-		}
-		break;
-	}
-	case MLX5_CQE_RESP_WR_IMM:
-	case MLX5_CQE_RESP_SEND:
-	case MLX5_CQE_RESP_SEND_IMM:
-	case MLX5_CQE_RESP_SEND_INV:
-		srqn_uidx = be32toh(cqe64->srqn_uidx) & 0xffffff;
-		err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx, cur_rsc,
-				  cur_srq, &is_srq);
-		if (unlikely(err))
-			return CQ_POLL_ERR;
-
-		if(is_srq) {
-			struct mlx5_srq *srq = (struct mlx5_srq *)(*cur_srq);
-			if(srqs)
-				*srqs = &srq->vsrq.srq;
-			if(qps)
-				*qps = NULL;
-		}
-		else {
-			struct mlx5_qp *qp = rsc_to_mqp(*cur_rsc);
-			if(qps)
-				*qps = &qp->verbs_qp.qp;
-			if(srqs)
-				*srqs = NULL;
-		}
-
-		if (lazy) {
-			if (likely(cqe64->app != MLX5_CQE_APP_TAG_MATCHING)) {
-				cq->verbs_cq.cq_ex.status = handle_responder_lazy
-					(cq, cqe64, *cur_rsc,
-					 is_srq ? *cur_srq : NULL, is_shaded);
-			} else {
-				if (unlikely(!is_srq))
-					return CQ_POLL_ERR;
-
-				err = handle_tag_matching(cq, cqe64, *cur_srq);
-				if (unlikely(err))
-					return CQ_POLL_ERR;
-			}
-		} else {
-			wc->status = migrrdma_handle_responder(cq, wc, cqe64, *cur_rsc,
-					      is_srq ? *cur_srq : NULL, is_shaded);
-		}
-		break;
-
-	case MLX5_CQE_NO_PACKET:
-		if (unlikely(cqe64->app != MLX5_CQE_APP_TAG_MATCHING))
-			return CQ_POLL_ERR;
-		srqn_uidx = be32toh(cqe64->srqn_uidx) & 0xffffff;
-		err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx, cur_rsc,
-				  cur_srq, &is_srq);
-		if (unlikely(err || !is_srq))
-			return CQ_POLL_ERR;
-
-		if(is_srq) {
-			struct mlx5_srq *srq = (struct mlx5_srq *)(*cur_srq);
-			if(srqs)
-				*srqs = &srq->vsrq.srq;
-			if(qps)
-				*qps = NULL;
-		}
-		else {
-			struct mlx5_qp *qp = rsc_to_mqp(*cur_rsc);
-			if(qps)
-				*qps = &qp->verbs_qp.qp;
-			if(srqs)
-				*srqs = NULL;
-		}
-
-		err = handle_tag_matching(cq, cqe64, *cur_srq);
-		if (unlikely(err))
-			return CQ_POLL_ERR;
-		break;
-
-	case MLX5_CQE_SIG_ERR:
-		sigerr_cqe = (struct mlx5_sigerr_cqe *)cqe64;
-
-		pthread_mutex_lock(&mctx->mkey_table_mutex);
-		mkey = mlx5_find_mkey(mctx, be32toh(sigerr_cqe->mkey) >> 8);
-		if (!mkey) {
-			pthread_mutex_unlock(&mctx->mkey_table_mutex);
-			return CQ_POLL_ERR;
-		}
-
-		mkey->sig->err_exists = true;
-		mkey->sig->err_count++;
-		get_sig_err_info(sigerr_cqe, &mkey->sig->err_info);
-		pthread_mutex_unlock(&mctx->mkey_table_mutex);
-
-		err = migrrdma_get_next_cqe(cq, &cqe64, &cqe);
-		/*
-		 * CQ_POLL_NODATA indicates that CQ was not empty but the polled
-		 * CQE was handled internally and should not processed by the
-		 * caller.
-		 */
-		if (err == CQ_EMPTY)
-			return CQ_POLL_NODATA;
-		goto again;
-
-	case MLX5_CQE_RESIZE_CQ:
-		break;
-	case MLX5_CQE_REQ_ERR:
-	case MLX5_CQE_RESP_ERR:
-		srqn_uidx = be32toh(cqe64->srqn_uidx) & 0xffffff;
-		ecqe = (struct mlx5_err_cqe *)cqe64;
-		{
-			enum ibv_wc_status *pstatus = lazy ? &cq->verbs_cq.cq_ex.status : &wc->status;
-
-			*pstatus = mlx5_handle_error_cqe(ecqe);
-		}
-
-		if (!lazy)
-			wc->vendor_err = ecqe->vendor_err_synd;
-
-		if (unlikely(ecqe->syndrome != MLX5_CQE_SYNDROME_WR_FLUSH_ERR &&
-			     ecqe->syndrome != MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR &&
-			     !is_odp_pfault_err(ecqe))) {
-			mlx5_err(mctx->dbg_fp, PFX "%s: got completion with error:\n",
-				mctx->hostname);
-			dump_cqe(mctx, ecqe);
-			if (mlx5_freeze_on_error_cqe) {
-				mlx5_err(mctx->dbg_fp, PFX "freezing at poll cq...");
-				while (1)
-					sleep(10);
-			}
-		}
-
-		if (opcode == MLX5_CQE_REQ_ERR) {
-			mqp = get_req_context(mctx, cur_rsc,
-					      (cqe_ver ? srqn_uidx : qpn), cqe_ver);
-			if (unlikely(!mqp))
-				return CQ_POLL_ERR;
-			if(qps)
-				*qps = &mqp->verbs_qp.qp;
-			if(srqs)
-				*srqs = NULL;
-			wq = &mqp->sq;
-			wqe_ctr = be16toh(cqe64->wqe_counter);
-			idx = wqe_ctr & (wq->wqe_cnt - 1);
-			if (lazy) {
-				if(likely(!is_shaded && !cq->migr_flag))
-					cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
-				else
-					cq->verbs_cq.cq_ex.wr_id = wq->tmp_wrid[idx];
-			}
-			else {
-				if(likely(!is_shaded && !cq->migr_flag))
-					wc->wr_id = wq->wrid[idx];
-				else
-					wc->wr_id = wq->tmp_wrid[idx];
-			}
-
-			if(!is_shaded && mqp->rsc.rsn == srqn_uidx) {
-				mqp->migrrdma_sq.n_acked += (wq->wqe_head[idx] + 1 - mqp->migrrdma_sq.tail);
-				mqp->migrrdma_sq.tail = wq->wqe_head[idx] + 1;
-			}
-		} else {
-			err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx,
-					  cur_rsc, cur_srq, &is_srq);
-			if (unlikely(err))
-				return CQ_POLL_ERR;
-
-			if(is_srq) {
-				struct mlx5_srq *srq = (struct mlx5_srq *)(*cur_srq);
-				if(srqs)
-					*srqs = &srq->vsrq.srq;
-				if(qps)
-					*qps = NULL;
-			}
-			else {
-				struct mlx5_qp *qp = rsc_to_mqp(*cur_rsc);
-				if(qps)
-					*qps = &qp->verbs_qp.qp;
-				if(srqs)
-					*srqs = NULL;
-			}
-
-			if (is_srq) {
-				wqe_ctr = be16toh(cqe64->wqe_counter);
-				if (is_odp_pfault_err(ecqe)) {
-					mlx5_complete_odp_fault(*cur_srq, wqe_ctr);
-					err = migrrdma_get_next_cqe(cq, &cqe64, &cqe);
-					/* CQ_POLL_NODATA indicates that CQ was not empty but the polled CQE
-					 * was handled internally and should not processed by the caller.
-					 */
-					if (err == CQ_EMPTY)
-						return CQ_POLL_NODATA;
-					goto again;
-				}
-
-#if 0
-				if (lazy)
-					cq->verbs_cq.cq_ex.wr_id = (*cur_srq)->wrid[wqe_ctr];
-				else
-					wc->wr_id = (*cur_srq)->wrid[wqe_ctr];
-				mlx5_free_srq_wqe(*cur_srq, wqe_ctr);
-#endif
-			} else {
-				switch ((*cur_rsc)->type) {
-				case MLX5_RSC_TYPE_RWQ:
-					wq = &(rsc_to_mrwq(*cur_rsc)->rq);
-					break;
-				default:
-					wq = &(rsc_to_mqp(*cur_rsc)->rq);
-					break;
-				}
-
-				if (lazy)
-					cq->verbs_cq.cq_ex.wr_id = wq->wrid[rsc_to_mqp(*cur_rsc)->migrrdma_rq.tail & (wq->wqe_cnt - 1)];
-				else
-					wc->wr_id = wq->wrid[rsc_to_mqp(*cur_rsc)->migrrdma_rq.tail & (wq->wqe_cnt - 1)];
-
-				if(!is_shaded) {
-					++rsc_to_mqp(*cur_rsc)->migrrdma_rq.tail;
-					rsc_to_mqp(*cur_rsc)->migrrdma_rq.n_acked++;
-				}
-			}
-		}
-		break;
-	}
-
-	return CQ_OK;
-}
-
 static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 struct mlx5_cqe64 *cqe64,
 				 void *cqe,
 				 struct mlx5_resource **cur_rsc,
 				 struct mlx5_srq **cur_srq,
 				 struct ibv_wc *wc,
-				 int cqe_ver, int lazy, int is_shaded)
+				 int cqe_ver, int lazy)
 				 ALWAYS_INLINE;
 static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 struct mlx5_cqe64 *cqe64,
@@ -1284,7 +710,7 @@ static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 				 struct mlx5_resource **cur_rsc,
 				 struct mlx5_srq **cur_srq,
 				 struct ibv_wc *wc,
-				 int cqe_ver, int lazy, int is_shaded)
+				 int cqe_ver, int lazy)
 {
 	struct mlx5_wq *wq;
 	uint16_t wqe_ctr;
@@ -1311,19 +737,7 @@ again:
 		cq->flags &= (~MLX5_CQ_LAZY_FLAGS);
 	} else {
 		wc->wc_flags = 0;
-		if(!is_shaded && !cq->migr_flag) {
-			uint32_t *qpn_dict = cq->verbs_cq.cq.context->device->qpn_dict;
-			wc->qp_num = qpn_dict[qpn];
-		}
-		else {
-			int err;
-			uint32_t vqpn;
-			err = get_vqpn_from_old(qpn, &vqpn);
-			if(err) {
-				return CQ_POLL_ERR;
-			}
-			wc->qp_num = vqpn;
-		}
+		wc->qp_num = qpn;
 	}
 
 	opcode = mlx5dv_get_cqe_opcode(cqe64);
@@ -1345,10 +759,7 @@ again:
 			case MLX5_OPCODE_UMR:
 			case MLX5_OPCODE_SET_PSV:
 			case MLX5_OPCODE_NOP:
-				if(likely(!is_shaded && !cq->migr_flag))
-					cq->cached_opcode = wq->wr_data[idx];
-				else
-					cq->cached_opcode = wq->tmp_wr_data[idx];
+				cq->cached_opcode = wq->wr_data[idx];
 				break;
 
 			case MLX5_OPCODE_RDMA_READ:
@@ -1368,13 +779,10 @@ again:
 				break;
 			}
 
-			if(likely(!is_shaded && !cq->migr_flag))
-				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
-			else
-				cq->verbs_cq.cq_ex.wr_id = wq->tmp_wrid[idx];
+			cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
 			cq->verbs_cq.cq_ex.status = err;
 		} else {
-			handle_good_req(wc, cqe64, wq, idx, cq, is_shaded);
+			handle_good_req(wc, cqe64, wq, idx);
 
 			if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
 				err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe,
@@ -1383,38 +791,11 @@ again:
 				err = mlx5_copy_to_send_wqe(
 				    mqp, wqe_ctr, cqe - 1, wc->byte_len);
 
-			if(likely(!is_shaded && !cq->migr_flag))
-				wc->wr_id = wq->wrid[idx];
-			else
-				wc->wr_id = wq->tmp_wrid[idx];
+			wc->wr_id = wq->wrid[idx];
 			wc->status = err;
 		}
 
-		if(!is_shaded &&
-					mqp->rsc.rsn == (be32toh(cqe64->srqn_uidx) & 0xffffff)) {
-#if 0
-			if(mqp->switch_qp) {
-				mlx5_destroy_qp_tmp(&mqp->switch_qp->verbs_qp.qp);
-				mqp->switch_qp = NULL;
-			}
-#endif
-			wq->n_acked += (wq->wqe_head[idx] + 1 - wq->tail);
-			wq->tail = wq->wqe_head[idx] + 1;
-			if(ibv_get_signal()) {
-				wq->commit_head = wq->head;
-				wq->commit_posted = wq->n_posted;
-			}
-		}
-		else if(!is_shaded) {
-			wq->tail += (mqp->tmp_sq.wqe_head[idx] + 1 - mqp->tmp_sq.tail);
-			if(ibv_get_signal()) {
-				wq->commit_head = wq->head;
-				wq->commit_posted = wq->n_posted;
-			}
-			mqp->tmp_sq.tail = mqp->tmp_sq.wqe_head[idx] + 1;
-			wc->wr_id = mqp->tmp_sq.wrid[idx];
-		}
-
+		wq->tail = wq->wqe_head[idx] + 1;
 		break;
 	}
 	case MLX5_CQE_RESP_WR_IMM:
@@ -1431,7 +812,7 @@ again:
 			if (likely(cqe64->app != MLX5_CQE_APP_TAG_MATCHING)) {
 				cq->verbs_cq.cq_ex.status = handle_responder_lazy
 					(cq, cqe64, *cur_rsc,
-					 is_srq ? *cur_srq : NULL, is_shaded);
+					 is_srq ? *cur_srq : NULL);
 			} else {
 				if (unlikely(!is_srq))
 					return CQ_POLL_ERR;
@@ -1441,8 +822,8 @@ again:
 					return CQ_POLL_ERR;
 			}
 		} else {
-			wc->status = handle_responder(cq, wc, cqe64, *cur_rsc,
-					      is_srq ? *cur_srq : NULL, is_shaded);
+			wc->status = handle_responder(wc, cqe64, *cur_rsc,
+					      is_srq ? *cur_srq : NULL);
 		}
 		break;
 
@@ -1520,43 +901,11 @@ again:
 			wq = &mqp->sq;
 			wqe_ctr = be16toh(cqe64->wqe_counter);
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
-			if (lazy) {
-				if(likely(!is_shaded && !cq->migr_flag))
-					cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
-				else
-					cq->verbs_cq.cq_ex.wr_id = wq->tmp_wrid[idx];
-			}
-			else {
-				if(likely(!is_shaded && !cq->migr_flag))
-					wc->wr_id = wq->wrid[idx];
-				else
-					wc->wr_id = wq->tmp_wrid[idx];
-			}
-
-			if(!is_shaded &&
-						mqp->rsc.rsn == (be32toh(cqe64->srqn_uidx) & 0xffffff)) {
-#if 0
-				if(mqp->switch_qp) {
-					mlx5_destroy_qp_tmp(&mqp->switch_qp->verbs_qp.qp);
-					mqp->switch_qp = NULL;
-				}
-#endif
-				wq->n_acked += (wq->wqe_head[idx] + 1 - wq->tail);
-				wq->tail = wq->wqe_head[idx] + 1;
-				if(ibv_get_signal()) {
-					wq->commit_head = wq->head;
-					wq->commit_posted = wq->n_posted;
-				}
-			}
-			else if(!is_shaded) {
-				wq->tail += (mqp->tmp_sq.wqe_head[idx] + 1 - mqp->tmp_sq.tail);
-				if(ibv_get_signal()) {
-					wq->commit_head = wq->head;
-					wq->commit_posted = wq->n_posted;
-				}
-				mqp->tmp_sq.tail = mqp->tmp_sq.wqe_head[idx] + 1;
-				wc->wr_id = mqp->tmp_sq.wrid[idx];
-			}
+			if (lazy)
+				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
+			else
+				wc->wr_id = wq->wrid[idx];
+			wq->tail = wq->wqe_head[idx] + 1;
 		} else {
 			err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx,
 					  cur_rsc, cur_srq, &is_srq);
@@ -1577,30 +926,10 @@ again:
 				}
 
 				if (lazy)
-					if(likely(!is_shaded && !cq->migr_flag))
-						cq->verbs_cq.cq_ex.wr_id = (*cur_srq)->wrid[wqe_ctr];
-					else
-						cq->verbs_cq.cq_ex.wr_id = (*cur_srq)->tmp_wrid[wqe_ctr];
+					cq->verbs_cq.cq_ex.wr_id = (*cur_srq)->wrid[wqe_ctr];
 				else
-					if(likely(!is_shaded && !cq->migr_flag))
-						wc->wr_id = (*cur_srq)->wrid[wqe_ctr];
-					else
-						wc->wr_id = (*cur_srq)->tmp_wrid[wqe_ctr];
-				if(!is_shaded) {
-					if(!(*cur_srq)->migr_flag)
-						mlx5_free_srq_wqe(*cur_srq, wqe_ctr);
-					else {
-						mlx5_spin_lock(&(*cur_srq)->lock);
-						(*cur_srq)->staged_index[((*cur_srq)->staged_head++) % (*cur_srq)->onflight_cap] = wqe_ctr;
-						mlx5_spin_unlock(&(*cur_srq)->lock);
-					}
-					{
-						struct srq_recv_wr_item *cur_recv_wr =
-									(*cur_srq)->onflight_recv_wr + wqe_ctr;
-						list_del(&cur_recv_wr->list);
-						(*cur_srq)->n_acked++;
-					}
-				}
+					wc->wr_id = (*cur_srq)->wrid[wqe_ctr];
+				mlx5_free_srq_wqe(*cur_srq, wqe_ctr);
 			} else {
 				switch ((*cur_rsc)->type) {
 				case MLX5_RSC_TYPE_RWQ:
@@ -1612,26 +941,10 @@ again:
 				}
 
 				if (lazy)
-					cq->verbs_cq.cq_ex.wr_id = wq->wrid[be16toh(cqe64->wqe_counter) & (wq->wqe_cnt - 1)];
+					cq->verbs_cq.cq_ex.wr_id = wq->wrid[wq->tail & (wq->wqe_cnt - 1)];
 				else
-					wc->wr_id = wq->wrid[be16toh(cqe64->wqe_counter) & (wq->wqe_cnt - 1)];
-				if(!is_shaded) {
-					++wq->tail;
-					wq->n_acked++;
-					if(ibv_get_signal()) {
-						wq->commit_head = wq->head;
-						wq->commit_posted = wq->n_posted;
-					}
-					if((*cur_rsc)->type != MLX5_RSC_TYPE_RWQ) {
-						(rsc_to_mqp(*cur_rsc))->onflight_tail++;
-#if 0
-						if((rsc_to_mqp(*cur_rsc))->switch_qp) {
-							mlx5_destroy_qp_tmp(&(rsc_to_mqp(*cur_rsc))->switch_qp->verbs_qp.qp);
-							(rsc_to_mqp(*cur_rsc))->switch_qp = NULL;
-						}
-#endif
-					}
-				}
+					wc->wr_id = wq->wrid[wq->tail & (wq->wqe_cnt - 1)];
+				++wq->tail;
 			}
 		}
 		break;
@@ -1648,22 +961,7 @@ static inline int mlx5_parse_lazy_cqe(struct mlx5_cq *cq,
 				      struct mlx5_cqe64 *cqe64,
 				      void *cqe, int cqe_ver)
 {
-	return mlx5_parse_cqe(cq, cqe64, cqe, &cq->cur_rsc, &cq->cur_srq, NULL, cqe_ver, 1, 0);
-}
-
-static inline int migrrdma_poll_one(struct mlx5_cq *cq,
-				struct mlx5_resource **cur_rsc,
-				struct mlx5_srq **cur_srq,
-				struct ibv_wc *wc, struct ibv_qp **qps, struct ibv_srq **srqs, int cqe_ver) {
-	struct mlx5_cqe64 *cqe64;
-	void *cqe;
-	int err;
-
-	err = migrrdma_get_next_cqe(cq, &cqe64, &cqe);
-	if(err == CQ_EMPTY)
-		return err;
-
-	return migrrdma_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, qps, srqs, cqe_ver, 0, 0);
+	return mlx5_parse_cqe(cq, cqe64, cqe, &cq->cur_rsc, &cq->cur_srq, NULL, cqe_ver, 1);
 }
 
 static inline int mlx5_poll_one(struct mlx5_cq *cq,
@@ -1679,54 +977,17 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	struct mlx5_cqe64 *cqe64;
 	void *cqe;
 	int err;
-	int is_shaded = 0;
 
 	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
-	if(err == CQ_SHADED) {
-		err = CQ_OK;
-		is_shaded = 1;
-	}
 	if (err == CQ_EMPTY)
 		return err;
 
-	return mlx5_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, cqe_ver, 0, is_shaded);
-}
-
-void migrrdma_start_poll(struct ibv_cq *ibcq) {
-	struct mlx5_cq *cq = to_mcq(ibcq);
-
-	cq->use_fake_index = 1;
-	cq->fake_index = cq->cons_index;
-}
-
-void migrrdma_end_poll(struct ibv_cq *ibcq) {
-	struct mlx5_cq *cq = to_mcq(ibcq);
-
-	cq->use_fake_index = 0;
-}
-
-int migrrdma_poll_cq(struct ibv_cq *ibcq, int ne,
-		struct ibv_wc *wc, struct ibv_qp **qps, struct ibv_srq **srqs) {
-	struct mlx5_cq *cq = to_mcq(ibcq);
-	struct mlx5_resource *rsc = NULL;
-	struct mlx5_srq *srq = NULL;
-	int npolled;
-	int err = CQ_OK;
-
-	for (npolled = 0; npolled < ne; ++npolled) {
-		err = migrrdma_poll_one(cq, &rsc, &srq, wc + npolled,
-				qps? qps + npolled: NULL, srqs? srqs + npolled: NULL, 1);
-
-		if(err != CQ_OK)
-			break;
-	}
-
-	return err == CQ_POLL_ERR ? err : npolled;
+	return mlx5_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, cqe_ver, 0);
 }
 
 static inline int poll_cq(struct ibv_cq *ibcq, int ne,
-		      struct ibv_wc *wc, int cqe_ver);
-
+		      struct ibv_wc *wc, int cqe_ver)
+		      ALWAYS_INLINE;
 static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 		      struct ibv_wc *wc, int cqe_ver)
 {
@@ -1736,31 +997,7 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	int npolled;
 	int err = CQ_OK;
 
-	if(ibv_get_signal())
-		mlx5_spin_lock(&cq->lock);
-
-	if(cq->migr_flag) {
-		struct mlx5_buf tmp_buf;
-		__be32 *tmp_dbrec;
-
-		cq->migr_flag = 0;
-
-		memcpy(&tmp_buf, cq->active_buf, sizeof(tmp_buf));
-		memcpy(cq->active_buf, &cq->migr_buf, sizeof(tmp_buf));
-		memcpy(&cq->migr_buf, &tmp_buf, sizeof(tmp_buf));
-
-		tmp_dbrec = cq->dbrec;
-		cq->dbrec = cq->migr_dbrec;
-		cq->migr_dbrec = tmp_dbrec;
-
-		cq->shaded_flag = 1;
-		cq->tmp_cons_index = cq->cons_index;
-		memcpy(cq->tmp_buf.buf, cq->migr_buf.buf,
-					(ibcq->cqe + 1) * cq->cqe_sz);
-		cq->cons_index = 0;
-	}
-
-	if (cq->stall_enable && !cq->migr_flag) {
+	if (cq->stall_enable) {
 		if (cq->stall_adaptive_enable) {
 			if (cq->stall_last_count)
 				mlx5_stall_cycles_poll_cq(cq->stall_last_count + cq->stall_cycles);
@@ -1770,32 +1007,19 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 		}
 	}
 
+	mlx5_spin_lock(&cq->lock);
+
 	for (npolled = 0; npolled < ne; ++npolled) {
-		if(cq->migr_flag)
-			break;
-
-		if(ibcq->stop_flag)
-			break;
-
 		err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled, cqe_ver);
-
 		if (err != CQ_OK)
 			break;
 	}
 
-	while(cq->use_fake_index) {
-		uint32_t fake_index;
-		pthread_rwlock_rdlock(&cq->fake_index_rwlock);
-		fake_index = cq->fake_index;
-		pthread_rwlock_unlock(&cq->fake_index_rwlock);
-		if(cq->cons_index < fake_index) {
-			break;
-		}
-	}
-
 	update_cons_index(cq);
 
-	if (cq->stall_enable && !cq->migr_flag) {
+	mlx5_spin_unlock(&cq->lock);
+
+	if (cq->stall_enable) {
 		if (cq->stall_adaptive_enable) {
 			if (npolled == 0) {
 				cq->stall_cycles = max(cq->stall_cycles-mlx5_stall_cq_dec_step,
@@ -1814,9 +1038,6 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 			cq->stall_next_poll = 1;
 		}
 	}
-
-	if(ibv_get_signal())
-		mlx5_spin_unlock(&cq->lock);
 
 	return err == CQ_POLL_ERR ? err : npolled;
 }
@@ -1889,7 +1110,7 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		}
 	}
 
-	if (lock && ibv_get_signal())
+	if (lock)
 		mlx5_spin_lock(&cq->lock);
 
 	cq->cur_rsc = NULL;
@@ -1897,7 +1118,7 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 
 	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
 	if (err == CQ_EMPTY) {
-		if (lock && ibv_get_signal())
+		if (lock)
 			mlx5_spin_unlock(&cq->lock);
 
 		if (stall) {
@@ -1917,7 +1138,7 @@ static inline int mlx5_start_poll(struct ibv_cq_ex *ibcq, struct ibv_poll_cq_att
 		cq->flags |= MLX5_CQ_FLAGS_FOUND_CQES;
 
 	err = mlx5_parse_lazy_cqe(cq, cqe64, cqe, cqe_version);
-	if (lock && ibv_get_signal() && err)
+	if (lock && err)
 		mlx5_spin_unlock(&cq->lock);
 
 	if (stall && err == CQ_POLL_ERR) {
@@ -2156,8 +1377,6 @@ static inline void mlx5_end_poll_lock(struct ibv_cq_ex *ibcq)
 	_mlx5_end_poll(ibcq, 1, 0);
 }
 
-#include <signal.h>
-
 int mlx5_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
 	return poll_cq(ibcq, ne, wc, 0);
@@ -2165,9 +1384,6 @@ int mlx5_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 
 int mlx5_poll_cq_v1(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
-	if(ibcq->stop_flag)
-		return 0;
-
 	return poll_cq(ibcq, ne, wc, 1);
 }
 
@@ -2243,21 +1459,8 @@ static inline enum ibv_wc_opcode mlx5_cq_read_wc_opcode(struct ibv_cq_ex *ibcq)
 static inline uint32_t mlx5_cq_read_wc_qp_num(struct ibv_cq_ex *ibcq)
 {
 	struct mlx5_cq *cq = to_mcq(ibv_cq_ex_to_cq(ibcq));
-	uint32_t qpn = be32toh(cq->cqe64->sop_drop_qpn) & 0xffffff;
 
-	if(!cq->shaded_flag && !cq->migr_flag) {
-		uint32_t *qpn_dict = cq->verbs_cq.cq.context->device->qpn_dict;
-		return qpn_dict[qpn];
-	}
-	else {
-		int err;
-		uint32_t vqpn;
-		err = get_vqpn_from_old(qpn, &vqpn);
-		if(err) {
-			return CQ_POLL_ERR;
-		}
-		return vqpn;
-	}
+	return be32toh(cq->cqe64->sop_drop_qpn) & 0xffffff;
 }
 
 static inline unsigned int mlx5_cq_read_wc_flags(struct ibv_cq_ex *ibcq)
@@ -2511,17 +1714,6 @@ int mlx5_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	uint32_t ci;
 	uint32_t cmd;
 
-	if((cq->migr_flag || cq->shaded_flag) && ibvcq->channel) {
-		struct ib_uverbs_comp_event_desc desc;
-		desc.cq_handle = ibvcq;
-		if(write(ibvcq->channel->fd, &desc, sizeof(desc)) < 0) {
-			return -1;
-		}
-
-		ibvcq->arm_flag = 1;
-		return 0;
-	}
-
 	sn  = cq->arm_sn & 3;
 	ci  = cq->cons_index & 0xffffff;
 	cmd = solicited ? MLX5_CQ_DB_REQ_NOT_SOL : MLX5_CQ_DB_REQ_NOT;
@@ -2532,11 +1724,6 @@ int mlx5_arm_cq(struct ibv_cq *ibvcq, int solicited)
 
 	cq->dbrec[MLX5_CQ_ARM_DB] = htobe32(sn << 28 | cmd | ci);
 
-	if(cq->migr_flag) {
-		ibvcq->arm_flag = 1;
-		return 0;
-	}
-
 	/*
 	 * Make sure that the doorbell record in host memory is
 	 * written before ringing the doorbell via PCI WC MMIO.
@@ -2544,7 +1731,6 @@ int mlx5_arm_cq(struct ibv_cq *ibvcq, int solicited)
 	mmio_wc_start();
 
 	mmio_write64_be(ctx->cq_uar_reg + MLX5_CQ_DOORBELL, htobe64(doorbell));
-	ibvcq->arm_flag = 1;
 
 	mmio_flush_writes();
 
@@ -2658,11 +1844,9 @@ void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t rsn, struct mlx5_srq *srq)
 
 void mlx5_cq_clean(struct mlx5_cq *cq, uint32_t qpn, struct mlx5_srq *srq)
 {
-	if(ibv_get_signal())
-		mlx5_spin_lock(&cq->lock);
+	mlx5_spin_lock(&cq->lock);
 	__mlx5_cq_clean(cq, qpn, srq);
-	if(ibv_get_signal())
-		mlx5_spin_unlock(&cq->lock);
+	mlx5_spin_unlock(&cq->lock);
 }
 
 static uint8_t sw_ownership_bit(int n, int nent)
