@@ -51,5 +51,15 @@ $ ./ib_send_bw -d [mlnx_dev] --use_old_post_send --run_infinitely -p 12346 [othe
 Note:
 * You need to specify the IP addresses of all the servers. If the servers reside on a single node, just repeat the IP address of the node as many times as the number of servers (in this example, we need to repeat 4 times).
 * The modified `perftest` does not exit elegantly. You need to use `Ctrl+C` or `pkill -9 ib_send_bw` to kill them.
-* To run RDMA live migration with the varying numbers of partners, we recommend modifying [`container_init.sh`](../../container_init.sh) to build the modified `perftest` inside the container, then rebuild the container image.
+* To run RDMA live migration with the varying numbers of partners, we recommend modifying [`container_init.sh`](../../container_init.sh) to build the modified `perftest` inside the container, then rebuild the container image. An example is given by [./container_init.patch](./container_init.patch).
+You can run the following commands:  
+```Bash
+$ cd [root of the repository]
+$ patch -p1 < eval/02_wbs_overhead/container_init.patch
+```  
+To reverse the modification, run the following commands:  
+```Bash
+$ cd [root of the repository]
+$ patch -p1 -R < eval/02_wbs_overhead/container_init.patch
+```
 * If you want many senders to issue verbs operations to one receiver, just add `--reversed` flag in both commands to reverse the traffic.
