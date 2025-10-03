@@ -1,0 +1,33 @@
+commit 58c3dcc6079645247547d48ce17b6d6c95878dcb
+Author: lixy1995 <lixy1995@node-0.lixy1995-271647.lixy-pg0.utah.cloudlab.us>
+Date:   Wed Oct 1 03:00:44 2025 -0600
+
+    Examples to modify container_init.sh
+
+diff --git a/container_init.sh b/container_init.sh
+index 6a0e647..ffb353f 100755
+--- a/container_init.sh
++++ b/container_init.sh
+@@ -5,6 +5,7 @@ docker run -d --name test --hostname test --net=host --device=/dev/infiniband/ -
+ docker cp utils/init_proc/ test:/
+ docker cp utils/fork/ test:/
+ docker cp src/rdma-core-54mlnx1/ test:/
++docker cp eval/02_wbs_overhead/perftest/ test:/
+ 
+ docker exec test /bin/sh -c 'apt-get update; \
+ 	apt-get -y install iputils-ping net-tools build-essential wget git vim \
+@@ -26,13 +27,7 @@ docker exec test /bin/sh -c 'apt-get update; \
+ 	cp build/lib/* /usr/lib/ -r; \
+ 	cp -L build/include/infiniband build/include/rdma /usr/include/ -r; \
+ 	cd ..; \
+-	wget https://content.mellanox.com/ofed/MLNX_OFED-5.4-1.0.3.0/MLNX_OFED_LINUX-5.4-1.0.3.0-ubuntu20.04-x86_64.tgz; \
+-	tar -zxf MLNX_OFED_LINUX-5.4-1.0.3.0-ubuntu20.04-x86_64.tgz; \
+-	cd MLNX_OFED_LINUX-5.4-1.0.3.0-ubuntu20.04-x86_64/src/; \
+-	tar -zxf MLNX_OFED_SRC-5.4-1.0.3.0.tgz; \
+-	cd MLNX_OFED_SRC-5.4-1.0.3.0/SOURCES/; \
+-	tar -zxf perftest_4.5.orig.tar.gz; \
+-	cd perftest-4.5; \
++	cd perftest; \
+ 	./autogen.sh; \
+ 	./configure; \
+ 	make; \
