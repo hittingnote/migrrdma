@@ -19,6 +19,7 @@ IBVERBS_1.0 {
 		ibv_reg_mr;
 		ibv_dereg_mr;
 		ibv_create_comp_channel;
+		ibv_resume_comp_channel;
 		ibv_destroy_comp_channel;
 		ibv_create_cq;
 		ibv_resize_cq;
@@ -178,6 +179,7 @@ IBVERBS_PRIVATE_@IBVERBS_PABI_VERSION@ {
 		ibv_cmd_alloc_dm;
 		ibv_cmd_alloc_mw;
 		ibv_cmd_alloc_pd;
+		ibv_cmd_alloc_async_fd;
 		ibv_cmd_attach_mcast;
 		ibv_cmd_close_xrcd;
 		ibv_cmd_create_ah;
@@ -208,6 +210,20 @@ IBVERBS_PRIVATE_@IBVERBS_PABI_VERSION@ {
 		ibv_cmd_detach_mcast;
 		ibv_cmd_free_dm;
 		ibv_cmd_get_context;
+		ibv_cmd_install_footprint;
+		ibv_cmd_register_async_fd;
+		ibv_cmd_install_cq_handle_mapping;
+		ibv_cmd_install_qp_handle_mapping;
+		ibv_cmd_install_srq_handle_mapping;
+		get_vqpn_from_old;
+		del_qpn_dict_node_2;
+		add_qpn_dict_node;
+		switch_to_new_qp;
+		ibv_cmd_install_ctx_resp;
+		register_update_mem;
+		register_keep_mmap_region;
+		add_bf_addr_map_entry;
+		get_alloc_bf;
 		ibv_cmd_modify_flow_action_esp;
 		ibv_cmd_modify_qp;
 		ibv_cmd_modify_qp_ex;
@@ -242,4 +258,5 @@ IBVERBS_PRIVATE_@IBVERBS_PABI_VERSION@ {
 		verbs_uninit_context;
 		verbs_init_cq;
 		ibv_cmd_modify_cq;
+		ibv_get_signal;
 };
