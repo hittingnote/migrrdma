@@ -982,6 +982,7 @@ func (c *Container) CheckpointRDMA(criuOpts *CriuOpts) error {
 	for _, e := range pid_dir {
 		v, err := strconv.Atoi(e.Name())
 		if err != nil {
+			cnt = cnt - 1
 			continue
 		}
 
