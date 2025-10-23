@@ -2211,6 +2211,11 @@ static int restore_task_with_children(void *_arg)
 	timing_stop(TIME_FORK);
 
 	if(enable_pre_setup) {
+		if(copy_premapped_area_to_target(&rsti(current)->vmas)) {
+			pr_err("Failed to copy_premapped_area_to_target\n");
+			goto err;
+		}
+
 		if(restore_rdma(pid, images_dir)) {
 			pr_err("restore_rdma failed. errno: %d\n", errno);
 			goto err;

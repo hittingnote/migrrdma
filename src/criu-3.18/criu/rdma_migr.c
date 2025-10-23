@@ -1521,6 +1521,7 @@ int stop_and_copy_update_state(struct pstree_item *current,
 				memcpy(vma2->page_bitmap, vma1->page_bitmap, BITS_TO_LONGS(nr_pages) * sizeof(long));
 			}
 			vma2->premmaped_addr = vma1->premmaped_addr;
+			vma1->vm_open = vma2->vm_open;
 
 			vma1 = list_entry(vma1->list.next, struct vma_area, list);
 			vma2 = list_entry(vma2->list.next, struct vma_area, list);
@@ -1568,6 +1569,7 @@ int stop_and_copy_update_state(struct pstree_item *current,
 			memcpy(vma2->page_bitmap, vma1->page_bitmap, BITS_TO_LONGS(nr_pages) * sizeof(long));
 		}
 		vma2->premmaped_addr = vma1->premmaped_addr;
+		vma1->vm_open = vma2->vm_open;
 
 		if(!vma_area_is(vma1, VMA_PREMMAPED)) {
 			vma1 = list_entry(vma1->list.next, struct vma_area, list);
@@ -1602,6 +1604,7 @@ int stop_and_copy_update_state(struct pstree_item *current,
 
 			vma2->premmaped_addr = (unsigned long)addr;
 			vma1->premmaped_addr = (unsigned long)addr;
+			vma1->vm_open = vma2->vm_open;
 		}
 		else {
 			/* Case 2 */
@@ -1638,6 +1641,7 @@ int stop_and_copy_update_state(struct pstree_item *current,
 
 				vma2->premmaped_addr = (unsigned long)addr;
 				vma1->premmaped_addr = (unsigned long)addr;
+				vma1->vm_open = vma2->vm_open;
 			}
 		}
 
@@ -1738,4 +1742,20 @@ inline size_t get_srq_replay_size(int *n) {
 
 inline void copy_srq_replay_nodes(void *to) {
 	memcpy(to, srq_replay_arr, sizeof(struct srq_replay_call_entry) * n_srq_replay);
+}
+
+int copy_premapped_area_to_target(struct vm_area_list *vmas) {
+	struct vma_area *vma;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		if(!check_rdma_vma(vma->e->start, vma->e->end))
+			continue;
+
+		if(!vma_entry_is(vma->e, VMA_PREMMAPED))
+			continue;
+
+		memcpy((void *)vma->e->start, (void *)vma->premmaped_addr, vma_entry_len(vma->e));
+	}
+
+	return 0;
 }
