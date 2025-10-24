@@ -2438,8 +2438,30 @@ static struct verbs_context *mlx5_pre_resume_context(struct ibv_device *ibdev,
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
 static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
-					int cmd_fd, int *async_fd, struct verbs_context *orig_ctx) {
+					int cmd_fd, int *async_fd, struct verbs_context *orig_ctx,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	struct mlx5_context *mlx5_ctx;
 	struct mlx5_alloc_ucontext	req = {};
 	struct mlx5_alloc_ucontext_resp resp = {};
@@ -2447,6 +2469,8 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	int ctx_resp_fd;
 	int err;
 	int info_fd;
+	struct vma_arr_ent *target;
+	struct verbs_context *orig_ctx_tmp;
 
 	mlx5_ctx = mlx5_init_context(ibdev, cmd_fd);
 	if(!mlx5_ctx)
@@ -2482,10 +2506,12 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 		return NULL;
 	}
 
+	target = match_vma_arr(vma_arr, cnt, orig_ctx);
+	orig_ctx_tmp = (struct verbs_context*)(target->premapped_addr + ((void*)orig_ctx - target->start));
 	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR); i++) {
 		typeof(mlx5_ctx->uar[i].reg) *content_p;
 
-		to_mctx(&orig_ctx->context)->uar[i].reg = mlx5_ctx->uar[i].reg;
+		to_mctx(&orig_ctx_tmp->context)->uar[i].reg = mlx5_ctx->uar[i].reg;
 		content_p = malloc(sizeof(*content_p));
 		if(!content_p) {
 			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
@@ -2511,13 +2537,13 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	}
 
 	for(int i = 0; i < mlx5_ctx->tot_uuars / (mlx5_ctx->num_uars_per_page * MLX5_NUM_NON_FP_BFREGS_PER_UAR) &&
-							to_mctx(&orig_ctx->context)->bfs; i++) {
+						to_mctx(&orig_ctx_tmp->context)->bfs; i++) {
 		for(int j = 0; j < mlx5_ctx->num_uars_per_page; j++) {
 			for(int k = 0; k < NUM_BFREGS_PER_UAR; k++) {
 				int bfi = (i * mlx5_ctx->num_uars_per_page + j) * NUM_BFREGS_PER_UAR + k;
 				typeof(mlx5_ctx->bfs[bfi].reg) *content_p;
 
-				to_mctx(&orig_ctx->context)->bfs[bfi].reg = mlx5_ctx->bfs[bfi].reg;
+				to_mctx(&orig_ctx_tmp->context)->bfs[bfi].reg = mlx5_ctx->bfs[bfi].reg;
 				content_p = malloc(sizeof(*content_p));
 				*content_p = mlx5_ctx->bfs[bfi].reg;
 				if(register_update_mem(&to_mctx(&orig_ctx->context)->bfs[bfi].reg,
@@ -2533,7 +2559,7 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	{
 		typeof(mlx5_ctx->hca_core_clock) *content_p;
 
-		to_mctx(&orig_ctx->context)->hca_core_clock = mlx5_ctx->hca_core_clock;
+		to_mctx(&orig_ctx_tmp->context)->hca_core_clock = mlx5_ctx->hca_core_clock;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mlx5_ctx->hca_core_clock;
 		if(register_update_mem(&to_mctx(&orig_ctx->context)->hca_core_clock,
@@ -2556,7 +2582,7 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	{
 		typeof(mlx5_ctx->clock_info_page) *content_p;
 
-		to_mctx(&orig_ctx->context)->clock_info_page = mlx5_ctx->clock_info_page;
+		to_mctx(&orig_ctx_tmp->context)->clock_info_page = mlx5_ctx->clock_info_page;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mlx5_ctx->clock_info_page;
 		if(register_update_mem(&to_mctx(&orig_ctx->context)->clock_info_page,
@@ -2574,13 +2600,19 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 		}
 	}
 
+	struct mlx5_bf *nc_uar_tmp;
+	struct mlx5_bf *nc_uar;
+
+	nc_uar = to_mctx(&orig_ctx_tmp->context)->nc_uar;
+	target = match_vma_arr(vma_arr, cnt, nc_uar);
+	nc_uar_tmp = (struct mlx5_bf *)(target->premapped_addr + ((void*)nc_uar - target->start));
 	{
 		typeof(mlx5_ctx->nc_uar->uar) *content_p;
 
-		to_mctx(&orig_ctx->context)->nc_uar->uar = mlx5_ctx->nc_uar->uar;
+		nc_uar_tmp->uar = mlx5_ctx->nc_uar->uar;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mlx5_ctx->nc_uar->uar;
-		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->uar,
+		if(register_update_mem(&nc_uar->uar,
 								sizeof(*content_p), content_p)) {
 			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
 			free(mlx5_ctx);
@@ -2598,10 +2630,10 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	{
 		typeof(mlx5_ctx->nc_uar->reg) *content_p;
 
-		to_mctx(&orig_ctx->context)->nc_uar->reg = mlx5_ctx->nc_uar->reg;
+		nc_uar_tmp->reg = mlx5_ctx->nc_uar->reg;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mlx5_ctx->nc_uar->reg;
-		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->reg,
+		if(register_update_mem(&nc_uar->reg,
 								sizeof(*content_p), content_p)) {
 			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
 			free(mlx5_ctx);
@@ -2612,10 +2644,10 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 	{
 		typeof(mlx5_ctx->nc_uar->page_id) *content_p;
 
-		to_mctx(&orig_ctx->context)->nc_uar->page_id = mlx5_ctx->nc_uar->page_id;
+		nc_uar_tmp->page_id = mlx5_ctx->nc_uar->page_id;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mlx5_ctx->nc_uar->page_id;
-		if(register_update_mem(&to_mctx(&orig_ctx->context)->nc_uar->page_id,
+		if(register_update_mem(&nc_uar->page_id,
 								sizeof(*content_p), content_p)) {
 			ibv_close_device(&mlx5_ctx->ibv_ctx.context);
 			free(mlx5_ctx);
@@ -2640,7 +2672,7 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 		return NULL;
 	}
 
-	to_mctx(&orig_ctx->context)->cq_uar_reg = mlx5_ctx->cq_uar_reg;
+	to_mctx(&orig_ctx_tmp->context)->cq_uar_reg = mlx5_ctx->cq_uar_reg;
 
 	{
 		typeof(mlx5_ctx->cq_uar_reg) *content_p;
@@ -2671,8 +2703,8 @@ static struct verbs_context *mlx5_resume_context(struct ibv_device *ibdev,
 		return NULL;
 	}
 
-	if(write(info_fd, &to_mctx(&orig_ctx->context)->nc_uar,
-					sizeof(to_mctx(&orig_ctx->context)->nc_uar)) < 0) {
+	if(write(info_fd, &to_mctx(&orig_ctx_tmp->context)->nc_uar,
+					sizeof(to_mctx(&orig_ctx_tmp->context)->nc_uar)) < 0) {
 		close(info_fd);
 		ibv_close_device(&mlx5_ctx->ibv_ctx.context);
 		free(mlx5_ctx);

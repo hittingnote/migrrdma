@@ -1447,13 +1447,37 @@ struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 	return ibv_cq_ex_to_cq(cq);
 }
 
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
 struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
-			void *buf_addr, void *db_addr, int vhandle)
+			void *buf_addr, void *db_addr, int vhandle,
+			struct vma_arr_ent *vma_arr, int cnt)
 {
 	struct ibv_cq_ex *cq;
 	struct mlx5_cq *mcq;
 	struct mlx5_cq *mcq_meta = to_mcq(cq_meta);
+	struct ibv_cq *cq_meta_tmp;
+	struct mlx5_cq *mcq_meta_tmp;
 	struct mlx5_device *dev = to_mdev(context->device);
 	struct ibv_cq_init_attr_ex cq_attr = {.cqe = cqe, .channel = channel,
 						.comp_vector = comp_vector,
@@ -1462,11 +1486,21 @@ struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_met
 	int err;
 	char fname[128];
 	int info_fd;
+	struct vma_arr_ent *target;
+
+	target = match_vma_arr(vma_arr, cnt, cq_meta);
+	cq_meta_tmp = (struct ibv_cq*)(target->premapped_addr + ((void*)cq_meta - target->start));
+	mcq_meta_tmp = to_mcq(cq_meta_tmp);
 
 	if (cqe <= 0) {
 		errno = EINVAL;
 		return NULL;
 	}
+
+	target = match_vma_arr(vma_arr, cnt, buf_addr);
+	buf_addr = target->premapped_addr + ((void*)buf_addr - target->start);
+	target = match_vma_arr(vma_arr, cnt, db_addr);
+	db_addr = target->premapped_addr + ((void*)db_addr - target->start);
 
 	cq = resume_cq(context, &cq_attr, 0, NULL, buf_addr, db_addr);
 	if(!cq)
@@ -1492,7 +1526,7 @@ struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_met
 		return NULL;
 	}
 
-	if(write(info_fd, &mcq_meta->active_buf->buf, sizeof(void *)) < 0) {
+	if(write(info_fd, &mcq_meta_tmp->active_buf->buf, sizeof(void *)) < 0) {
 		close(info_fd);
 		ibv_destroy_cq(ibv_cq_ex_to_cq(cq));
 		return NULL;
@@ -1510,7 +1544,7 @@ struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_met
 		return NULL;
 	}
 
-	if(write(info_fd, &mcq_meta->dbrec, sizeof(void *)) < 0) {
+	if(write(info_fd, &mcq_meta_tmp->dbrec, sizeof(void *)) < 0) {
 		close(info_fd);
 		ibv_destroy_cq(ibv_cq_ex_to_cq(cq));
 		return NULL;
@@ -1521,7 +1555,7 @@ struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_met
 	{
 		typeof(mcq->cqn) *content_p;
 
-		mcq_meta->cqn = mcq->cqn;
+		mcq_meta_tmp->cqn = mcq->cqn;
 		content_p = malloc(sizeof(*content_p));
 		*content_p = mcq->cqn;
 		if(register_update_mem(&mcq_meta->cqn, sizeof(*content_p), content_p)) {
@@ -1669,20 +1703,33 @@ void mlx5_copy_cqe_to_shaded(struct ibv_cq *ibcq) {
 							(ibcq->cqe + 1) * cq->cqe_sz);
 }
 
-int mlx5_uwrite_cq(struct ibv_cq *ibcq, int cq_dir_fd) {
+int mlx5_uwrite_cq(struct ibv_cq *ibcq, int cq_dir_fd,
+				struct vma_arr_ent *vma_arr, int cnt) {
 	struct mlx5_cq *cq = to_mcq(ibcq);
 	struct mlx5_cqe64 *cqe;
 	int i;
+	void *buf = cq->migr_buf.buf;
+	__be32 *migr_dbrec = cq->migr_dbrec;
 
-	memset(cq->migr_buf.buf, 0, (ibcq->cqe + 1) * cq->cqe_sz);
+	if(vma_arr) {
+		struct vma_arr_ent *target = match_vma_arr(vma_arr, cnt, buf);
+		buf = target->premapped_addr + ((void*)buf - target->start);
+	}
+
+	memset(buf, 0, (ibcq->cqe + 1) * cq->cqe_sz);
 	for(i = 0; i < (ibcq->cqe + 1); i++) {
-		cqe = cq->migr_buf.buf + i * cq->cqe_sz;
+		cqe = buf + i * cq->cqe_sz;
 		cqe += cq->cqe_sz == 128? 1: 0;
 		cqe->op_own = MLX5_CQE_INVALID << 4;
 	}
 
-	cq->migr_dbrec[MLX5_CQ_SET_CI] = 0;
-	cq->migr_dbrec[MLX5_CQ_ARM_DB] = 0;
+	if(vma_arr) {
+		struct vma_arr_ent *target = match_vma_arr(vma_arr, cnt, migr_dbrec);
+		migr_dbrec = target->premapped_addr + ((void*)migr_dbrec - target->start);
+	}
+
+	migr_dbrec[MLX5_CQ_SET_CI] = 0;
+	migr_dbrec[MLX5_CQ_ARM_DB] = 0;
 
 	return 0;
 }
@@ -1694,11 +1741,18 @@ void mlx5_record_qp_index(struct ibv_qp *qp) {
 	memcpy(&mqp->rollback_sq, &mqp->sq, sizeof(struct mlx5_wq));
 }
 
-int mlx5_uwrite_qp(struct ibv_qp *ibqp, struct ibv_qp *new_qp) {
+int mlx5_uwrite_qp(struct ibv_qp *ibqp, struct ibv_qp *new_qp,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	struct mlx5_qp *qp = to_mqp(ibqp);
+	__be32 *migr_db = qp->migr_db;
 
-	qp->migr_db[MLX5_RCV_DBR] = 0;
-	qp->migr_db[MLX5_SND_DBR] = 0;
+	if(vma_arr) {
+		struct vma_arr_ent *target = match_vma_arr(vma_arr, cnt, migr_db);
+		migr_db = target->premapped_addr + ((void*)migr_db - target->start);
+	}
+
+	migr_db[MLX5_RCV_DBR] = 0;
+	migr_db[MLX5_SND_DBR] = 0;
 
 	return 0;
 }
@@ -4356,7 +4410,8 @@ err:
 
 struct ibv_qp *mlx5_resume_qp(struct ibv_context *context, int pd_handle, int qp_handle,
 				struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
-				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg) {
+				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg,
+				struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_qp *qp;
 	struct ibv_qp_init_attr_ex attrx;
 	struct mlx5_pd pd;
@@ -4376,6 +4431,13 @@ struct ibv_qp *mlx5_resume_qp(struct ibv_context *context, int pd_handle, int qp
 	memcpy(&attrx, attr, sizeof(*attr));
 	attrx.comp_mask = IBV_QP_INIT_ATTR_PD;
 	attrx.pd = &pd;
+
+	if(vma_arr) {
+		struct vma_arr_ent *target = match_vma_arr(vma_arr, cnt, buf_addr);
+		buf_addr = target->premapped_addr + ((void *)buf_addr - target->start);
+		target = match_vma_arr(vma_arr, cnt, db_addr);
+		db_addr = target->premapped_addr + ((void *)db_addr - target->start);
+	}
 	qp = resume_qp(context, &attrx, NULL, buf_addr,
 					db_addr, usr_idx, orig_qp);
 	if(qp)
@@ -4499,7 +4561,8 @@ void mlx5_copy_qp(struct ibv_qp *ibqp1, struct ibv_qp *ibqp2,
 	mqp1->switch_qp = mqp2;
 }
 
-int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp) {
+int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp,
+						struct vma_arr_ent *vma_arr, int cnt) {
 	struct mlx5_qp *mqp = to_mqp(qp);
 
 	{

@@ -543,22 +543,56 @@ int switch_to_new_qp(uint32_t pqpn, void *param,
 
 #include "ibverbs.h"
 
-int switch_all_qps(int (*switch_cb)(struct ibv_qp *orig_qp, struct ibv_qp *new_qp),
-				int (*load_cb)(struct ibv_qp *orig_qp, void *replay_fn)) {
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
+int switch_all_qps(int (*switch_cb)(struct ibv_qp *orig_qp, struct ibv_qp *new_qp,
+								struct vma_arr_ent *vma_arr, int cnt),
+				int (*load_cb)(struct ibv_qp *orig_qp, void *replay_fn),
+				struct vma_arr_ent *vma_arr, int cnt) {
 	struct switch_list_node *this_node;
 	struct switch_list_node *tmp;
+	struct ibv_context *context_tmp;
+	struct verbs_context_ops *ctx_ops_tmp;
+	struct vma_arr_ent *target;
 	int err;
+	struct ibv_qp *orig_qp_tmp;
 
 	pthread_rwlock_wrlock(&switch_list.rwlock);
 	for_each_rbtree_entry_safe(this_node, tmp, &switch_list,
 					to_switch_list_node, node) {
-		err = switch_cb(this_node->orig_qp, this_node->new_qp);
+		err = switch_cb(this_node->orig_qp, this_node->new_qp, vma_arr, cnt);
 		if(err) {
 			pthread_rwlock_unlock(&switch_list.rwlock);
 			return err;
 		}
 
-		err = load_cb(this_node->orig_qp, get_ops(this_node->orig_qp->context)->replay_recv_wr);
+		target = match_vma_arr(vma_arr, cnt, this_node->orig_qp);
+		orig_qp_tmp = (struct ibv_qp *)(target->premapped_addr + ((void*)this_node->orig_qp - target->start));
+
+		target = match_vma_arr(vma_arr, cnt, orig_qp_tmp->context);
+		context_tmp = (struct ibv_context *)(target->premapped_addr + ((void*)orig_qp_tmp->context - target->start));
+		target = match_vma_arr(vma_arr, cnt, get_ops(context_tmp));
+		ctx_ops_tmp = (struct verbs_context_ops *)(target->premapped_addr + ((void*)get_ops(context_tmp) - target->start));
+		err = load_cb(this_node->orig_qp, ctx_ops_tmp->replay_recv_wr);
 		if(err) {
 			pthread_rwlock_unlock(&switch_list.rwlock);
 			return err;

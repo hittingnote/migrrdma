@@ -2352,6 +2352,12 @@ struct footprint_gid_entry {
 	uint32_t						gid_type;
 };
 
+struct vma_arr_ent {
+	unsigned long long				start;
+	unsigned long long				end;
+	unsigned long long				premapped_addr;
+};
+
 struct ibv_resume_context_param {
 	char								cdev[32];
 	int									cmd_fd;
@@ -2379,7 +2385,8 @@ struct ibv_context *ibv_pre_resume_context(struct ibv_device **dev_list,
 		const struct ibv_resume_context_param *context_param);
 
 struct ibv_context *ibv_resume_context(struct ibv_device **dev_list,
-		const struct ibv_resume_context_param *context_param);
+		const struct ibv_resume_context_param *context_param,
+		struct vma_arr_ent *vma_arr, int cnt);
 
 struct ibv_context *ibv_resume_context_v2(struct ibv_device **dev_list,
 		const struct ibv_resume_context_param *context_param);
@@ -2944,7 +2951,8 @@ struct ibv_resume_srq_param {
 };
 
 struct ibv_cq *ibv_resume_cq(struct ibv_context *context, 
-				const struct ibv_resume_cq_param *cq_param);
+				const struct ibv_resume_cq_param *cq_param,
+				struct vma_arr_ent *vma_arr, int cnt);
 
 struct ibv_cq *ibv_resume_cq_v2(struct ibv_context *context, 
 				const struct ibv_resume_cq_param *cq_param);
@@ -2970,7 +2978,8 @@ struct ibv_resume_qp_param {
 
 struct ibv_qp *ibv_resume_create_qp(struct ibv_context *context,
 		struct ibv_pd *pd, struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
-		const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg);
+		const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg,
+		struct vma_arr_ent *vma_arr, int cnt);
 
 struct ibv_qp *ibv_resume_create_qp_v2(struct ibv_context *context,
 		struct ibv_pd *pd, struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
@@ -2979,7 +2988,8 @@ struct ibv_qp *ibv_resume_create_qp_v2(struct ibv_context *context,
 void ibv_resume_free_qp(struct ibv_qp *qp);
 
 int ibv_prepare_for_replay(int (*qp_load_cb)(struct ibv_qp *orig_qp, void *replay_fn),
-						int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail));
+						int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail),
+						struct vma_arr_ent *vma_arr, int cnt);
 int ibv_update_mem(int (*update_mem_fn)(void *ptr, size_t size,
 								void *content_p),
 					int (*keep_mmap_fn)(unsigned long long start,

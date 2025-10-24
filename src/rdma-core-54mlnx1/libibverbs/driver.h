@@ -242,7 +242,8 @@ struct verbs_device_ops {
 	void (*uninit_device)(struct verbs_device *device);
 
 	struct verbs_context *(*resume_context)(struct ibv_device *ibdev, int cmd_fd,
-						int *async_fd, struct verbs_context *orig_ctx);
+						int *async_fd, struct verbs_context *orig_ctx,
+						struct vma_arr_ent *vma_arr, int cnt);
 	struct verbs_context *(*resume_context_v2)(struct ibv_device *ibdev, int cmd_fd,
 						int *async_fd, struct verbs_context *orig_ctx);
 	struct verbs_context *(*pre_resume_context)(struct ibv_device *ibdev, int cmd_fd);
@@ -411,10 +412,11 @@ struct verbs_context_ops {
 	void (*unimport_mr)(struct ibv_mr *mr);
 	void (*unimport_pd)(struct ibv_pd *pd);
 
-	int (*uwrite_cq)(struct ibv_cq *cq, int cq_dir_fd);
+	int (*uwrite_cq)(struct ibv_cq *cq, int cq_dir_fd, struct vma_arr_ent *vma_arr, int cnt);
 	struct ibv_cq *(*resume_cq)(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
-			void *buf_addr, void *db_addr, int vhandle);
+			void *buf_addr, void *db_addr, int vhandle,
+			struct vma_arr_ent *vma_arr, int cnt);
 	struct ibv_cq *(*resume_cq_v2)(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
 			void *buf_addr, void *db_addr, int vhandle);
@@ -422,16 +424,18 @@ struct verbs_context_ops {
 	void (*set_cons_index)(struct ibv_cq *cq, int cons_index);
 	void (*copy_cqe_to_shaded)(struct ibv_cq *cq);
 
-	int (*uwrite_qp)(struct ibv_qp *qp, struct ibv_qp *new_qp);
+	int (*uwrite_qp)(struct ibv_qp *qp, struct ibv_qp *new_qp, struct vma_arr_ent *vma_arr, int cnt);
 	struct ibv_qp *(*resume_qp)(struct ibv_context *context, int pd_handle, int qp_handle,
 					struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
-					int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg);
+					int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg,
+					struct vma_arr_ent *vma_arr, int cnt);
 	void (*free_qp)(struct ibv_qp *qp);
 	int (*is_q_empty)(struct ibv_qp *qp);
 	void (*copy_qp)(struct ibv_qp *qp1, struct ibv_qp *qp2, void *param);
 	struct ibv_qp *(*calloc_qp)(void);
 	int (*replay_recv_wr)(struct ibv_qp *qp);
-	int (*prepare_qp_recv_replay)(struct ibv_qp *qp, struct ibv_qp *new_qp);
+	int (*prepare_qp_recv_replay)(struct ibv_qp *qp, struct ibv_qp *new_qp,
+								struct vma_arr_ent *vma_arr, int cnt);
 	int (*prepare_qp_recv_replay_v2)(struct ibv_qp *qp, struct ibv_qp *new_qp);
 	void (*record_qp_index)(struct ibv_qp *qp);
 
@@ -643,8 +647,10 @@ int switch_to_new_qp(uint32_t pqpn, void *param,
 				int (*switch_cb)(struct ibv_qp *orig_qp,
 				struct ibv_qp *new_qp,
 				void *param));
-int switch_all_qps(int (*switch_cb)(struct ibv_qp *orig_qp, struct ibv_qp *new_qp),
-				int (*load_cb)(struct ibv_qp *orig_qp, void *replay_fn));
+int switch_all_qps(int (*switch_cb)(struct ibv_qp *orig_qp, struct ibv_qp *new_qp,
+									struct vma_arr_ent *vma_arr, int cnt),
+				int (*load_cb)(struct ibv_qp *orig_qp, void *replay_fn),
+				struct vma_arr_ent *vma_arr, int cnt);
 int add_srq_switch_node(struct ibv_srq *new_srq, struct ibv_srq *orig_srq);
 int switch_all_srqs(int (*switch_cb)(struct ibv_srq *orig_srq, struct ibv_srq *new_srq, int *head, int *tail),
 			int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail));

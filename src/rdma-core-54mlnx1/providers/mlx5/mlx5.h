@@ -1131,7 +1131,8 @@ struct ibv_cq *mlx5_create_cq(struct ibv_context *context, int cqe,
 
 struct ibv_cq *mlx5_resume_cq(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
-			void *buf_addr, void *db_addr, int vhandle);
+			void *buf_addr, void *db_addr, int vhandle,
+			struct vma_arr_ent *vma_arr, int cnt);
 
 struct ibv_cq *mlx5_resume_cq_v2(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
@@ -1139,7 +1140,8 @@ struct ibv_cq *mlx5_resume_cq_v2(struct ibv_context *context, struct ibv_cq *cq_
 
 struct ibv_qp *mlx5_resume_qp(struct ibv_context *context, int pd_handle, int qp_handle,
 				struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
-				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg);
+				int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg,
+				struct vma_arr_ent *vma_arr, int cnt);
 
 struct ibv_srq *mlx5_resume_srq(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
 struct ibv_srq *mlx5_resume_srq_v2(struct ibv_pd *pd, struct ibv_resume_srq_param *param);
@@ -1154,7 +1156,8 @@ void mlx5_copy_qp(struct ibv_qp *qp1, struct ibv_qp *qp2, void *param);
 
 struct ibv_qp *mlx5_calloc_qp(void);
 
-int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp);
+int mlx5_prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp,
+							struct vma_arr_ent *vma_arr, int cnt);
 int mlx5_prepare_qp_recv_replay_v2(struct ibv_qp *qp, struct ibv_qp *new_qp);
 
 int mlx5_replay_recv_wr(struct ibv_qp *qp);
@@ -1168,8 +1171,10 @@ int mlx5_copy_uar_list(struct verbs_context *orig_ctx, struct ibv_context *new_c
 
 uint32_t get_prod_index(struct mlx5_cq *cq);
 
-int mlx5_uwrite_cq(struct ibv_cq *cq, int cq_dir_fd);
-int mlx5_uwrite_qp(struct ibv_qp *qp, struct ibv_qp *new_qp);
+int mlx5_uwrite_cq(struct ibv_cq *cq, int cq_dir_fd,
+					struct vma_arr_ent *vma_arr, int cnt);
+int mlx5_uwrite_qp(struct ibv_qp *qp, struct ibv_qp *new_qp,
+					struct vma_arr_ent *vma_arr, int cnt);
 
 int mlx5_uwrite_srq(struct ibv_srq *srq, struct ibv_srq *new_srq);
 

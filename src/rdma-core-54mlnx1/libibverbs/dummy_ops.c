@@ -139,7 +139,8 @@ static struct ibv_cq *create_cq(struct ibv_context *context, int cqe,
 
 static struct ibv_cq *resume_cq(struct ibv_context *context, struct ibv_cq *cq_meta,
 			int cqe, struct ibv_comp_channel *channel, int comp_vector,
-			void *buf_addr, void *db_addr, int vhandle) {
+			void *buf_addr, void *db_addr, int vhandle,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	errno = EOPNOTSUPP;
 	return NULL;
 }
@@ -151,12 +152,14 @@ static struct ibv_cq *resume_cq_v2(struct ibv_context *context, struct ibv_cq *c
 	return NULL;
 }
 
-static int uwrite_cq(struct ibv_cq *cq, int cq_dir_fd) {
+static int uwrite_cq(struct ibv_cq *cq, int cq_dir_fd,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	errno = EOPNOTSUPP;
 	return -1;
 }
 
-static int uwrite_qp(struct ibv_qp *qp, struct ibv_qp *new_qp) {
+static int uwrite_qp(struct ibv_qp *qp, struct ibv_qp *new_qp,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	errno = EOPNOTSUPP;
 	return -1;
 }
@@ -247,7 +250,8 @@ static struct ibv_qp *create_qp(struct ibv_pd *pd,
 
 static struct ibv_qp *resume_qp(struct ibv_context *context, int pd_handle, int qp_handle,
 					struct ibv_qp_init_attr *attr, void *buf_addr, void *db_addr,
-					int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg) {
+					int32_t usr_idx, struct ibv_qp *orig_qp, unsigned long long *bf_reg,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	errno = EOPNOTSUPP;
 	return NULL;
 }
@@ -287,7 +291,8 @@ static int replay_recv_wr(struct ibv_qp *qp) {
 	return -1;
 }
 
-static int prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp) {
+static int prepare_qp_recv_replay(struct ibv_qp *qp, struct ibv_qp *new_qp,
+						struct vma_arr_ent *vma_arr, int cnt) {
 	return -1;
 }
 

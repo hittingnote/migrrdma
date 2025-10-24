@@ -881,7 +881,7 @@ int restore_rdma(pid_t pid, char *img_dir_path) {
 		return -1;
 	}
 
-	if(switch_all_qps(prepare_qp_replay, do_prepare_qp)) {
+	if(switch_all_qps(prepare_qp_replay, do_prepare_qp, NULL, 0)) {
 		return -1;
 	}
 

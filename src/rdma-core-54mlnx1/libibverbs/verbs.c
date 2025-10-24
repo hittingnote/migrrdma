@@ -893,21 +893,48 @@ LATEST_SYMVER_FUNC(ibv_create_cq, 1_1, "IBVERBS_1.1",
 	return cq;
 }
 
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
 LATEST_SYMVER_FUNC(ibv_resume_cq, 1_1, "IBVERBS_1.1",
 			struct ibv_cq *, struct ibv_context *context,
-			const struct ibv_resume_cq_param *cq_param) {
+			const struct ibv_resume_cq_param *cq_param,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_cq *cq;
 	struct ibv_comp_channel *channel;
 	struct ibv_cq *orig_cq = cq_param->meta_uaddr;
+	struct vma_arr_ent *target;
+	struct ibv_cq *orig_cq_tmp;
 
 	channel = get_comp_channel_from_fd(cq_param->comp_fd);
 
-	if(get_ops(context)->uwrite_cq((struct ibv_cq *)cq_param->meta_uaddr, 0)) {
+	target = match_vma_arr(vma_arr, cnt, orig_cq);
+	orig_cq_tmp = (struct ibv_cq*)(target->premapped_addr + ((void*)orig_cq - target->start));
+	if(get_ops(context)->uwrite_cq(orig_cq_tmp, 0, vma_arr, cnt)) {
 		return NULL;
 	}
 
-	cq = get_ops(context)->resume_cq(context, cq_param->meta_uaddr, cq_param->cq_size,
-				channel, 0, cq_param->buf_addr, cq_param->db_addr, cq_param->cq_vhandle);
+	cq = get_ops(context)->resume_cq(context, orig_cq, cq_param->cq_size,
+				channel, 0, cq_param->buf_addr, cq_param->db_addr, cq_param->cq_vhandle,
+				vma_arr, cnt);
 	if(!cq)
 		return NULL;
 
@@ -918,7 +945,7 @@ LATEST_SYMVER_FUNC(ibv_resume_cq, 1_1, "IBVERBS_1.1",
 		return NULL;
 	}
 
-	if(rbtree_add_cq(cq_param->meta_uaddr)) {
+	if(rbtree_add_cq(orig_cq_tmp)) {
 		ibv_destroy_cq(cq);
 		return NULL;
 	}
@@ -1451,16 +1478,22 @@ LATEST_SYMVER_FUNC(ibv_create_qp, 1_1, "IBVERBS_1.1",
 LATEST_SYMVER_FUNC(ibv_resume_create_qp, 1_1, "IBVERBS_1.1",
 			struct ibv_qp *, struct ibv_context *context, struct ibv_pd *pd,
 			struct ibv_cq *send_cq, struct ibv_cq *recv_cq, struct ibv_srq *srq,
-			const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg) {
+			const struct ibv_resume_qp_param *qp_param, unsigned long long *bf_reg,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_qp *qp_ptr = qp_param->meta_uaddr;
+	struct ibv_qp *qp_ptr_tmp;
 	struct ibv_qp *qp;
 	struct ibv_qp_init_attr qp_init_attr;
 	char fname[128];
 	int info_fd;
 	int err;
 	pthread_t thread_id;
+	struct vma_arr_ent *target;
 
-	if(get_ops(context)->uwrite_qp(qp_ptr, qp)) {
+	target = match_vma_arr(vma_arr, cnt, qp_ptr);
+	qp_ptr_tmp = (struct ibv_qp *)(target->premapped_addr + ((void *)qp_ptr - target->start));
+
+	if(get_ops(context)->uwrite_qp(qp_ptr_tmp, qp, vma_arr, cnt)) {
 		return NULL;
 	}
 
@@ -1474,7 +1507,7 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp, 1_1, "IBVERBS_1.1",
 	
 	qp = get_ops(context)->resume_qp(context, qp_param->pd_vhandle, qp_param->qp_vhandle,
 					&qp_init_attr, qp_param->buf_addr, qp_param->db_addr,
-					qp_param->usr_idx, qp_param->meta_uaddr, bf_reg);
+					qp_param->usr_idx, qp_ptr_tmp, bf_reg, vma_arr, cnt);
 	if(!qp) {
 		return NULL;
 	}
@@ -1493,18 +1526,18 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp, 1_1, "IBVERBS_1.1",
 
 	qp->qp_num = qp_param->vqpn;
 
-	qp_ptr->orig_real_qpn = qp_ptr->real_qpn;
+	qp_ptr_tmp->orig_real_qpn = qp_ptr_tmp->real_qpn;
 	{
 		typeof(qp_ptr->real_qpn) *content_p;
 		content_p = malloc(sizeof(*content_p));
-		*content_p = qp_ptr->real_qpn;
+		*content_p = qp_ptr_tmp->real_qpn;
 		if(register_update_mem(&qp_ptr->orig_real_qpn,
 						sizeof(*content_p), content_p)) {
 			ibv_destroy_qp(qp);
 			return NULL;
 		}
 	}
-	qp_ptr->real_qpn = qp->real_qpn;
+	qp_ptr_tmp->real_qpn = qp->real_qpn;
 	{
 		typeof(qp->real_qpn) *content_p;
 		content_p = malloc(sizeof(*content_p));
@@ -1515,7 +1548,7 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp, 1_1, "IBVERBS_1.1",
 			return NULL;
 		}
 	}
-	memcpy(&qp_ptr->local_gid, &qp->local_gid, sizeof(union ibv_gid));
+	memcpy(&qp_ptr_tmp->local_gid, &qp->local_gid, sizeof(union ibv_gid));
 	{
 		typeof(qp->local_gid) *content_p;
 		content_p = malloc(sizeof(*content_p));
@@ -1570,7 +1603,7 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp_v2, 1_1, "IBVERBS_1.1",
 	int err;
 	pthread_t thread_id;
 
-	if(get_ops(context)->uwrite_qp(qp_ptr, qp)) {
+	if(get_ops(context)->uwrite_qp(qp_ptr, qp, NULL, 0)) {
 		return NULL;
 	}
 
@@ -1584,7 +1617,7 @@ LATEST_SYMVER_FUNC(ibv_resume_create_qp_v2, 1_1, "IBVERBS_1.1",
 	
 	qp = get_ops(context)->resume_qp(context, qp_param->pd_vhandle, qp_param->qp_vhandle,
 					&qp_init_attr, qp_param->buf_addr, qp_param->db_addr,
-					qp_param->usr_idx, qp_param->meta_uaddr, bf_reg);
+					qp_param->usr_idx, qp_param->meta_uaddr, bf_reg, NULL, 0);
 	if(!qp) {
 		return NULL;
 	}
@@ -1633,9 +1666,15 @@ LATEST_SYMVER_FUNC(ibv_resume_free_qp, 1_1, "IBVERBS_1.1",
 	get_ops(qp->context)->free_qp(qp);
 }
 
-static int replay_recv_wr_cb(struct ibv_qp *orig_qp, struct ibv_qp *new_qp) {
-	orig_qp->clear_qpndict_flag = 1;
-	return get_ops(new_qp->context)->prepare_qp_recv_replay(orig_qp, new_qp);
+static int replay_recv_wr_cb(struct ibv_qp *orig_qp, struct ibv_qp *new_qp,
+				struct vma_arr_ent *vma_arr, int cnt) {
+	struct ibv_qp *orig_qp_tmp;
+	struct vma_arr_ent *target;
+
+	target = match_vma_arr(vma_arr, cnt, orig_qp);
+	orig_qp_tmp = (struct ibv_qp *)(target->premapped_addr + ((void*)orig_qp - target->start));
+	orig_qp_tmp->clear_qpndict_flag = 1;
+	return get_ops(new_qp->context)->prepare_qp_recv_replay(orig_qp, new_qp, vma_arr, cnt);
 }
 
 static int replay_srq_recv_wr_cb(struct ibv_srq *orig_srq, struct ibv_qp *new_srq,
@@ -1663,9 +1702,10 @@ int iter_cq_insert_fake_comp_event(struct ibv_cq *cq,
 
 LATEST_SYMVER_FUNC(ibv_prepare_for_replay, 1_1, "IBVERBS_1.1",
 			int, int (*qp_load_cb)(struct ibv_qp *orig_qp, void *replay_fn),
-			int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail)) {
+			int (*srq_load_cb)(struct ibv_srq *orig_srq, void *replay_fn, int head, int tail),
+			struct vma_arr_ent *vma_arr, int cnt) {
 	return rbtree_traverse_cq(iter_cq_insert_fake_comp_event, NULL) ||
-			switch_all_qps(replay_recv_wr_cb, qp_load_cb) ||
+			switch_all_qps(replay_recv_wr_cb, qp_load_cb, vma_arr, cnt) ||
 			switch_all_srqs(replay_srq_recv_wr_cb, srq_load_cb);
 }
 

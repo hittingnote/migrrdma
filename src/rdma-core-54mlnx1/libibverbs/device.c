@@ -476,11 +476,11 @@ static int iter_cq_uwrite(struct ibv_cq *cq, void *entry, void *in_param) {
 	cq->wc = NULL;
 	cq->qps = NULL;
 	cq->srqs = NULL;
-	return get_ops(cq->context)->uwrite_cq(cq, 0);
+	return get_ops(cq->context)->uwrite_cq(cq, 0, NULL, 0);
 }
 
 static int iter_qp_uwrite(struct ibv_qp *qp, void *entry, void *in_param) {
-	return get_ops(qp->context)->uwrite_qp(qp, 0);
+	return get_ops(qp->context)->uwrite_qp(qp, 0, NULL, 0);
 }
 
 static int iter_srq_uwrite(struct ibv_srq *srq, void *entry, void *in_param) {
@@ -1761,7 +1761,8 @@ LATEST_SYMVER_FUNC(ibv_pre_resume_context, 1_1, "IBVERBS_1.1",
 
 LATEST_SYMVER_FUNC(ibv_resume_context, 1_1, "IBVERBS_1.1",
 			struct ibv_context *, struct ibv_device **dev_list,
-			const struct ibv_resume_context_param *context_param) {
+			const struct ibv_resume_context_param *context_param,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	int ctx_cmd_fd = -1;
 	struct verbs_device *verbs_device;
 	struct ibv_device *ib_dev = NULL;
@@ -1821,7 +1822,7 @@ LATEST_SYMVER_FUNC(ibv_resume_context, 1_1, "IBVERBS_1.1",
 	ibv_free_tmp_context(&context_ex->context);
 	context_ex = verbs_device->ops->resume_context(ib_dev,
 					context_param->cmd_fd, &ctx_async_fd,
-					context_param->ctx_uaddr);
+					context_param->ctx_uaddr, vma_arr, cnt);
 
 	if(ctx_async_fd < 0) {
 		close(context_param->cmd_fd);
