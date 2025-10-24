@@ -49,7 +49,6 @@ struct task_restore_args;
 int open_vmas(struct pstree_item *t);
 int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta);
 int unmap_guard_pages(struct pstree_item *t);
-int prepare_mappings(struct pstree_item *t, bool enqueue_page);
-int only_prepare_rdma_mappings(struct pstree_item *t);
+int prepare_mappings(struct pstree_item *t, bool unmap_old);
 bool should_dump_page(VmaEntry *vmae, u64 pme);
 #endif /* __CR_MEM_H__ */

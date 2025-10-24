@@ -1,15 +1,7 @@
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <linux/un.h>
 #include "rdma_migr.h"
-#include "debug.h"
-#include "include/rbtree.h"
 #include "include/mem.h"
 #include "include/pstree.h"
-#include "include/namespaces.h"
-#include "include/timens.h"
 #include "include/cr_options.h"
 
 static declare_and_init_rbtree(cq_dict);
@@ -142,93 +134,6 @@ static struct ibv_srq *get_srq_ptr_from_handle(int srq_handle) {
 
 static pid_t __rdma_pid__;
 
-#define mv_fd(pid_fd, new_pid)									\
-	if(dup2(pid_fd, new_pid) < 0) {								\
-		if(pid_fd >= 0)											\
-			close(pid_fd);										\
-		pid_fd = -1;											\
-	}															\
-	else {														\
-		close(pid_fd);											\
-		pid_fd = new_pid;										\
-	}
-
-static int __wait_for_proc_complete(pid_t pid) {
-	char fname[128];
-	int channel_fd;
-	int sig;
-
-	sprintf(fname, "/proc/rdma/%d/to_proc", pid);
-	channel_fd = open(fname, O_RDONLY);
-	if(channel_fd < 0) {
-		return -1;
-	}
-
-	dbg_info("Ready to get the signal from channel FD\n");
-	if(read(channel_fd, &sig, sizeof(int)) < 0) {
-		dbg_info("Error occurs. errno: %d\n", -errno);
-		close(channel_fd);
-		return -1;
-	}
-	dbg_info("Finish get the signal from channel FD\n");
-
-	close(channel_fd);
-	return 0;
-}
-
-int wait_for_proc_complete(pid_t pid) {
-	char fname[512];
-	int task_fd;
-	DIR *task_DIR;
-	struct dirent *task_dirent;
-	struct stat statbuf;
-
-	sprintf(fname, "/proc/rdma/%d", pid);
-	if(!stat(fname, &statbuf) && __wait_for_proc_complete(pid)) {
-		return -1;
-	}
-
-	sprintf(fname, "/proc/%d/task", pid);
-	task_fd = open(fname, O_DIRECTORY);
-	if(task_fd < 0) {
-		return -1;
-	}
-
-	task_DIR = fdopendir(task_fd);
-	while((task_dirent = readdir(task_DIR)) != NULL) {
-		int child_fd;
-		FILE *child_fp;
-		pid_t child_pid;
-
-		if(!strncmp(task_dirent->d_name, ".", strlen(".")))
-			continue;
-		
-		sprintf(fname, "%s/children", task_dirent->d_name);
-		child_fd = openat(task_fd, fname, O_RDONLY);
-		if(child_fd < 0) {
-			close(task_fd);
-			return -1;
-		}
-
-		child_fp = fdopen(child_fd, "r");
-		while(fscanf(child_fp, "%d", &child_pid) != EOF) {
-			sprintf(fname, "/proc/rdma/%d", child_pid);
-			if(stat(fname, &statbuf))
-				continue;
-			
-			if(__wait_for_proc_complete(child_pid)) {
-				close(child_fd);
-				close(task_fd);
-				return -1;
-			}
-		}
-		close(child_fd);
-	}
-
-	close(task_fd);
-	return 0;
-}
-
 int is_rdma_dev(unsigned long st_rdev) {
 	int cdev_dir_fd;
 	DIR *cdev_dir;
@@ -282,9 +187,11 @@ int is_rdma_dev(unsigned long st_rdev) {
 
 #define def_restore(res, restore_info_fn, restore_sub_fn, free_fn)						\
 static int restore_rdma_##res(void *parent, int img_fd,									\
-						char *path, char *parent_path) {								\
-	void *(*__restore_info_fn)(void *, int, char *, char *, int *);						\
-	int (*__restore_sub_fn)(void *, int, char *);										\
+						char *path, char *parent_path,									\
+						struct vma_arr_ent *vma_arr, int cnt) {							\
+	void *(*__restore_info_fn)(void *, int, char *, char *, int *,						\
+							struct vma_arr_ent *, int);									\
+	int (*__restore_sub_fn)(void *, int, char *, struct vma_arr_ent *, int);			\
 	void (*__free_fn)(void *);															\
 	int sub_img_fd;																		\
 	void *p_res;																		\
@@ -302,13 +209,15 @@ static int restore_rdma_##res(void *parent, int img_fd,									\
 		return -1;																		\
 	}																					\
 																						\
-	p_res = __restore_info_fn(parent, sub_img_fd, path, parent_path, &err);				\
+	p_res = __restore_info_fn(parent, sub_img_fd, path, parent_path,					\
+									&err, vma_arr, cnt);								\
 	if(err) {																			\
 		close(sub_img_fd);																\
 		return -1;																		\
 	}																					\
 																						\
-	if(__restore_sub_fn && __restore_sub_fn(p_res, sub_img_fd, path)) {					\
+	if(__restore_sub_fn &&																\
+					__restore_sub_fn(p_res, sub_img_fd, path, vma_arr, cnt)) {			\
 		if(__free_fn)																	\
 			__free_fn(p_res);															\
 		close(sub_img_fd);																\
@@ -340,14 +249,37 @@ static int restore_rdma_##res(void *parent, int img_fd,									\
 	dump_info(dir_fd, info_fd, param, map_field##_mmap_fd);								\
 	dump_info(dir_fd, info_fd, param, map_field##_map)
 
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
 static void *restore_mr(void *parent, int mr_fd,
-						char *mr_path, char *parent_path, int *p_err) {
+						char *mr_path, char *parent_path, int *p_err,
+						struct vma_arr_ent *vma_arr, int cnt) {
 //	struct ibv_context *tmp_context = parent;
 	struct ibv_pd *tmp_pd = parent;
 	struct ibv_resume_mr_param mr_param;
 	int info_fd;
 	int pd_handle;
 	int mr_handle;
+	struct vma_arr_ent *target;
 
 	sscanf(parent_path, "pd_%d", &pd_handle);
 	sscanf(mr_path, "mr_%d", &mr_handle);
@@ -359,6 +291,8 @@ static void *restore_mr(void *parent, int mr_fd,
 	dump_info(mr_fd, info_fd, &mr_param, vlkey);
 	dump_info(mr_fd, info_fd, &mr_param, vrkey);
 
+	target = match_vma_arr(vma_arr, cnt, mr_param.iova);
+	mr_param.iova = (void*)(target->premapped_addr + ((void*)mr_param.iova - target->start));
 	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param);
 	return (*p_err)? NULL: parent;
 }
@@ -396,11 +330,13 @@ def_restore(mr, restore_mr, NULL, NULL);
 	close(info_fd)
 
 static void *restore_qp(void *parent, int qp_fd,
-						char *qp_path, char *parent_path, int *p_err) {
+						char *qp_path, char *parent_path, int *p_err,
+						struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_pd *tmp_pd = parent;
 	struct ibv_cq *send_cq, *recv_cq;
 	struct ibv_qp *tmp_qp;
 	struct ibv_qp *qp_ptr;
+	struct ibv_qp *qp_ptr_tmp;
 	struct ibv_srq *srq;
 	struct ibv_resume_qp_param qp_param;
 	int info_fd;
@@ -408,6 +344,8 @@ static void *restore_qp(void *parent, int qp_fd,
 	int qp_handle;
 	unsigned long long bf_reg;
 	int i;
+	struct vma_arr_ent *target;
+	struct ibv_srq *srq_tmp;
 
 	memset(&qp_param, 0, sizeof(qp_param));
 	info_fd = openat(qp_fd, "qp_ctx", O_RDONLY);
@@ -458,17 +396,22 @@ static void *restore_qp(void *parent, int qp_fd,
 	close(info_fd);
 
 	qp_ptr = qp_param.meta_uaddr;
+	target = match_vma_arr(vma_arr, cnt, qp_ptr);
+	qp_ptr_tmp = (struct ibv_qp*)(target->premapped_addr + ((void*)qp_ptr - target->start));
 	send_cq = get_cq_ptr_from_handle(qp_param.send_cq_handle);
 	recv_cq = get_cq_ptr_from_handle(qp_param.recv_cq_handle);
-	if(qp_ptr->srq) {
-		srq = get_srq_ptr_from_handle(qp_ptr->srq->handle);
-		srq->handle = qp_ptr->srq->handle;
+	if(qp_ptr_tmp->srq) {
+		target = match_vma_arr(vma_arr, cnt, qp_ptr_tmp->srq);
+		srq_tmp = (struct ibv_srq*)(target->premapped_addr + ((void*)qp_ptr_tmp->srq - target->start));
+		srq = get_srq_ptr_from_handle(srq_tmp->handle);
+		srq->handle = srq_tmp->handle;
 	}
 	else {
 		srq = NULL;
 	}
 	tmp_qp = ibv_resume_create_qp(tmp_pd->context, tmp_pd,
-						send_cq, recv_cq, srq, &qp_param, &bf_reg);
+						send_cq, recv_cq, srq, &qp_param, &bf_reg,
+						vma_arr, cnt);
 	if(!tmp_qp) {
 		*p_err = -1;
 		return NULL;
@@ -484,7 +427,7 @@ static void *restore_qp(void *parent, int qp_fd,
 		}
 	}
 
-	qp_ptr->dest_qpn = tmp_qp->dest_qpn;
+	qp_ptr_tmp->dest_qpn = tmp_qp->dest_qpn;
 	{
 		typeof(tmp_qp->dest_qpn) *content_p;
 		content_p = malloc(sizeof(*content_p));
@@ -495,7 +438,7 @@ static void *restore_qp(void *parent, int qp_fd,
 			return NULL;
 		}
 	}
-	qp_ptr->dest_pid = tmp_qp->dest_pid;
+	qp_ptr_tmp->dest_pid = tmp_qp->dest_pid;
 	{
 		typeof(tmp_qp->dest_pid) *content_p;
 		content_p = malloc(sizeof(*content_p));
@@ -506,7 +449,7 @@ static void *restore_qp(void *parent, int qp_fd,
 			return NULL;
 		}
 	}
-	memcpy(&qp_ptr->rc_dest_gid, &tmp_qp->rc_dest_gid, sizeof(union ibv_gid));
+	memcpy(&qp_ptr_tmp->rc_dest_gid, &tmp_qp->rc_dest_gid, sizeof(union ibv_gid));
 	{
 		typeof(tmp_qp->rc_dest_gid) *content_p;
 		content_p = malloc(sizeof(*content_p));
@@ -526,7 +469,8 @@ static void *restore_qp(void *parent, int qp_fd,
 def_restore(qp, restore_qp, NULL, NULL);
 
 static void *restore_srq(void *parent, int srq_fd,
-			char *srq_path, char *parent_path, int *p_err) {
+			char *srq_path, char *parent_path, int *p_err,
+			struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_resume_srq_param srq_param;
 	struct ibv_pd *tmp_pd = parent;
 	struct ibv_srq *srq;
@@ -568,7 +512,8 @@ static void *restore_srq(void *parent, int srq_fd,
 def_restore(srq, restore_srq, NULL, NULL);
 
 static void *restore_cq(void *parent, int cq_fd,
-						char *cq_path, char *parent_path, int *p_err) {
+						char *cq_path, char *parent_path, int *p_err,
+						struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_context *tmp_context = parent;
 	struct ibv_cq *tmp_cq;
 	struct ibv_resume_cq_param cq_param;
@@ -585,7 +530,7 @@ static void *restore_cq(void *parent, int cq_fd,
 	dump_info(cq_fd, info_fd, &cq_param, db_addr);
 	dump_info(cq_fd, info_fd, &cq_param, comp_fd);
 
-	tmp_cq = ibv_resume_cq(tmp_context, &cq_param);
+	tmp_cq = ibv_resume_cq(tmp_context, &cq_param, vma_arr, cnt);
 	if(!tmp_cq) {
 		*p_err = -1;
 		return NULL;
@@ -607,7 +552,8 @@ static inline void free_cq(void *g_tmp_cq) {
 def_restore(cq, restore_cq, NULL, free_cq);
 
 static void *restore_comp_channel(void *parent, int comp_channel_fd,
-						char *comp_path, char *parent_path, int *p_err) {
+						char *comp_path, char *parent_path, int *p_err,
+						struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_context *tmp_context = parent;
 	int comp_fd;
 
@@ -623,7 +569,8 @@ static void *restore_comp_channel(void *parent, int comp_channel_fd,
 def_restore(uverbs_completion_event_file, restore_comp_channel, NULL, NULL);
 
 static void *restore_pd(void *parent, int pd_fd,
-				char *pd_path, char *parent_path, int *p_err) {
+				char *pd_path, char *parent_path, int *p_err,
+				struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_context *tmp_context = parent;
 	struct ibv_pd *tmp_pd;
 	int pd_handle;
@@ -634,12 +581,13 @@ static void *restore_pd(void *parent, int pd_fd,
 		*p_err = -1;
 		return NULL;
 	}
-	
+
 	*p_err = 0;
 	return tmp_pd;
 }
 
-static int restore_pd_sub(void *parent, int pd_fd, char *path) {
+static int restore_pd_sub(void *parent, int pd_fd, char *path,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_context *tmp_context = parent;
 	DIR *pd_dir;
 	struct dirent *pd_dirent;
@@ -650,7 +598,8 @@ static int restore_pd_sub(void *parent, int pd_fd, char *path) {
 
 	while((pd_dirent = readdir(pd_dir)) != NULL) {
 		if(!strncmp(pd_dirent->d_name, "srq", strlen("srq"))) {
-			if(restore_rdma_srq(tmp_context, pd_fd, pd_dirent->d_name, path)) {
+			if(restore_rdma_srq(tmp_context, pd_fd, pd_dirent->d_name, path,
+									vma_arr, cnt)) {
 				return -1;
 			}
 		}
@@ -660,13 +609,15 @@ static int restore_pd_sub(void *parent, int pd_fd, char *path) {
 
 	while((pd_dirent = readdir(pd_dir)) != NULL) {
 		if(!strncmp(pd_dirent->d_name, "mr", strlen("mr"))) {
-			if(restore_rdma_mr(tmp_context, pd_fd, pd_dirent->d_name, path)) {
+			if(restore_rdma_mr(tmp_context, pd_fd, pd_dirent->d_name, path,
+									vma_arr, cnt)) {
 				return -1;
 			}
 		}
 
 		if(!strncmp(pd_dirent->d_name, "qp", strlen("qp"))) {
-			if(restore_rdma_qp(tmp_context, pd_fd, pd_dirent->d_name, path)) {
+			if(restore_rdma_qp(tmp_context, pd_fd, pd_dirent->d_name, path,
+									vma_arr, cnt)) {
 				return -1;
 			}
 		}
@@ -682,7 +633,8 @@ static inline void free_pd(void *g_tmp_pd) {
 def_restore(pd, restore_pd, restore_pd_sub, free_pd);
 
 static void *restore_context(void *parent, int cmd_fd,
-					char *cmd_fd_path, char *parent_path, int *p_err) {
+					char *cmd_fd_path, char *parent_path, int *p_err,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_resume_context_param context_param;
 	int info_fd;
 	struct ibv_context *context;
@@ -706,7 +658,8 @@ static void *restore_context(void *parent, int cmd_fd,
 		context = ibv_pre_resume_context(ibv_device_list, &context_param);
 	}
 	else {
-		context = ibv_resume_context(ibv_device_list, &context_param);
+		context = ibv_resume_context(ibv_device_list, &context_param,
+										vma_arr, cnt);
 	}
 	if(!context)
 		*p_err = -1;
@@ -719,7 +672,8 @@ static void *restore_context(void *parent, int cmd_fd,
 	return context;
 }
 
-static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
+static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path,
+							struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_context *tmp_context = g_tmp_context;
 	DIR *cmd_dir;
 	struct dirent *cmd_dirent;
@@ -735,7 +689,7 @@ static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
 		if(!strncmp(cmd_dirent->d_name, "uverbs_completion_event_file",
 						strlen("uverbs_completion_event_file"))) {
 			if(restore_rdma_uverbs_completion_event_file(tmp_context, cmd_fd,
-								cmd_dirent->d_name, path)) {
+								cmd_dirent->d_name, path, vma_arr, cnt)) {
 				return -1;
 			}
 		}
@@ -744,10 +698,11 @@ static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
 	if(lseek(cmd_fd, 0, SEEK_SET) < 0) {
 		return -1;
 	}
-	
+
 	while((cmd_dirent = readdir(cmd_dir)) != NULL) {
 		if(!strncmp(cmd_dirent->d_name, "cq", strlen("cq"))) {
-			if(restore_rdma_cq(tmp_context, cmd_fd, cmd_dirent->d_name, path)) {
+			if(restore_rdma_cq(tmp_context, cmd_fd, cmd_dirent->d_name, path,
+								vma_arr, cnt)) {
 				return -1;
 			}
 		}
@@ -759,7 +714,8 @@ static int restore_context_sub(void *g_tmp_context, int cmd_fd, char *path) {
 
 	while((cmd_dirent = readdir(cmd_dir)) != NULL) {
 		if(!strncmp(cmd_dirent->d_name, "pd", strlen("pd"))) {
-			if(restore_rdma_pd(tmp_context, cmd_fd, cmd_dirent->d_name, path)) {
+			if(restore_rdma_pd(tmp_context, cmd_fd, cmd_dirent->d_name, path,
+								vma_arr, cnt)) {
 				return -1;
 			}
 		}
@@ -774,12 +730,16 @@ static inline void free_context(void *g_tmp_context) {
 
 def_restore(context, restore_context, restore_context_sub, free_context);
 
-int restore_rdma(pid_t pid, char *img_dir_path) {
+int restore_rdma(pid_t pid, char *img_dir_path,
+				struct vm_area_list *vmas) {
 	char fname[128];
 	int img_fd;
 	int img_pid_fd;
 	DIR *img_pid_DIR;
 	struct dirent *img_pid_dirent;
+	struct vma_arr_ent *vma_arr = NULL;
+	int curp = 0;
+	struct vma_area *vma;
 
 	img_fd = open(img_dir_path, O_DIRECTORY);
 	if(img_fd < 0) {
@@ -794,9 +754,27 @@ int restore_rdma(pid_t pid, char *img_dir_path) {
 	}
 
 	pr_info("Pre-restoring RDMA information...\n");
+	if(vmas) {
+		vma_arr = malloc(vmas->nr * sizeof(*vma_arr));
+		if(!vma_arr) {
+			close(img_fd);
+			return -1;
+		}
+	}
+
+	if(vma_arr) {
+		list_for_each_entry(vma, &vmas->h, list) {
+			vma_arr[curp].start = vma->e->start;
+			vma_arr[curp].end = vma->e->end;
+			vma_arr[curp].premapped_addr = vma->premmaped_addr;
+			curp++;
+		}
+	}
 
 	img_pid_DIR = fdopendir(img_pid_fd);
 	if(!img_pid_DIR) {
+		if(vma_arr)
+			free(vma_arr);
 		close(img_pid_fd);
 		close(img_fd);
 		return -1;
@@ -807,8 +785,10 @@ int restore_rdma(pid_t pid, char *img_dir_path) {
 
 		if(!strncmp(img_pid_dirent->d_name, ".", strlen(".")))
 			continue;
-		
+
 		if(fstatat(img_pid_fd, img_pid_dirent->d_name, &st, 0)) {
+			if(vma_arr)
+				free(vma_arr);
 			close(img_pid_fd);
 			close(img_fd);
 			return -1;
@@ -816,24 +796,25 @@ int restore_rdma(pid_t pid, char *img_dir_path) {
 
 		if(!S_ISDIR(st.st_mode))
 			continue;
-		
+
 		if(restore_rdma_context(NULL, img_pid_fd,
-						img_pid_dirent->d_name, fname)) {
+						img_pid_dirent->d_name,
+						fname, vma_arr, curp)) {
+			if(vma_arr)
+				free(vma_arr);
 			close(img_pid_fd);
 			close(img_fd);
 			return -1;
 		}
 	}
 
+	if(vma_arr)
+		free(vma_arr);
 	close(img_fd);
 	close(img_pid_fd);
 
 	return 0;
 }
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 
 enum rdma_notify_ops {
 	RDMA_NOTIFY_PRE_ESTABLISH,
@@ -856,7 +837,7 @@ static inline int up_to_pow_two(int n) {
 	int tmp = n;
 	while(tmp & (tmp - 1))
 		tmp = (tmp & (tmp - 1));
-	
+
 	if(n > tmp)
 		return 2*tmp;
 	else
@@ -868,7 +849,7 @@ static void *expand_buf(void *buf, size_t orig_size, size_t new_size) {
 
 	if(up_to_pow_two(new_size) <= up_to_pow_two(orig_size))
 		return buf;
-	
+
 	buf_tmp = malloc(up_to_pow_two(new_size));
 	if(!buf_tmp) {
 		if(buf)
@@ -915,7 +896,7 @@ static int n_msgs = 0;
 inline size_t get_send_msg_meta_size(int *pn_msgs) {
 	if(pn_msgs) {
 		*pn_msgs = n_msgs;
-}
+    }
 
 	return sizeof(struct send_msg_entry) * n_msgs;
 }
@@ -1013,6 +994,9 @@ static int notify_partners(pid_t pid, struct sockaddr_in *migr_dest_addr,
 	int n_item = 0;
 	struct notify_item *item_list;
 	int curp = 0;
+	struct vma_arr_ent *vma_arr = NULL;
+	int curp_vma = 0;
+	struct vma_area *vma;
 
 	sprintf(fname, "/proc/rdma/%d", pid);
 	rdma_proc_fd = open(fname, O_DIRECTORY);
@@ -1021,6 +1005,21 @@ static int notify_partners(pid_t pid, struct sockaddr_in *migr_dest_addr,
 	}
 
 	pr_info("PID %d: Now prepare to notify partners\n", pid);
+
+	if(enable_pre_setup) {
+		vma_arr = malloc(rsti(current)->vmas.nr * sizeof(*vma_arr));
+		if(!vma_arr) {
+			close(rdma_proc_fd);
+			return -1;
+		}
+
+		list_for_each_entry(vma, &rsti(current)->vmas.h, list) {
+			vma_arr[curp_vma].start = vma->e->start;
+			vma_arr[curp_vma].end = vma->e->end;
+			vma_arr[curp_vma].premapped_addr = vma->premmaped_addr;
+			curp_vma++;
+		}
+	}
 
 	rdma_proc_DIR = fdopendir(rdma_proc_fd);
 	while((rdma_proc_dirent = readdir(rdma_proc_DIR)) != NULL) {
@@ -1092,7 +1091,7 @@ static int notify_partners(pid_t pid, struct sockaddr_in *migr_dest_addr,
 
 				n_item++;
 			}
-			
+
 			close(pd_fd);
 		}
 
@@ -1248,12 +1247,17 @@ static int notify_partners(pid_t pid, struct sockaddr_in *migr_dest_addr,
 				memcpy(&item_list[curp].dest_gid, &dest_gid, sizeof(dest_gid));
 				item_list[curp].dest_qpn = dest_qpn;
 				item_list[curp].pid = pid;
+				if(enable_pre_setup) {
+					struct vma_arr_ent *target;
+					target = match_vma_arr(vma_arr, curp_vma, qp);
+					qp = (struct ibv_qp *)(target->premapped_addr + ((void*)qp - target->start));
+				}
 				item_list[curp].n_posted = get_n_posted_from_qpn(qp->qp_num);
 				curp++;
 
 				close(qp_fd);
 			}
-			
+
 			close(pd_fd);
 		}
 
@@ -1698,7 +1702,7 @@ size_t get_total_content_size(void) {
 
 inline void copy_update_nodes(void *to) {
 	memcpy(to, update_arr, sizeof(struct update_mem_node) * n_update);
-	}
+}
 
 static struct qp_replay_call_entry qp_replay_arr[1024 * 1024];
 static int n_qp_replay = 0;
@@ -1742,20 +1746,4 @@ inline size_t get_srq_replay_size(int *n) {
 
 inline void copy_srq_replay_nodes(void *to) {
 	memcpy(to, srq_replay_arr, sizeof(struct srq_replay_call_entry) * n_srq_replay);
-}
-
-int copy_premapped_area_to_target(struct vm_area_list *vmas) {
-	struct vma_area *vma;
-
-	list_for_each_entry(vma, &vmas->h, list) {
-		if(!check_rdma_vma(vma->e->start, vma->e->end))
-			continue;
-
-		if(!vma_entry_is(vma->e, VMA_PREMMAPED))
-			continue;
-
-		memcpy((void *)vma->e->start, (void *)vma->premmaped_addr, vma_entry_len(vma->e));
-	}
-
-	return 0;
 }

@@ -102,7 +102,6 @@
 #include "rdma_migr.h"
 
 static pid_t prerestore_parent_pid;
-int timens_helper_pid = -1;
 
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread __export_restore_thread
@@ -1005,7 +1004,7 @@ skip_hook:
 		sprintf(ta->images_dir, "%.127s", images_dir);
 
 		pr_info("Start to pre-restore RDMA\n");
-		if(restore_rdma(pid, images_dir)) {
+		if(restore_rdma(pid, images_dir, NULL)) {
 			pr_err("restore_rdma failed. errno: %d\n", errno);
 			return -1;
 		}
@@ -1644,9 +1643,6 @@ static int sigchld_process(int status, pid_t pid)
 {
 	int sig;
 
-	if(pid == timens_helper_pid)
-		return 0;
-
 	if (WIFEXITED(status)) {
 		pr_err("%d exited, status=%d\n", pid, WEXITSTATUS(status));
 		return -1;
@@ -2010,55 +2006,11 @@ static int restore_task_with_children(void *_arg)
 	struct cr_clone_arg *ca = _arg;
 	pid_t pid;
 	int ret;
+	struct vma_arr_ent *vma_arr = NULL;
+	int curp = 0;
+	struct vma_area *vma;
 
 	current = ca->item;
-
-#if 0
-	if(current == root_item) {
-		timens_helper_pid = fork();
-		if(timens_helper_pid < 0) {
-			goto err;
-		}
-		if(timens_helper_pid == 0) {
-			int sock;
-			struct sockaddr_un sock_un;
-			int err;
-
-			if (unshare(CLONE_NEWTIME)) {
-				pr_perror("Unable to create a new time namespace");
-				goto err;
-			}
-
-			sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-			if(sock < 0) {
-				pr_perror("socket");
-				return -1;
-			}
-
-			memset(&sock_un, 0, sizeof(sock_un));
-			sock_un.sun_family = AF_UNIX;
-			sprintf(sock_un.sun_path, "/dev/shm/timens.sock");
-			unlink(sock_un.sun_path);
-			err = bind(sock, (struct sockaddr*)&sock_un, sizeof(sock_un));
-			if(err) {
-				close(sock);
-				pr_perror("bind");
-				return -1;
-			}
-
-			if(recvfrom(sock, NULL, 0, 0, NULL, NULL) < 0) {
-				close(sock);
-				pr_perror("recvfrom");
-				return -1;
-			}
-
-			pr_info("Now timens helper exits\n");
-			close(sock);
-			unlink(sock_un.sun_path);
-			while(1);
-		}
-	}
-#endif
 
 	if (current != root_item) {
 		char buf[12];
@@ -2173,23 +2125,13 @@ static int restore_task_with_children(void *_arg)
 			goto err;
 	}
 
-	if(enable_pre_setup) {
-		if(add_rdma_vma_node(pid)) {
-			goto err;
-		}
-
-		if(only_prepare_rdma_mappings(current)) {
-			goto err;
-		}
-	}
-
 	if (setup_newborn_fds(current))
 		goto err;
 
 	if (restore_task_mnt_ns(current))
 		goto err;
 
-	if (prepare_mappings(current, !enable_pre_setup))
+	if (prepare_mappings(current, true))
 		goto err;
 
 	if (prepare_sigactions(ca->core) < 0)
@@ -2211,12 +2153,7 @@ static int restore_task_with_children(void *_arg)
 	timing_stop(TIME_FORK);
 
 	if(enable_pre_setup) {
-		if(copy_premapped_area_to_target(&rsti(current)->vmas)) {
-			pr_err("Failed to copy_premapped_area_to_target\n");
-			goto err;
-		}
-
-		if(restore_rdma(pid, images_dir)) {
+		if(restore_rdma(pid, images_dir, &rsti(current)->vmas)) {
 			pr_err("restore_rdma failed. errno: %d\n", errno);
 			goto err;
 		}
@@ -2273,10 +2210,23 @@ static int restore_task_with_children(void *_arg)
 		if(stop_and_copy_update_state(current, ca))
 			goto err;
 
-		if(prepare_mappings(current, true))
+		if(prepare_mappings(current, false))
 			goto err;
 
-		if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback)) {
+		vma_arr = malloc(rsti(current)->vmas.nr * sizeof(*vma_arr));
+		if(!vma_arr) {
+			goto err;
+		}
+
+		list_for_each_entry(vma, &rsti(current)->vmas.h, list) {
+			vma_arr[curp].start = vma->e->start;
+			vma_arr[curp].end = vma->e->end;
+			vma_arr[curp].premapped_addr = vma->premmaped_addr;
+			curp++;
+		}
+
+		if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback,
+									vma_arr, curp)) {
 			goto err;
 		}
 
@@ -2988,7 +2938,6 @@ int prepare_task_entries(void)
 
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
-	task_entries->nr_to_wait = 0;
 	task_entries->nr_helpers = 0;
 	futex_set(&task_entries->start, CR_STATE_FAIL);
 	mutex_init(&task_entries->userns_sync_lock);
@@ -3118,11 +3067,6 @@ int cr_restore_tasks(void)
 
 	if (prepare_pstree() < 0)
 		goto err;
-
-	futex_set(&task_entries->futex_n_wait,
-				task_entries->nr_to_wait);
-	futex_set(&task_entries->futex_n_wait_2,
-				task_entries->nr_to_wait);
 
 	{
 		struct pstree_item *pi;

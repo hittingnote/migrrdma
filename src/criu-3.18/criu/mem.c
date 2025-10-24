@@ -1105,12 +1105,9 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 	return ret;
 }
 
-#include "rdma_migr.h"
-
-static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr, bool enqueue_page)
+static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 {
 	struct vma_area *vma;
-	struct vma_area *last_vma = NULL;
 	int ret = 0;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
@@ -1149,7 +1146,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr,
 			continue;
 		}
 
-		for (i = 0; i < nr_pages; i++, last_vma = vma) {
+		for (i = 0; i < nr_pages; i++) {
 			unsigned char buf[PAGE_SIZE];
 			void *p;
 
@@ -1185,11 +1182,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr,
 					BUG();
 				}
 
-				if(enqueue_page) {
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
-					pr_debug("Enqueue page-read\n");
-				}
 
 				pr->skip_pages(pr, len);
 
@@ -1197,7 +1191,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr,
 				len >>= PAGE_SHIFT;
 				nr_restored += len;
 				i += len - 1;
-
+				pr_debug("Enqueue page-read\n");
 				continue;
 			}
 
@@ -1210,23 +1204,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr,
 
 			set_bit(off, vma->page_bitmap);
 			if (vma_inherited(vma)) {
-				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
-					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
-
-					if (vma->e->status & VMA_NO_PROT_WRITE) {
-						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
-							vma->e->end, va, nr_pages);
-						BUG();
-					}
-
-					if(enqueue_page) {
-					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
-						return -1;
-					
-					pr_debug("Enqueue page-read\n");
-				}
-				}
-
 				clear_bit(off, vma->pvma->page_bitmap);
 
 				ret = pr->read_pages(pr, va, 1, buf, 0);
@@ -1245,23 +1222,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr,
 				memcpy(p, buf, PAGE_SIZE);
 			} else {
 				int nr;
-
-				if(check_rdma_vma(vma->e->start, vma->e->end) && vma != last_vma) {
-					unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
-
-					if (vma->e->status & VMA_NO_PROT_WRITE) {
-						pr_debug("VMA 0x%" PRIx64 ":0x%" PRIx64 " RO %#lx:%lu IO\n", vma->e->start,
-							vma->e->end, va, nr_pages);
-						BUG();
-					}
-
-					if(enqueue_page) {
-					if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
-						return -1;
-					
-					pr_debug("Enqueue page-read\n");
-				}
-				}
 
 				/*
 				 * Try to read as many pages as possible at once.
@@ -1369,153 +1329,7 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	return 0;
 }
 
-static int only_premap_rdma_private_vma(struct pstree_item *t, struct vma_area *vma)
-{
-	int ret;
-	void *addr;
-	unsigned long nr_pages, size;
-
-	nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
-	vma->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
-	if (vma->page_bitmap == NULL)
-		return -1;
-
-	/*
-	 * A grow-down VMA has a guard page, which protect a VMA below it.
-	 * So one more page is mapped here to restore content of the first page
-	 */
-	if (vma_has_guard_gap_hidden(vma))
-		vma->e->start -= PAGE_SIZE;
-
-	size = vma_entry_len(vma->e);
-	if (!vma_inherited(vma)) {
-		int flag = 0;
-		/*
-		 * The respective memory area was NOT found in the parent.
-		 * Map a new one.
-		 */
-
-		/*
-		 * Restore AIO ring buffer content to temporary anonymous area.
-		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
-		 */
-		if (vma_entry_is(vma->e, VMA_AREA_AIORING))
-			flag |= MAP_ANONYMOUS;
-		else if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
-			ret = vma->vm_open(vpid(t), vma);
-			if (ret < 0) {
-				pr_err("Can't fixup VMA's fd\n");
-				return -1;
-			}
-		}
-
-		/*
-		 * All mappings here get PROT_WRITE regardless of whether we
-		 * put any data into it or not, because this area will get
-		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
-		 * bits there. Ideally we'd check for the whole COW-chain
-		 * having any data in.
-		 */
-		pr_info("Detect RDMA mem mapping %lx-%lx. Now map in.\n", vma->e->start, vma->e->end);
-		addr = mmap((void *)vma->e->start, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
-			    vma->e->pgoff);
-
-		if (addr == MAP_FAILED) {
-			pr_perror("Unable to map ANON_VMA");
-			return -1;
-		}
-	} else {
-		void *paddr;
-
-		/*
-		 * The area in question can be COWed with the parent. Remap the
-		 * parent area. Note, that it has already being passed through
-		 * the restore_priv_vma_content() call and thus may have some
-		 * pages in it.
-		 */
-
-		paddr = decode_pointer(vma->pvma->premmaped_addr);
-		if (vma_has_guard_gap_hidden(vma))
-			paddr -= PAGE_SIZE;
-
-		addr = mremap(paddr, size, size, MREMAP_FIXED | MREMAP_MAYMOVE, (void *)vma->e->start);
-		if (addr != (void *)vma->e->start) {
-			pr_perror("Unable to remap a private vma");
-			return -1;
-		}
-	}
-
-	vma->e->status |= VMA_PREMMAPED;
-	vma->premmaped_addr = (unsigned long)addr;
-	pr_debug("\tpremap %#016" PRIx64 "-%#016" PRIx64 " -> %016lx\n", vma->e->start, vma->e->end,
-		 (unsigned long)addr);
-
-	if (vma_has_guard_gap_hidden(vma)) { /* Skip guard page */
-		vma->e->start += PAGE_SIZE;
-		vma->premmaped_addr += PAGE_SIZE;
-	}
-
-	if (vma_area_is(vma, VMA_FILE_PRIVATE))
-		vma->vm_open = NULL; /* prevent from 2nd open in prepare_vmas */
-
-	return 0;
-}
-
-static int only_premap_rdma_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas)
-{
-	struct vma_area *vma;
-	int ret = 0;
-	LIST_HEAD(empty);
-
-	filemap_ctx_init(true);
-
-	list_for_each_entry(vma, &vmas->h, list) {
-		if (task_size_check(vpid(t), vma->e)) {
-			ret = -1;
-			break;
-		}
-		
-		if(!check_rdma_vma(vma->e->start, vma->e->end))
-			continue;
-
-		if (!vma_area_is_private(vma, kdat.task_size))
-			continue;
-
-		if (vma->e->flags & MAP_HUGETLB)
-			continue;
-
-		/* VMA offset may change due to plugin so we cannot premap */
-		if (vma->e->status & VMA_EXT_PLUGIN)
-			continue;
-
-		ret = only_premap_rdma_private_vma(t, vma);
-
-		if (ret < 0)
-			break;
-	}
-
-	filemap_ctx_fini();
-
-	return ret;
-}
-
-int only_prepare_rdma_mappings(struct pstree_item *t) {
-	int ret = 0;
-	struct vm_area_list *vmas;
-
-	vmas = &rsti(t)->vmas;
-	if (vmas->nr == 0) /* Zombie */
-		goto out;
-
-	ret = only_premap_rdma_priv_vmas(t, vmas);
-	if (ret < 0)
-		goto out;
-
-out:
-	return ret;
-}
-
-int prepare_mappings(struct pstree_item *t, bool enqueue_page)
+int prepare_mappings(struct pstree_item *t, bool unmap_old)
 {
 	int ret = 0;
 	void *addr;
@@ -1537,10 +1351,8 @@ int prepare_mappings(struct pstree_item *t, bool enqueue_page)
 		goto out;
 	}
 
-//	old_premmapped_addr = rsti(t)->premmapped_addr;
-//	old_premmapped_len = rsti(t)->premmapped_len;
-	old_premmapped_addr = NULL;
-	old_premmapped_len = 0;
+	old_premmapped_addr = rsti(t)->premmapped_addr;
+	old_premmapped_len = rsti(t)->premmapped_len;
 	rsti(t)->premmapped_addr = addr;
 	rsti(t)->premmapped_len = vmas->rst_priv_size;
 
@@ -1559,11 +1371,11 @@ int prepare_mappings(struct pstree_item *t, bool enqueue_page)
 
 	pr.reset(&pr);
 
-	ret = restore_priv_vma_content(t, &pr, enqueue_page);
+	ret = restore_priv_vma_content(t, &pr);
 	if (ret < 0)
 		goto out;
 
-	if (old_premmapped_addr) {
+	if (old_premmapped_addr && unmap_old) {
 		ret = munmap(old_premmapped_addr, old_premmapped_len);
 		if (ret < 0)
 			pr_perror("Unable to unmap %p(%lx)", old_premmapped_addr, old_premmapped_len);

@@ -2343,15 +2343,6 @@ ext:
 					goto err;
 				}
 			}
-
-#if 0
-			if (curr_mode != saved_mode) {
-				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
-				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
-				       rfi->path, (int)curr_mode, saved_mode);
-				goto err;
-			}
-#endif
 		}
 
 		/*

@@ -1,25 +1,20 @@
 #ifndef __RDMA_NOTIFY_H__
 #define __RDMA_NOTIFY_H__
 
-#include <stdio.h>
 #include <infiniband/verbs.h>
 #include "include/restorer.h"
-#include "include/util.h"
 
-extern int num_devices;
 extern struct ibv_device **ibv_device_list;
 
 extern int is_rdma_dev(unsigned long st_rdev);
-extern int dump_rdma(pid_t pid, char *img_dir_path);
-extern int restore_rdma(pid_t pid, char *img_dir_path);
+extern int restore_rdma(pid_t pid, char *img_dir_path,
+					struct vm_area_list *vmas);
 extern int prepare_for_partners_restore(pid_t pid);
 
 #define is_rdma_event_fd(link)								\
 	is_anon_link_type(link, "[infinibandevent]")
 
-extern int add_rdma_vma_node(pid_t pid);
 extern int add_one_rdma_vma_node(unsigned long long start, unsigned long long end);
-extern int check_rdma_vma(unsigned long long start, unsigned long long end);
 extern struct unmapped_node *get_rdma_unmapped_node(int *pn_unmapped, int *err);
 extern int add_update_node(void *ptr, size_t size, void *content_p);
 extern size_t get_update_node_size(int *n_node);

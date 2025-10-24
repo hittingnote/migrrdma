@@ -37,8 +37,6 @@
 #define CPU_CAP_ALL	(CPU_CAP_FPU | CPU_CAP_CPU | CPU_CAP_INS)
 #define CPU_CAP_DEFAULT (CPU_CAP_FPU | CPU_CAP_INS)
 
-extern int timens_helper_pid;
-
 struct cg_root_opt {
 	struct list_head node;
 	char *controller;
@@ -243,7 +241,6 @@ struct cr_options {
 
 #include <linux/limits.h>
 
-extern char check_buf[1024];
 extern char *ip_addr;
 extern int enable_pre_setup;
 

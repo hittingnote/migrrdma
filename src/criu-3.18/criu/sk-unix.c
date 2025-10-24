@@ -1060,7 +1060,7 @@ static struct fdinfo_list_entry *get_fle_for_task(struct file_desc *tgt, struct 
 	 * we're another user of it.
 	 */
 	if(owner->pid->max_fd < 0) {
-	fd = find_unused_fd(owner, -1);
+		fd = find_unused_fd(owner, -1);
 	}
 	else {
 		fd = owner->pid->max_fd + 1;

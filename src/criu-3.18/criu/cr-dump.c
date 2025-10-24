@@ -2099,7 +2099,6 @@ static int cr_dump_finish(int ret)
 }
 
 FILE *fp;
-
 #include "rdma_migr.h"
 
 int cr_dump_tasks(pid_t pid)

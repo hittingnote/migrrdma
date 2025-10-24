@@ -785,8 +785,6 @@ unsigned long arch_shmat(int shmid, void *shmaddr, int shmflg, unsigned long siz
 }
 #endif
 
-static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry);
-
 static unsigned long restore_mapping(VmaEntry *vma_entry)
 {
 	int prot = vma_entry->prot;
@@ -1037,7 +1035,7 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 	return 0;
 }
 
-static int vma_remap(struct task_restore_args *args, VmaEntry *vma_entry, int uffd)
+static int vma_remap(VmaEntry *vma_entry, int uffd)
 {
 	unsigned long src = vma_premmaped_start(vma_entry);
 	unsigned long dst = vma_entry->start;
@@ -1104,18 +1102,10 @@ static int vma_remap(struct task_restore_args *args, VmaEntry *vma_entry, int uf
 		src = addr;
 	}
 
-	if(check_is_rdma_mmap(args, vma_entry)) {
-		pr_info("(%lx-%lx) is RDMA's memory. Perform memcpy from %lx to %lx, and unmap %lx\n",
-						vma_entry->start, vma_entry->end, src, dst, src);
-		memcpy(dst, src, len);
-		sys_munmap(src, len);
-	}
-	else {
-		tmp = sys_mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
-		if (tmp != dst) {
-			pr_err("Unable to remap %lx -> %lx\n", src, dst);
-			return -1;
-		}
+	tmp = sys_mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+	if (tmp != dst) {
+		pr_err("Unable to remap %lx -> %lx\n", src, dst);
+		return -1;
 	}
 
 	/*
@@ -1539,25 +1529,6 @@ int cleanup_current_inotify_events(struct task_restore_args *task_args)
 	return 0;
 }
 
-static int check_is_rdma_mmap(struct task_restore_args *args, VmaEntry *vma_entry) {
-	int start = 0, end = args->n_unmapped - 1;
-
-	while(start <= end) {
-		int mid = (start + end) / 2;
-		if(vma_entry->start == args->unmapped[mid].start) {
-			return 1;
-		}
-		else if(vma_entry->start < args->unmapped[mid].start) {
-			end = mid - 1;
-		}
-		else {
-			start = mid + 1;
-		}
-	}
-
-	return 0;
-}
-
 #include <linux/un.h>
 
 /*
@@ -1680,7 +1651,7 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
-		if (vma_remap(args, vma_entry, args->uffd))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
 
@@ -1697,7 +1668,7 @@ long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start < vma_entry->shmid)
 			break;
 
-		if (vma_remap(args, vma_entry, args->uffd))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
 
@@ -1752,30 +1723,8 @@ long __export_restore_task(struct task_restore_args *args)
 		ssize_t r;
 
 		while (nr) {
-			int start = 0, end = args->vmas_n - 1;
 			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			while(start <= end) {
-				int mid = (start + end) / 2;
-				vma_entry = args->vmas + mid;
-				if(iovs->iov_base >= vma_entry->start && iovs->iov_base < vma_entry->end) {
-					start = mid;
-					end = mid;
-					break;
-				}
-				else if(iovs->iov_base < vma_entry->start) {
-					end = mid - 1;
-				}
-				else {
-					start = mid + 1;
-				}
-			}
-			vma_entry = args->vmas + start;
-			if(check_is_rdma_mmap(args, vma_entry)) {
-				r = iovs->iov_len;
-			}
-			else {
-				r = sys_preadv(args->vma_ios_fd, iovs, nr, rio->off);
-			}
+			r = sys_preadv(args->vma_ios_fd, iovs, nr, rio->off);
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
 				goto core_restore_end;

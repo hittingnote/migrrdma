@@ -1,5 +1,3 @@
-#include <sys/types.h>
-#include <unistd.h>
 #include "rdma_migr.h"
 #include "rbtree.h"
 
@@ -37,25 +35,6 @@ static struct rdma_vma_node *search_rdma_vma_node(unsigned long long start,
 	return node? container_of(node, struct rdma_vma_node, node): NULL;
 }
 
-int check_rdma_vma(unsigned long long start, unsigned long long end) {
-	struct rdma_vma_node *vma_node;
-
-	pthread_rwlock_rdlock(&rdma_vma.rwlock);
-	vma_node = search_rdma_vma_node(start, NULL, NULL);
-	if(!vma_node) {
-		pthread_rwlock_unlock(&rdma_vma.rwlock);
-		return 0;
-	}
-
-	if(vma_node->end != end) {
-		pthread_rwlock_unlock(&rdma_vma.rwlock);
-		return 0;
-	}
-
-	pthread_rwlock_unlock(&rdma_vma.rwlock);
-	return 1;
-}
-
 int add_one_rdma_vma_node(unsigned long long start, unsigned long long end) {
 	struct rb_node *parent, **insert;
 	struct rdma_vma_node *vma_node;
@@ -79,33 +58,6 @@ int add_one_rdma_vma_node(unsigned long long start, unsigned long long end) {
 
 	pthread_rwlock_unlock(&rdma_vma.rwlock);
 	pr_info("Add mapping (start: %llx, end: %llx)\n", start, end);
-	return 0;
-}
-
-#include "include/cr_options.h"
-
-int add_rdma_vma_node(pid_t pid) {
-	char fname[4096 + 512];
-	FILE *f_smap;
-	char strln[1024];
-
-	sprintf(fname, "%s/rdma_pid_%d/rdma_smap", images_dir, pid);
-	f_smap = fopen(fname, "r");
-	if(!f_smap)
-		return 0;
-
-	while(fgets(strln, 1024, f_smap)) {
-		unsigned long long start, end;
-		if(sscanf(strln, "%llx-%llx", &start, &end) < 2)
-			continue;
-
-		if(add_one_rdma_vma_node(start, end)) {
-			fclose(f_smap);
-			return -1;
-		}
-	}
-
-	fclose(f_smap);
 	return 0;
 }
 
