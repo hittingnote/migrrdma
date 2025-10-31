@@ -585,7 +585,9 @@ int ibv_cmd_install_qp_handle_mapping(struct ibv_context *context,
 int ibv_cmd_install_srq_handle_mapping(struct ibv_context *context,
 							int vhandle, int handle);
 int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
-							uint32_t vlkey, uint32_t lkey);
+							uint32_t vlkey, uint32_t lkey,
+							unsigned long long vaddr,
+							unsigned long long mr_vaddr);
 int ibv_cmd_install_local_rkey_mapping(struct ibv_context *context,
 							uint32_t vrkey, uint32_t rkey);
 int ibv_cmd_delete_local_rkey_mapping(struct ibv_context *context, uint32_t vrkey);

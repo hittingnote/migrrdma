@@ -60,6 +60,12 @@
 
 typedef _Atomic(uint32_t) atomic_uint32_t;
 
+struct key_map_item {
+	uint32_t					pkey;
+	unsigned long long			vaddr;
+	unsigned long long			mr_vaddr;
+};
+
 enum {
 	MLX5_IB_MMAP_CMD_SHIFT	= 8,
 	MLX5_IB_MMAP_CMD_MASK	= 0xff,

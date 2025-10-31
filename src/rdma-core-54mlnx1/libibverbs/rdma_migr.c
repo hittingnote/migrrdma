@@ -378,7 +378,7 @@ static void *restore_mr(void *parent, int mr_fd,
 	dump_info(mr_fd, info_fd, &mr_param, vlkey);
 	dump_info(mr_fd, info_fd, &mr_param, vrkey);
 
-	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param);
+	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param, NULL, 0);
 	return (*p_err)? NULL: parent;
 }
 

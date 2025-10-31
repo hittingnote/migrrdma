@@ -354,13 +354,19 @@ LATEST_SYMVER_FUNC(ibv_dealloc_pd, 1_1, "IBVERBS_1.1",
 	return get_ops(pd->context)->dealloc_pd(pd);
 }
 
+struct key_map_item {
+	uint32_t					pkey;
+	unsigned long long			vaddr;
+	unsigned long long			mr_vaddr;
+};
+
 static uint32_t get_first_empty_slot_for_lkey(struct ibv_context *context) {
-	uint32_t *lkey_arr = context->lkey_mapping;
+	struct key_map_item *lkey_arr = context->lkey_mapping;
 	uint32_t i;
 
-	for(i = 0; i < getpagesize() / sizeof(uint32_t) && lkey_arr[i]; i++);
+	for(i = 0; i < getpagesize() / sizeof(struct key_map_item) && lkey_arr[i].pkey; i++);
 
-	if(i >= getpagesize() / sizeof(uint32_t))
+	if(i >= getpagesize() / sizeof(struct key_map_item))
 		return -1;
 
 	return i;
@@ -413,7 +419,7 @@ struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 	}
 
 	vlkey = get_first_empty_slot_for_lkey(pd->context);
-	if(ibv_cmd_install_lkey_mapping(pd->context, vlkey, mr->lkey)) {
+	if(ibv_cmd_install_lkey_mapping(pd->context, vlkey, mr->lkey, addr, addr)) {
 		ibv_dereg_mr(mr);
 		return NULL;
 	}
@@ -480,20 +486,47 @@ LATEST_SYMVER_FUNC(ibv_reg_mr, 1_1, "IBVERBS_1.1",
 	return ibv_reg_mr_iova2(pd, addr, length, (uintptr_t)addr, access);
 }
 
+#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
+	int start = 0, end = (__size__) - 1;											\
+	struct vm_arr_ent *__ret__ = NULL;												\
+	while(start <= end) {															\
+		int mid = (start + end) / 2;												\
+		if((__vma_arr__)[mid].start <= __addr__ &&									\
+					(__vma_arr__)[mid].end > __addr__) {							\
+			__ret__ = &(__vma_arr__)[mid];											\
+			break;																	\
+		}																			\
+		else if(__addr__ < (__vma_arr__)[mid].start) {								\
+			end = mid - 1;															\
+		}																			\
+		else {																		\
+			start = mid + 1;														\
+		}																			\
+	}																				\
+																					\
+	__ret__;																		\
+})
+
 static struct ibv_mr *__ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
-				uint64_t iova, unsigned int access, int mr_handle, uint32_t vlkey, uint32_t vrkey)
+				uint64_t iova, unsigned int access, int mr_handle, uint32_t vlkey, uint32_t vrkey,
+				struct vma_arr_ent *vma_arr, int cnt)
 {
 	struct verbs_device *device = verbs_get_device(pd->context->device);
 	bool odp_mr = access & IBV_ACCESS_ON_DEMAND;
 	struct ibv_mr *mr;
+	struct vma_arr_ent *target;
+	void *tmp_addr;
+
+	target = match_vma_arr(vma_arr, cnt, addr);
+	tmp_addr = (void*)(target->premapped_addr + ((void *)addr - target->start));
 
 	if (!(device->core_support & IB_UVERBS_CORE_SUPPORT_OPTIONAL_MR_ACCESS))
 		access &= ~IBV_ACCESS_OPTIONAL_RANGE;
 
-	if (!odp_mr && ibv_dontfork_range(addr, length))
+	if (!odp_mr && ibv_dontfork_range(tmp_addr, length))
 		return NULL;
 
-	mr = get_ops(pd->context)->reg_mr(pd, addr, length, iova, access);
+	mr = get_ops(pd->context)->reg_mr(pd, tmp_addr, length, (uintptr_t)tmp_addr, access);
 	if (mr) {
 		mr->context = pd->context;
 		mr->pd      = pd;
@@ -509,7 +542,7 @@ static struct ibv_mr *__ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t l
 		return NULL;
 	}
 
-	if(ibv_cmd_install_lkey_mapping(pd->context, vlkey, mr->lkey)) {
+	if(ibv_cmd_install_lkey_mapping(pd->context, vlkey, mr->lkey, addr, tmp_addr)) {
 		ibv_dereg_mr(mr);
 		return NULL;
 	}
@@ -524,7 +557,8 @@ static struct ibv_mr *__ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t l
 
 LATEST_SYMVER_FUNC(ibv_resume_mr, 1_1, "IBVERBS_1.1",
 			int, struct ibv_context *context, struct ibv_pd *pd,
-					const struct ibv_resume_mr_param *mr_param) {
+					const struct ibv_resume_mr_param *mr_param,
+					struct vma_arr_ent *vma_arr, int cnt) {
 	struct ibv_mr *mr;
 	char fname[128];
 	int mr_dir_fd;
@@ -534,7 +568,7 @@ LATEST_SYMVER_FUNC(ibv_resume_mr, 1_1, "IBVERBS_1.1",
 	mr = __ibv_reg_mr_iova2(pd, mr_param->iova, mr_param->length,
 							(uintptr_t)mr_param->iova,
 							mr_param->access_flags, mr_param->mr_vhandle,
-							mr_param->vlkey, mr_param->vrkey);
+							mr_param->vlkey, mr_param->vrkey, vma_arr, cnt);
 	if(!mr) {
 		return -1;
 	}
@@ -892,27 +926,6 @@ LATEST_SYMVER_FUNC(ibv_create_cq, 1_1, "IBVERBS_1.1",
 
 	return cq;
 }
-
-#define match_vma_arr(__vma_arr__, __size__, __addr__) ({							\
-	int start = 0, end = (__size__) - 1;											\
-	struct vm_arr_ent *__ret__ = NULL;												\
-	while(start <= end) {															\
-		int mid = (start + end) / 2;												\
-		if((__vma_arr__)[mid].start <= __addr__ &&									\
-					(__vma_arr__)[mid].end > __addr__) {							\
-			__ret__ = &(__vma_arr__)[mid];											\
-			break;																	\
-		}																			\
-		else if(__addr__ < (__vma_arr__)[mid].start) {								\
-			end = mid - 1;															\
-		}																			\
-		else {																		\
-			start = mid + 1;														\
-		}																			\
-	}																				\
-																					\
-	__ret__;																		\
-})
 
 LATEST_SYMVER_FUNC(ibv_resume_cq, 1_1, "IBVERBS_1.1",
 			struct ibv_cq *, struct ibv_context *context,

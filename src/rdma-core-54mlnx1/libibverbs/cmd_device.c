@@ -201,12 +201,16 @@ int ibv_cmd_install_cq_handle_mapping(struct ibv_context *context,
 }
 
 int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
-							uint32_t vlkey, uint32_t lkey) {
+						uint32_t vlkey, uint32_t lkey,
+						unsigned long long vaddr,
+						unsigned long long mr_addr) {
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
-					UVERBS_METHOD_INSTALL_LKEY_MAPPING, 2);
+					UVERBS_METHOD_INSTALL_LKEY_MAPPING, 4);
 	
 	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vlkey);
 	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &lkey);
+	fill_attr_in_ptr(cmdb, 2, &vaddr);
+	fill_attr_in_ptr(cmdb, 3, &mr_addr);
 
 	return execute_ioctl(context, cmdb);
 }

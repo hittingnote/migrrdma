@@ -2559,7 +2559,8 @@ struct ibv_resume_mr_param {
 };
 
 int ibv_resume_mr(struct ibv_context *context, struct ibv_pd *pd,
-			const struct ibv_resume_mr_param *mr_param);
+			const struct ibv_resume_mr_param *mr_param,
+			struct vma_arr_ent *vma_arr, int cnt);
 
 /**
  * ibv_dealloc_pd - Free a protection domain

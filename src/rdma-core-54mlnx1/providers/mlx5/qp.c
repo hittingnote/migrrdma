@@ -320,19 +320,23 @@ static void set_datagram_seg(struct mlx5_wqe_datagram_seg *dseg,
 static void set_data_ptr_seg(struct ibv_context *ctx, struct mlx5_wqe_data_seg *dseg, struct ibv_sge *sg,
 			     int offset)
 {
-	uint32_t *lkey_arr = ctx->lkey_mapping;
+	uint64_t addr;
+	struct key_map_item *lkey_arr = ctx->lkey_mapping;
 	dseg->byte_count = htobe32(sg->length - offset);
-	dseg->lkey       = htobe32(lkey_arr[sg->lkey]);
-	dseg->addr       = htobe64(sg->addr + offset);
+	dseg->lkey       = htobe32(lkey_arr[sg->lkey].pkey);
+	addr = lkey_arr[sg->lkey].mr_vaddr + (sg->addr - lkey_arr[sg->lkey].vaddr);
+	dseg->addr       = htobe64(addr + offset);
 }
 
 static void set_data_ptr_seg_atomic(struct ibv_context *ctx, struct mlx5_wqe_data_seg *dseg,
 				    struct ibv_sge *sg)
 {
-	uint32_t *lkey_arr = ctx->lkey_mapping;
+	uint64_t addr;
+	struct key_map_item *lkey_arr = ctx->lkey_mapping;
 	dseg->byte_count = htobe32(MLX5_ATOMIC_SIZE);
-	dseg->lkey       = htobe32(lkey_arr[sg->lkey]);
-	dseg->addr       = htobe64(sg->addr);
+	dseg->lkey       = htobe32(lkey_arr[sg->lkey].pkey);
+	addr = lkey_arr[sg->lkey].mr_vaddr + (sg->addr - lkey_arr[sg->lkey].vaddr);
+	dseg->addr       = htobe64(addr);
 }
 
 static void set_data_ptr_seg_end(struct mlx5_wqe_data_seg *dseg)

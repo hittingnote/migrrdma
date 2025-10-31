@@ -205,10 +205,12 @@ int __mlx5_post_srq_recv__(struct ibv_srq *ibsrq,
 		scat      = (struct mlx5_wqe_data_seg *) (next + 1);
 
 		for (i = 0; i < wr->num_sge; ++i) {
-			uint32_t *lkey_arr = ibsrq->context->lkey_mapping;
+			uint64_t addr;
+			struct key_map_item *lkey_arr = ibsrq->context->lkey_mapping;
 			scat[i].byte_count = htobe32(wr->sg_list[i].length);
-			scat[i].lkey       = htobe32(lkey_arr[wr->sg_list[i].lkey]);
-			scat[i].addr       = htobe64(wr->sg_list[i].addr);
+			scat[i].lkey       = htobe32(lkey_arr[wr->sg_list[i].lkey].pkey);
+			addr = lkey_arr[wr->sg_list[i].lkey].mr_vaddr + (wr->sg_list[i].addr - lkey_arr[wr->sg_list[i].lkey].vaddr);
+			scat[i].addr       = htobe64(addr);
 		}
 
 		if (i < srq->max_gs) {
