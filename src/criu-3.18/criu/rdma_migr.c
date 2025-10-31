@@ -291,9 +291,7 @@ static void *restore_mr(void *parent, int mr_fd,
 	dump_info(mr_fd, info_fd, &mr_param, vlkey);
 	dump_info(mr_fd, info_fd, &mr_param, vrkey);
 
-	target = match_vma_arr(vma_arr, cnt, mr_param.iova);
-	mr_param.iova = (void*)(target->premapped_addr + ((void*)mr_param.iova - target->start));
-	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param);
+	*p_err = ibv_resume_mr(tmp_pd->context, tmp_pd, &mr_param, vma_arr, cnt);
 	return (*p_err)? NULL: parent;
 }
 
