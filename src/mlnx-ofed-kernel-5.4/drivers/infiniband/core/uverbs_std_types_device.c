@@ -487,18 +487,30 @@ static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LQPN_MAPPING)(
 	return 0;
 }
 
+struct key_map_item {
+	uint32_t					pkey;
+	unsigned long long			vaddr;
+	unsigned long long			mr_vaddr;
+};
+
 static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LKEY_MAPPING)(
 				struct uverbs_attr_bundle *attrs) {
 	uint32_t vlkey, lkey;
+	unsigned long long vaddr;
+	unsigned long long mr_addr;
 	int ret;
-	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
+	struct key_map_item *lkey_arr = attrs->ufile->lkey_mapping;
 
 	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
 	ret = uverbs_copy_from(&lkey, attrs, UVERBS_ATTR_HANDLE);
+	ret = uverbs_copy_from(&vaddr, attrs, 2);
+	ret = uverbs_copy_from(&mr_addr, attrs, 3);
 	if(ret)
 		return ret;
 
-	lkey_arr[vlkey] = lkey;
+	lkey_arr[vlkey].pkey = lkey;
+	lkey_arr[vlkey].vaddr = vaddr;
+	lkey_arr[vlkey].mr_vaddr = mr_addr;
 	return 0;
 }
 
@@ -548,13 +560,15 @@ static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LKEY_MAPPING)(
 				struct uverbs_attr_bundle *attrs) {
 	uint32_t vlkey;
 	int ret;
-	uint32_t *lkey_arr = attrs->ufile->lkey_mapping;
+	struct key_map_item *lkey_arr = attrs->ufile->lkey_mapping;
 
 	ret = uverbs_copy_from(&vlkey, attrs, UVERBS_ATTR_VHANDLE);
 	if(ret)
 		return ret;
 
-	lkey_arr[vlkey] = 0;
+	lkey_arr[vlkey].pkey = 0;
+	lkey_arr[vlkey].vaddr = 0;
+	lkey_arr[vlkey].mr_vaddr = 0;
 	return 0;
 }
 
@@ -908,7 +922,11 @@ DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
 				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
-				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(2,
+				UVERBS_ATTR_TYPE(u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(3,
+				UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING,
