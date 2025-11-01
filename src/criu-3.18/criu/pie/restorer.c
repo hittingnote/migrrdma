@@ -1531,6 +1531,28 @@ int cleanup_current_inotify_events(struct task_restore_args *task_args)
 
 #include <linux/un.h>
 
+static inline struct rdma_premap_node *get_premap_node(
+						struct task_restore_args *args, VmaEntry *ent) {
+	unsigned long long second_start = vma_premmaped_start(ent);
+	int start = 0;
+	int end = args->n_premap - 1;
+
+	while(start <= end) {
+		int mid = (start + end) / 2;
+		if(args->premap[mid].second_addr == second_start) {
+			return &args->premap[mid];
+		}
+		else if(args->premap[mid].second_addr < second_start) {
+			start = mid + 1;
+		}
+		else {
+			end = mid - 1;
+		}
+	}
+
+	return NULL;
+}
+
 /*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
@@ -1640,6 +1662,8 @@ long __export_restore_task(struct task_restore_args *args)
 
 	/* Shift private vma-s to the left */
 	for (i = 0; i < args->vmas_n; i++) {
+		struct rdma_premap_node *premap_node;
+
 		vma_entry = args->vmas + i;
 
 		if (!vma_entry_is(vma_entry, VMA_PREMMAPED))
@@ -1650,6 +1674,14 @@ long __export_restore_task(struct task_restore_args *args)
 
 		if (vma_entry->start > vma_entry->shmid)
 			break;
+
+		premap_node = get_premap_node(args, vma_entry);
+		if(premap_node) {
+			void *src = vma_premmaped_start(vma_entry);
+			void *dst = premap_node->first_addr;
+			memcpy(dst, src, premap_node->size);
+			vma_premmaped_start(vma_entry) = dst;
+		}
 
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;

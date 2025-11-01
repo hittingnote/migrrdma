@@ -138,6 +138,12 @@ struct unmapped_node {
 	unsigned long long				end;
 };
 
+struct rdma_premap_node {
+	unsigned long long				second_addr;
+	unsigned long long				first_addr;
+	size_t							size;
+};
+
 struct update_mem_node {
 	void					*ptr;
 	size_t					size;
@@ -177,6 +183,8 @@ struct task_restore_args {
 	char						images_dir[128];
 	struct unmapped_node *unmapped;
 	int n_unmapped;
+	struct rdma_premap_node *premap;
+	int n_premap;
 	struct update_mem_node			*update_arr;
 	int								n_update;
 	struct qp_replay_call_entry		*qp_replay_arr;

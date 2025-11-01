@@ -15,7 +15,14 @@ extern int prepare_for_partners_restore(pid_t pid);
 	is_anon_link_type(link, "[infinibandevent]")
 
 extern int add_one_rdma_vma_node(unsigned long long start, unsigned long long end);
+extern int add_one_premap_node(unsigned long long second_addr,
+						unsigned long long first_addr, size_t size);
+extern int get_premap_node(unsigned long long second_addr,
+					unsigned long long *first_addr, size_t *size);
+extern int del_one_premap_node(unsigned long long second_addr);
+extern int add_premap_node(pid_t pid);
 extern struct unmapped_node *get_rdma_unmapped_node(int *pn_unmapped, int *err);
+extern struct rdma_premap_node *get_rdma_premap_node(int *n_arr, int *err);
 extern int add_update_node(void *ptr, size_t size, void *content_p);
 extern size_t get_update_node_size(int *n_node);
 extern void copy_update_nodes(void *to);

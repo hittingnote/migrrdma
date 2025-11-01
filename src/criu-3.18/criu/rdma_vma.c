@@ -11,7 +11,7 @@ struct rdma_vma_node {
 
 static int rdma_vma_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
 	struct rdma_vma_node *ent1 = n1? container_of(n1, struct rdma_vma_node, node): NULL;
-	struct rdma_vma_node *ent2 = n1? container_of(n2, struct rdma_vma_node, node): NULL;
+	struct rdma_vma_node *ent2 = n2? container_of(n2, struct rdma_vma_node, node): NULL;
 	if(ent1->start < ent2->start)
 		return -1;
 	else if(ent1->start > ent2->start)
@@ -172,4 +172,163 @@ struct unmapped_node *get_rdma_unmapped_node(int *pn_unmapped, int *err) {
 	*err = 0;
 	*pn_unmapped = n_unmapped;
 	return unmapped;
+}
+
+static declare_and_init_rbtree(second_premap);
+
+struct second_premap_node {
+	struct rb_node					node;
+	unsigned long long				second_premap_addr;
+	unsigned long long				first_premap_addr;
+	size_t							size;
+};
+
+static int second_premap_node_compare(const struct rb_node *n1, const struct rb_node *n2) {
+	struct second_premap_node *ent1 = n1? container_of(n1, struct second_premap_node, node): NULL;
+	struct second_premap_node *ent2 = n2? container_of(n2, struct second_premap_node, node): NULL;
+
+	if(ent1->second_premap_addr < ent2->second_premap_addr)
+		return -1;
+	else if(ent1->second_premap_addr > ent2->second_premap_addr)
+		return 1;
+	else
+		return 0;
+}
+
+static struct second_premap_node *to_second_premap_node(struct rb_node *n) {
+	return n? container_of(n, struct second_premap_node, node): NULL;
+}
+
+static struct second_premap_node *search_second_premap_node(unsigned long long second_addr,
+							struct rb_node **p_parent, struct rb_node ***p_insert) {
+	struct second_premap_node my_node = {.second_premap_addr = second_addr};
+	struct rb_node *node;
+
+	node = ___search(&my_node.node, &second_premap, p_parent, p_insert,
+						SEARCH_EXACTLY, second_premap_node_compare);
+
+	return node? container_of(node, struct second_premap_node, node): NULL;
+}
+
+int add_one_premap_node(unsigned long long second_addr,
+						unsigned long long first_addr, size_t size) {
+	struct rb_node *parent, **insert;
+	struct second_premap_node *premap_node;
+
+	pthread_rwlock_wrlock(&second_premap.rwlock);
+	premap_node = search_second_premap_node(second_addr,
+							&parent, &insert);
+	if(premap_node) {
+		pthread_rwlock_unlock(&second_premap.rwlock);
+		return -EEXIST;
+	}
+
+	premap_node = malloc(sizeof(*premap_node));
+	if(!premap_node) {
+		pthread_rwlock_unlock(&second_premap.rwlock);
+		return -ENOMEM;
+	}
+
+	premap_node->second_premap_addr = second_addr;
+	premap_node->first_premap_addr = first_addr;
+	premap_node->size = size;
+	rbtree_add_node(&premap_node->node, parent, insert, &second_premap);
+
+	pthread_rwlock_unlock(&second_premap.rwlock);
+	return 0;
+}
+
+int get_premap_node(unsigned long long second_addr,
+					unsigned long long *first_addr, size_t *size) {
+	struct second_premap_node *premap_node;
+
+	pthread_rwlock_rdlock(&second_premap.rwlock);
+	premap_node = search_second_premap_node(second_addr,
+							NULL, NULL);
+	if(!premap_node) {
+		pthread_rwlock_unlock(&second_premap.rwlock);
+		return -ENOENT;
+	}
+
+	if(first_addr)
+		*first_addr = premap_node->first_premap_addr;
+	if(size)
+		*size = premap_node->size;
+
+	pthread_rwlock_unlock(&second_premap.rwlock);
+	return 0;
+}
+
+int del_one_premap_node(unsigned long long second_addr) {
+	struct second_premap_node *premap_node;
+
+	pthread_rwlock_wrlock(&second_premap.rwlock);
+	premap_node = search_second_premap_node(second_addr,
+							NULL, NULL);
+	if(!premap_node) {
+		pthread_rwlock_unlock(&second_premap.rwlock);
+		return -ENOENT;
+	}
+
+	rbtree_rm_node(premap_node, &second_premap);
+	pthread_rwlock_unlock(&second_premap.rwlock);
+	return 0;
+}
+
+#include "include/cr_options.h"
+
+int add_premap_node(pid_t pid) {
+	char fname[4096 + 512];
+	FILE *f_smap;
+	char strln[1024];
+
+	sprintf(fname, "%s/rdma_pid_%d/rdma_smap", images_dir, pid);
+	f_smap = fopen(fname, "r");
+	if(!f_smap)
+		return 0;
+
+	while(fgets(strln, 1024, f_smap) != NULL) {
+		unsigned long long start, end;
+		if(sscanf(strln, "%llx-%llx", &start, &end) < 2)
+			continue;
+
+		if(add_one_premap_node(start, 0, end - start)) {
+			fclose(f_smap);
+			return -1;
+		}
+	}
+
+	fclose(f_smap);
+	return 0;
+}
+
+struct rdma_premap_node *get_rdma_premap_node(int *n_arr, int *err) {
+	int cnt = 0;
+	struct rdma_premap_node *premap_node_arr;
+	struct second_premap_node *iter_node;
+
+	*err = 0;
+
+	for_each_rbtree_entry(iter_node, &second_premap,
+					to_second_premap_node, node) {
+		cnt++;
+	}
+
+	premap_node_arr = malloc(sizeof(*premap_node_arr) * cnt);
+	if(!premap_node_arr) {
+		*err = -ENOMEM;
+		return NULL;
+	}
+
+	cnt = 0;
+	for_each_rbtree_entry(iter_node, &second_premap,
+					to_second_premap_node, node) {
+		premap_node_arr[cnt].second_addr = iter_node->second_premap_addr;
+		premap_node_arr[cnt].first_addr = iter_node->first_premap_addr;
+		premap_node_arr[cnt].size = iter_node->size;
+		cnt++;
+	}
+
+	*n_arr = cnt;
+	return premap_node_arr;
 }

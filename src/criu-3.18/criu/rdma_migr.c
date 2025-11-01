@@ -1513,6 +1513,14 @@ int stop_and_copy_update_state(struct pstree_item *current,
 					&vma2->list != &vmas.h) {
 		if(vma1->e->start == vma2->e->start &&
 						vma1->e->end == vma2->e->end) {
+			unsigned long long first_addr;
+			size_t size;
+
+			if(!get_premap_node(vma1->e->start, &first_addr, &size)) {
+				del_one_premap_node(vma1->e->start);
+				add_one_premap_node(vma1->e->start, vma1->premmaped_addr, size);
+			}
+
 			vma2->e->status = vma1->e->status;
 			nr_pages = vma_entry_len(vma2->e) / PAGE_SIZE;
 			if(vma1->page_bitmap) {

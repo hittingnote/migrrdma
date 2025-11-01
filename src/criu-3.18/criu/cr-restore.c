@@ -900,6 +900,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	struct task_restore_args *ta;
 	struct unmapped_node *unmapped;
 	struct unmapped_node *ta_unmapped;
+	struct rdma_premap_node *premap;
+	int n_premap;
 	int n_unmapped;
 	int n_update;
 	size_t update_size;
@@ -926,12 +928,19 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 	}
 
+	premap = get_rdma_premap_node(&n_premap, &err);
+	if(err) {
+		pr_err("Error occurs when get_rdma_premap_node\n");
+		return -1;
+	}
+
 	update_size = get_update_node_size(&n_update);
 	qp_replay_size = get_qp_replay_size(&n_qp_replay);
 	srq_replay_size = get_srq_replay_size(&n_srq_replay);
 	msg_meta_size = get_send_msg_meta_size(&n_msg);
 	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads
 						+ n_unmapped * sizeof(*unmapped)
+						+ n_premap * sizeof(*premap)
 						+ update_size + qp_replay_size + srq_replay_size + msg_meta_size
 						+ get_total_content_size()
 						+ get_send_msg_size(), page_size());
@@ -950,8 +959,13 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	free(unmapped);
 
+	ta->n_premap = n_premap;
+	ta->premap = (void*)(ta->unmapped + n_unmapped);
+	memcpy(ta->premap, premap, sizeof(*premap) * n_premap);
+	free(premap);
+
 	ta->n_update = n_update;
-	ta->update_arr = (void *)(ta->unmapped + n_unmapped);
+	ta->update_arr = (void *)(ta->premap + n_premap);
 	copy_update_nodes(ta->update_arr);
 
 	ta->n_qp_replay = n_qp_replay;
@@ -2125,6 +2139,12 @@ static int restore_task_with_children(void *_arg)
 			goto err;
 	}
 
+	if(enable_pre_setup) {
+		if(add_premap_node(pid)) {
+			goto err;
+		}
+	}
+
 	if (setup_newborn_fds(current))
 		goto err;
 
@@ -2219,10 +2239,19 @@ static int restore_task_with_children(void *_arg)
 		}
 
 		list_for_each_entry(vma, &rsti(current)->vmas.h, list) {
+			unsigned long long first_addr;
+			size_t size;
+
 			vma_arr[curp].start = vma->e->start;
 			vma_arr[curp].end = vma->e->end;
 			vma_arr[curp].premapped_addr = vma->premmaped_addr;
 			curp++;
+
+			if(!get_premap_node(vma->e->start, &first_addr, &size)) {
+				del_one_premap_node(vma->e->start);
+				add_one_premap_node(vma->premmaped_addr, first_addr, size);
+				add_one_rdma_vma_node(first_addr, first_addr + size);
+			}
 		}
 
 		if(ibv_prepare_for_replay(load_qp_callback, load_srq_callback,
@@ -4199,6 +4228,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 					+ sizeof(struct thread_restore_args) * current->nr_threads);
 	task_args->unmapped = ta_unmapped;
 
+	task_args->premap = (void *)task_args->premap - task_args->base +
+										(void *)task_args;
 	task_args->update_arr = (void *)task_args->update_arr - task_args->base +
 										(void *)task_args;
 	task_args->qp_replay_arr = (void *)task_args->qp_replay_arr - task_args->base +
