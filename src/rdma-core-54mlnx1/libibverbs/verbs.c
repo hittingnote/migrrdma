@@ -373,12 +373,12 @@ static uint32_t get_first_empty_slot_for_lkey(struct ibv_context *context) {
 }
 
 static uint32_t get_first_empty_slot_for_rkey(struct ibv_context *context) {
-	uint32_t *rkey_arr = context->rkey_mapping;
+	struct key_map_item *rkey_arr = context->rkey_mapping;
 	uint32_t i;
 
-	for(i = 0; i < getpagesize() / sizeof(uint32_t) && rkey_arr[i]; i++);
+	for(i = 0; i < getpagesize() / sizeof(struct key_map_item) && rkey_arr[i].pkey; i++);
 
-	if(i >= getpagesize() / sizeof(uint32_t))
+	if(i >= getpagesize() / sizeof(struct key_map_item))
 		return -1;
 
 	return i;
@@ -427,7 +427,7 @@ struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 	mr->lkey = vlkey;
 
 	vrkey = get_first_empty_slot_for_rkey(pd->context);
-	if(ibv_cmd_install_local_rkey_mapping(pd->context, vrkey, mr->rkey)) {
+	if(ibv_cmd_install_local_rkey_mapping(pd->context, vrkey, mr->rkey, addr, addr)) {
 		ibv_dereg_mr(mr);
 		return NULL;
 	}
@@ -547,7 +547,7 @@ static struct ibv_mr *__ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t l
 		return NULL;
 	}
 
-	if(ibv_cmd_install_local_rkey_mapping(pd->context, vrkey, mr->rkey)) {
+	if(ibv_cmd_install_local_rkey_mapping(pd->context, vrkey, mr->rkey, addr, tmp_addr)) {
 		ibv_dereg_mr(mr);
 		return NULL;
 	}

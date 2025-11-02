@@ -210,14 +210,21 @@ struct msg_fmt {
 	uint32_t				vrkey;
 };
 
+struct reply_fmt {
+	uint32_t				rkey;
+	unsigned long long		vaddr;
+	unsigned long long		mr_addr;
+};
+
 static inline void set_raddr_seg(struct ibv_qp *qp, struct mlx5_wqe_raddr_seg *rseg,
 				 uint64_t remote_addr, uint32_t rkey)
 {
-	uint32_t *rkey_arr = qp->rkey_arr;
+	uint64_t addr;
+	struct key_map_item *rkey_arr = qp->rkey_arr;
 
-	if(!rkey_arr[rkey]) {
-		uint32_t *local_rkey_arr = qp->context->rkey_mapping;
-		uint32_t remote_real_rkey;
+	if(!rkey_arr[rkey].pkey) {
+		struct key_map_item *local_rkey_arr = qp->context->rkey_mapping;
+		struct reply_fmt reply;
 		struct sockaddr_in remote_netaddr;
 		struct msg_fmt msg_fmt;
 		int sk;
@@ -241,16 +248,19 @@ static inline void set_raddr_seg(struct ibv_qp *qp, struct mlx5_wqe_raddr_seg *r
 			return;
 		}
 
-		err = recvfrom(sk, &remote_real_rkey, sizeof(remote_real_rkey), 0, NULL, NULL);
+		err = recvfrom(sk, &reply, sizeof(reply), 0, NULL, NULL);
 		if(err < 0) {
 			return;
 		}
 
-		rkey_arr[rkey] = remote_real_rkey;
+		rkey_arr[rkey].pkey = reply.rkey;
+		rkey_arr[rkey].vaddr = reply.vaddr;
+		rkey_arr[rkey].mr_vaddr = reply.mr_addr;
 	}
 
-	rseg->raddr    = htobe64(remote_addr);
-	rseg->rkey     = htobe32(rkey_arr[rkey]);
+	addr = rkey_arr[rkey].mr_vaddr + (remote_addr - rkey_arr[rkey].vaddr);
+	rseg->raddr    = htobe64(addr);
+	rseg->rkey     = htobe32(rkey_arr[rkey].pkey);
 	rseg->reserved = 0;
 }
 

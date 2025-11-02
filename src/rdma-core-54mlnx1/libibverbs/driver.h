@@ -589,7 +589,9 @@ int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
 							unsigned long long vaddr,
 							unsigned long long mr_vaddr);
 int ibv_cmd_install_local_rkey_mapping(struct ibv_context *context,
-							uint32_t vrkey, uint32_t rkey);
+							uint32_t vrkey, uint32_t rkey,
+							unsigned long long vaddr,
+							unsigned long long mr_addr);
 int ibv_cmd_delete_local_rkey_mapping(struct ibv_context *context, uint32_t vrkey);
 int ibv_cmd_delete_lkey_mapping(struct ibv_context *context, uint32_t vlkey);
 int ibv_cmd_register_remote_gid_pid(struct ibv_context *context,

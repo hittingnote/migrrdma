@@ -216,12 +216,16 @@ int ibv_cmd_install_lkey_mapping(struct ibv_context *context,
 }
 
 int ibv_cmd_install_local_rkey_mapping(struct ibv_context *context,
-							uint32_t vrkey, uint32_t rkey) {
+							uint32_t vrkey, uint32_t rkey,
+							unsigned long long vaddr,
+							unsigned long long mr_addr) {
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_FOOTPRINT,
-					UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING, 2);
+					UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING, 4);
 	
 	fill_attr_in_ptr(cmdb, UVERBS_ATTR_VHANDLE, &vrkey);
 	fill_attr_in_ptr(cmdb, UVERBS_ATTR_HANDLE, &rkey);
+	fill_attr_in_ptr(cmdb, 2, &vaddr);
+	fill_attr_in_ptr(cmdb, 3, &mr_addr);
 
 	return execute_ioctl(context, cmdb);
 }
