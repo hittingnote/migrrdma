@@ -5,6 +5,8 @@ struct rkey_mapping_node {
 	pid_t					pid;
 	uint32_t				vrkey;
 	uint32_t				rkey;
+	unsigned long long		vaddr;
+	unsigned long long		mr_addr;
 	struct rb_node			node;
 };
 
@@ -34,7 +36,8 @@ static struct rkey_mapping_node *search(pid_t pid, uint32_t vrkey,
 	return node? container_of(node, struct rkey_mapping_node, node): NULL;
 }
 
-int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey) {
+int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey,
+				unsigned long long vaddr, unsigned long long mr_addr) {
 	struct rkey_mapping_node *mapping_node;
 	struct rb_node *parent, **insert;
 
@@ -55,6 +58,8 @@ int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey) {
 	mapping_node->pid = pid;
 	mapping_node->vrkey = vrkey;
 	mapping_node->rkey = rkey;
+	mapping_node->vaddr = vaddr;
+	mapping_node->mr_addr = mr_addr;
 	rbtree_add_node(&mapping_node->node, parent, insert, &rkey_mapping_table);
 	write_unlock(&rkey_mapping_table.rwlock);
 
@@ -80,6 +85,12 @@ struct msg_fmt {
 	uint32_t				vrkey;
 };
 
+struct reply_fmt {
+	uint32_t				rkey;
+	unsigned long long		vaddr;
+	unsigned long long		mr_addr;
+};
+
 static struct task_struct *rkey_service_task;
 static struct socket *sock;
 
@@ -89,7 +100,7 @@ static int rkey_translate_service(void *unused) {
 	struct msghdr msg;
 	struct kvec vec;
 	struct msg_fmt msg_content;
-	uint32_t rkey;
+	struct reply_fmt reply;
 	struct rkey_mapping_node *mapping_node;
 
 	err = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, 0, &sock);
@@ -123,14 +134,16 @@ static int rkey_translate_service(void *unused) {
 
 		read_lock(&rkey_mapping_table.rwlock);
 		mapping_node = search(msg_content.pid, msg_content.vrkey, NULL, NULL);
-		rkey = mapping_node? mapping_node->rkey: -1;
+		reply.rkey = mapping_node? mapping_node->rkey: -1;
+		reply.vaddr = mapping_node? mapping_node->vaddr: NULL;
+		reply.mr_addr = mapping_node? mapping_node->mr_addr: NULL;
 		read_unlock(&rkey_mapping_table.rwlock);
 
 		memset(&vec, 0, sizeof(vec));
 
-		vec.iov_base = &rkey;
-		vec.iov_len = sizeof(rkey);
-		err = kernel_sendmsg(sock, &msg, &vec, 1, sizeof(rkey));
+		vec.iov_base = &reply;
+		vec.iov_len = sizeof(reply);
+		err = kernel_sendmsg(sock, &msg, &vec, 1, sizeof(reply));
 		if(err < 0) {
 			err_info("kernel_sendmsg error\n");
 			continue;

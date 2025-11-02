@@ -517,29 +517,37 @@ static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LKEY_MAPPING)(
 static int UVERBS_HANDLER(UVERBS_METHOD_INSTALL_LOCAL_RKEY_MAPPING)(
 				struct uverbs_attr_bundle *attrs) {
 	uint32_t vrkey, rkey;
+	unsigned long long vaddr;
+	unsigned long long mr_addr;
 	int ret;
-	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
+	struct key_map_item *rkey_arr = attrs->ufile->rkey_mapping;
 
 	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
 	ret = uverbs_copy_from(&rkey, attrs, UVERBS_ATTR_HANDLE);
+	ret = uverbs_copy_from(&vaddr, attrs, 2);
+	ret = uverbs_copy_from(&mr_addr, attrs, 3);
 	if(ret)
 		return ret;
 
-	rkey_arr[vrkey] = rkey;
-	return service_register_rkey_mapping(current->tgid, vrkey, rkey);
+	rkey_arr[vrkey].pkey = rkey;
+	rkey_arr[vrkey].vaddr = vaddr;
+	rkey_arr[vrkey].mr_vaddr = mr_addr;
+	return service_register_rkey_mapping(current->tgid, vrkey, rkey, vaddr, mr_addr);
 }
 
 static int UVERBS_HANDLER(UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING)(
 				struct uverbs_attr_bundle *attrs) {
 	uint32_t vrkey;
 	int ret;
-	uint32_t *rkey_arr = attrs->ufile->rkey_mapping;
+	struct key_map_item *rkey_arr = attrs->ufile->rkey_mapping;
 
 	ret = uverbs_copy_from(&vrkey, attrs, UVERBS_ATTR_VHANDLE);
 	if(ret)
 		return ret;
 
-	rkey_arr[vrkey] = 0;
+	rkey_arr[vrkey].pkey = 0;
+	rkey_arr[vrkey].vaddr = 0;
+	rkey_arr[vrkey].mr_vaddr = 0;
 	return service_delete_rkey_mapping(current->tgid, vrkey);
 }
 
@@ -933,7 +941,11 @@ DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_VHANDLE,
 				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_HANDLE,
-				UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+				UVERBS_ATTR_TYPE(u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(2,
+				UVERBS_ATTR_TYPE(u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(3,
+				UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
 	UVERBS_METHOD_DELETE_LOCAL_RKEY_MAPPING,

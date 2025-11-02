@@ -118,7 +118,8 @@ extern void unregister_qp_symlink(u32 vqpn);
 
 extern int register_remote_rkey_mapping(struct ib_uverbs_file *ufile,
 						union ib_gid *gid, pid_t pid);
-extern int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey);
+extern int service_register_rkey_mapping(pid_t pid, uint32_t vrkey, uint32_t rkey,
+						unsigned long long vaddr, unsigned long long mr_addr);
 extern int service_delete_rkey_mapping(pid_t pid, uint32_t vrkey);
 
 #endif
