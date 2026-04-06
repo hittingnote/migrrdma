@@ -133,10 +133,60 @@ struct restore_vma_io {
 	struct iovec iovs[0];
 };
 
+struct unmapped_node {
+	unsigned long long				start;
+	unsigned long long				end;
+};
+
+struct update_mem_node {
+	void					*ptr;
+	size_t					size;
+	void					*content_p;
+	char					msg[0];
+};
+
+struct qp_replay_call_entry {
+	void				*cb;
+	void				*qp;
+	char				msg[0];
+};
+
+struct srq_replay_call_entry {
+	void				*cb;
+	void				*srq;
+	int					head;
+	int					tail;
+	char				msg[0];
+};
+
+#include <arpa/inet.h>
+
+struct send_msg_entry {
+	struct sockaddr_in		remote_addr;
+	size_t					size;
+	void					*buf;
+};
+
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
+	void						*base;
+	void						*restore_hook;
+	int							enable_pre_setup;
+	char						images_dir[128];
+	struct unmapped_node *unmapped;
+	int n_unmapped;
+	struct update_mem_node			*update_arr;
+	int								n_update;
+	struct qp_replay_call_entry		*qp_replay_arr;
+	int								n_qp_replay;
+	struct srq_replay_call_entry	*srq_replay_arr;
+	int								n_srq_replay;
+	struct send_msg_entry			*msg_arr;
+	int								n_msg;
+
+	pid_t prerestore_parent_pid;
 
 	int fd_exe_link; /* opened self->exe file */
 	int logfd;

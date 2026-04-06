@@ -47,8 +47,14 @@
 
 #include "cr-errno.h"
 #include "namespaces.h"
+#include "soccr/external.h"
+
+#define EXTRACT_LOG
 
 unsigned int service_sk_ino = -1;
+char check_buf[1024];
+char *ip_addr;
+int enable_pre_setup;
 
 static int recv_criu_msg(int socket_fd, CriuReq **req)
 {
@@ -84,6 +90,62 @@ static int recv_criu_msg(int socket_fd, CriuReq **req)
 	if (!*req) {
 		pr_perror("Failed unpacking request");
 		goto err;
+	}
+
+	if((*req)->type == CRIU_REQ_TYPE__SINGLE_PRE_DUMP_RDMA) {
+		len = recv(socket_fd, NULL, 0, MSG_TRUNC | MSG_PEEK);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		len = recv(socket_fd, check_buf, len, MSG_TRUNC);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		if (len == 0) {
+			pr_info("Client exited unexpectedly\n");
+			errno = ECONNRESET;
+			goto err;
+		}
+
+		asprintf(&ip_addr, "%s", check_buf);
+		enable_pre_setup = 1;
+	}
+	else if((*req)->type == CRIU_REQ_TYPE__DUMP ||
+				(*req)->type == CRIU_REQ_TYPE__RESTORE) {
+		char pre_setup_flag[32];
+		off_t off;
+
+		len = recv(socket_fd, NULL, 0, MSG_TRUNC | MSG_PEEK);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		len = recv(socket_fd, check_buf, len, MSG_TRUNC);
+		if (len == -1) {
+			pr_perror("Can't read request");
+			goto err;
+		}
+
+		if (len == 0) {
+			pr_info("Client exited unexpectedly\n");
+			errno = ECONNRESET;
+			goto err;
+		}
+
+		sscanf(check_buf, "%s%ln", &pre_setup_flag, &off);
+		if(!strcmp(pre_setup_flag, "false")) {
+			enable_pre_setup = 0;
+		}
+		else {
+			enable_pre_setup = 1;
+		}
+
+		asprintf(&ip_addr, "%s", check_buf + off + 1);
 	}
 
 	exit_code = 0;
@@ -240,14 +302,14 @@ int send_criu_rpc_script(enum script_actions act, char *name, int sk, int fd)
 	return 0;
 }
 
-static char images_dir[PATH_MAX];
+char images_dir[PATH_MAX];
+char images_dir_path[PATH_MAX];
 
 static int setup_opts_from_req(int sk, CriuOpts *req)
 {
 	struct ucred ids;
 	struct stat st;
 	socklen_t ids_len = sizeof(struct ucred);
-	char images_dir_path[PATH_MAX];
 	char work_dir_path[PATH_MAX];
 	char status_fd[PATH_MAX];
 	bool output_changed_by_rpc_conf = false;
@@ -752,6 +814,18 @@ static int dump_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
+#ifdef EXTRACT_LOG
+	{
+		char fname[128];
+		int fd;
+
+		sprintf(fname, "/dev/shm/dump_%d.log", req->pid);
+		fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
+		dup2(fd, log_get_fd());
+		close(fd);
+	}
+#endif
+
 	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
 	if (init_pidfd_store_hash())
@@ -794,6 +868,19 @@ static int restore_using_req(int sk, CriuOpts *req)
 	opts.mode = CR_RESTORE;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
+
+#ifdef EXTRACT_LOG
+	{
+		char fname[128];
+		int fd;
+		pid_t pid;
+		sscanf(images_dir, "/dev/shm/restorerdma/%d", &pid);
+		sprintf(fname, "/dev/shm/restore_%d.log", pid);
+		fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
+		dup2(fd, log_get_fd());
+		close(fd);
+	}
+#endif
 
 	__setproctitle("restore --rpc -D %s", images_dir);
 
@@ -885,6 +972,69 @@ static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 			goto pidfd_store_err;
 
 		if (cr_pre_dump_tasks(req->pid))
+			goto cout;
+
+		ret = 0;
+	cout:
+		free_pidfd_store();
+	pidfd_store_err:
+		exit(ret);
+	}
+
+	if (waitpid(pid, &status, 0) != pid) {
+		pr_perror("Unable to wait %d", pid);
+		goto out;
+	}
+	if (status != 0)
+		goto out;
+
+	success = true;
+out:
+	if (send_criu_pre_dump_resp(sk, success, single) == -1) {
+		pr_perror("Can't send pre-dump resp");
+		success = false;
+	}
+
+	return success ? 0 : -1;
+}
+
+static int pre_dump_rdma_using_req(int sk, CriuOpts *req, bool single)
+{
+	int pid, status;
+	bool success = false;
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("Can't fork");
+		goto out;
+	}
+
+	if (pid == 0) {
+		int ret = 1;
+
+		opts.mode = CR_PRE_DUMP_RDMA;
+		if (setup_opts_from_req(sk, req))
+			goto cout;
+
+#ifdef EXTRACT_LOG
+		{
+			char fname[128];
+			int fd;
+
+			sprintf(fname, "/dev/shm/dumprdma_%d.log", req->pid);
+			fd = open(fname, O_RDWR | O_CREAT | O_TRUNC, 00666);
+			dup2(fd, log_get_fd());
+			close(fd);
+		}
+#endif
+
+		opts.final_state = TASK_ALIVE;
+		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
+
+		if (init_pidfd_store_hash())
+			goto pidfd_store_err;
+
+		if (cr_dump_tasks(req->pid))
 			goto cout;
 
 		ret = 0;
@@ -1294,6 +1444,9 @@ more:
 		break;
 	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP:
 		ret = pre_dump_using_req(sk, msg->opts, true);
+		break;
+	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP_RDMA:
+		ret = pre_dump_rdma_using_req(sk, msg->opts, true);
 		break;
 
 	default:
