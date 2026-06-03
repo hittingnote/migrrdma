@@ -11,8 +11,39 @@ CRIU 3.18, and [runc](https://github.com/opencontainers/runc/tree/8fc5be4e60246e
 To figure out what exact change we made to each component,
 you can click the commit message behind each of their directories inside [src/](./src).
 
-MigrRDMA was accepted in SIGCOMM'25.
-Interested readers may refer to [our paper](./docs/migrrdma_paper.pdf).
+MigrRDMA was accepted and published in [SIGCOMM'25](./docs/migrrdma_sigcomm.pdf) and [Transactions on Networking](./docs/migrrdma_ton.pdf).
+For citation, use one of the following bibtex items:
+
+```bibtex
+@inproceedings{10.1145/3718958.3750487,
+author = {Li, Xiaoyu and Shu, Ran and Xiong, Yongqiang and Ren, Fengyuan},
+title = {Software-based Live Migration for RDMA},
+year = {2025},
+isbn = {9798400715242},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3718958.3750487},
+doi = {10.1145/3718958.3750487},
+booktitle = {Proceedings of the ACM SIGCOMM 2025 Conference},
+pages = {99–113},
+numpages = {15},
+keywords = {data center, RDMA, live migration, virtualization},
+location = {S\~{a}o Francisco Convent, Coimbra, Portugal},
+series = {SIGCOMM '25}
+}
+
+@ARTICLE{11523192,
+author={Li, Xiaoyu and Zhang, Weizhe and Ren, Fengyuan},
+journal={IEEE Transactions on Networking}, 
+title={MigrRDMA: Enabling RDMA Live Migration in the Software}, 
+year={2026},
+volume={34},
+number={},
+pages={5365-5380},
+keywords={Data Center; RDMA; Live Migration; Virtualization},
+doi={10.1109/TON.2026.3694041}
+}
+```
 
 ## Prerequisites
 
