@@ -1,1 +1,0 @@
-Note: Please switch to `sigcomm_artifact` branch to reproduce our work.
